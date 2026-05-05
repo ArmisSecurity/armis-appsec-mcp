@@ -54,9 +54,10 @@ class TestReadAndValidateFile:
     def test_happy_path(self, tmp_path):
         f = tmp_path / "app.py"
         f.write_text("print('hello')\n")
-        code, filename = server.read_and_validate_file(str(f))
+        code, filename, resolved = server.read_and_validate_file(str(f))
         assert code == "print('hello')\n"
         assert filename == "app.py"
+        assert resolved == os.path.realpath(str(f))
 
     def test_file_not_found(self, tmp_path):
         with pytest.raises(Exception, match="File not found"):
@@ -89,7 +90,7 @@ class TestReadAndValidateFile:
     def test_truncation(self, tmp_path):
         f = tmp_path / "huge.py"
         f.write_text("x" * 100_000)
-        code, _ = server.read_and_validate_file(str(f))
+        code, _, _ = server.read_and_validate_file(str(f))
         assert len(code) == server._MAX_CODE_CHARS
 
     def test_blocked_path(self):

@@ -272,9 +272,10 @@ class TestReadAndValidateFileIntegration:
     def test_reads_real_file(self, tmp_path):
         f = tmp_path / "test.py"
         f.write_text("x = 1\n")
-        code, name = server.read_and_validate_file(str(f))
+        code, name, resolved = server.read_and_validate_file(str(f))
         assert code == "x = 1\n"
         assert name == "test.py"
+        assert resolved == os.path.realpath(str(f))
 
 
 class TestRunGitDiffIntegration:

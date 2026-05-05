@@ -72,8 +72,8 @@ Present findings to the user as follows:
 1. State the total count: "Found N security issue(s)."
 2. Group by severity (CRITICAL first, then HIGH, MEDIUM, LOW, INFO).
 3. For each finding, include:
-   - Severity and CWE ID (e.g. "CRITICAL -- CWE-89: SQL Injection")
-   - Line number
+   - File path and line number: The scanner output already contains resolved `file:line` locations (e.g. `server.py:167`). Use these locations **exactly as they appear** in the tool result -- do NOT substitute raw line numbers from the finding data. If the tool output shows `L{number}` (no file prefix), the line could not be resolved to a source file -- show it as-is.
+   - Severity, CWE ID, and CWE name (e.g. "CRITICAL -- CWE-89 (SQL Injection)")
    - Explanation of the vulnerability
    - `[SECRET]` tag if the finding involves a hardcoded secret
    - Tainted function references if present

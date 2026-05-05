@@ -79,7 +79,12 @@ def parse_findings(raw: str) -> list[dict]:
 
 
 def format_findings(
-    findings: list[dict], filename: str, suppression_summary: dict | None = None
+    findings: list[dict],
+    filename: str,
+    file_path: str = "",
+    line_map: dict[int, tuple[str, int]] | None = None,
+    changed_files: list[str] | None = None,
+    suppression_summary: dict | None = None,
 ) -> str:
     """Format findings as compact plain text optimized for LLM consumption.
 
@@ -88,10 +93,14 @@ def format_findings(
     """
     suppressed_count = (suppression_summary or {}).get("suppressed", 0)
 
+    header_suffix = ""
+    if changed_files is not None:
+        header_suffix = f" ({len(changed_files)} file(s))"
+
     if not findings and not suppressed_count:
-        return f"SCAN {filename}: clean, no findings."
+        return f"SCAN {filename}{header_suffix}: clean, no findings."
     if not findings and suppressed_count:
-        return f"SCAN {filename}: 0 finding(s) ({suppressed_count} suppressed by .armisignore)"
+        return f"SCAN {filename}{header_suffix}: 0 finding(s) ({suppressed_count} suppressed by .armisignore)"
 
     severity_rank = {s: i for i, s in enumerate(SEVERITY_ORDER)}
     findings = sorted(findings, key=lambda f: severity_rank.get(f.get("severity", "").upper(), 99))
@@ -99,22 +108,50 @@ def format_findings(
     # Header with suppression info when applicable
     if suppressed_count:
         header = (
-            f"SCAN {filename}: {len(findings)} finding(s) "
+            f"SCAN {filename}{header_suffix}: {len(findings)} finding(s) "
             f"({len(findings)} active, {suppressed_count} suppressed)"
         )
     else:
-        header = f"SCAN {filename}: {len(findings)} finding(s)"
+        header = f"SCAN {filename}{header_suffix}: {len(findings)} finding(s)"
     lines = [header]
+
+    source_line_to_files: dict[int, list[str]] = {}
+    if line_map:
+        for _blob, (mfile, src_line) in line_map.items():
+            source_line_to_files.setdefault(src_line, [])
+            if mfile not in source_line_to_files[src_line]:
+                source_line_to_files[src_line].append(mfile)
 
     for i, f in enumerate(findings):
         severity = f.get("severity", "unknown").upper()
         cwe = f.get("cwe", "?")
-        line_num = f.get("line", "?")
+        cwe_name = f.get("cwe_name", "")
+        raw_line = f.get("line", "?")
+        try:
+            line_num = int(raw_line)
+        except (TypeError, ValueError):
+            line_num = None
         explanation = f.get("explanation", "")
         has_secret = f.get("has_secret", False)
         tainted = f.get("tainted_function_references", [])
 
-        parts = [f"[{i + 1}] {severity} CWE-{cwe} L{line_num}: {explanation}"]
+        cwe_label = f" ({cwe_name})" if cwe_name else ""
+
+        if line_map and line_num is not None and line_num in line_map:
+            mapped_file, mapped_line = line_map[line_num]
+            location = f"{mapped_file}:{mapped_line}"
+        elif line_map and line_num is not None and line_num in source_line_to_files:
+            files = source_line_to_files[line_num]
+            if len(files) == 1:
+                location = f"{files[0]}:{line_num}"
+            else:
+                location = f"L{raw_line}"
+        elif file_path and line_num is not None:
+            location = f"{file_path}:{line_num}"
+        else:
+            location = f"L{raw_line}"
+
+        parts = [f"[{i+1}] {severity} CWE-{cwe}{cwe_label} {location}: {explanation}"]
         if has_secret:
             parts[0] += " [SECRET]"
         if tainted:
@@ -131,9 +168,45 @@ def format_findings(
     return "\n".join(lines)
 
 
-def scan(code: str, filename: str = "snippet") -> tuple[str, list[dict]]:
-    """Scan code and return (formatted_report, raw_findings)."""
-    raw = call_appsec_api(code)
-    findings = parse_findings(raw)
-    report = format_findings(findings, filename)
-    return report, findings
+_MAX_DIFF_LINES = 50_000
+
+def build_diff_line_map(
+    diff_text: str,
+) -> tuple[dict[int, tuple[str, int]], list[str]]:
+    """Parse unified diff and map blob line numbers to (file_path, source_line).
+
+    Returns (line_map, changed_files) where line_map maps 1-based blob line
+    numbers to (file_path, source_line_number) tuples.
+    """
+    line_map: dict[int, tuple[str, int]] = {}
+    changed_files: list[str] = []
+    current_file = ""
+    current_source_line = 0
+
+    hunk_re = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+    lines = diff_text.splitlines()
+    if len(lines) > _MAX_DIFF_LINES:
+        lines = lines[:_MAX_DIFF_LINES]
+
+    for blob_line_num, line in enumerate(lines, start=1):
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            if current_file not in changed_files:
+                changed_files.append(current_file)
+        elif line.startswith("--- ") or line.startswith("diff --git"):
+            continue
+        elif (m := hunk_re.match(line)):
+            current_source_line = int(m.group(1))
+        elif line.startswith("+"):
+            if current_file:
+                line_map[blob_line_num] = (current_file, current_source_line)
+            current_source_line += 1
+        elif line.startswith(" "):
+            if current_file:
+                line_map[blob_line_num] = (current_file, current_source_line)
+            current_source_line += 1
+        elif line.startswith("-"):
+            pass  # removed lines: no mapping, no source line increment
+
+    return line_map, changed_files
