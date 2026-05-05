@@ -149,34 +149,26 @@ class TestFormatFindings:
         assert "UNKNOWN CWE-89 L?" in result
 
     def test_finding_with_file_path(self):
-        findings = [
-            {"cwe": 89, "severity": "HIGH", "line": 10, "explanation": "SQL injection"}
-        ]
+        findings = [{"cwe": 89, "severity": "HIGH", "line": 10, "explanation": "SQL injection"}]
         result = format_findings(findings, "app.py", file_path="/src/app.py")
         assert "/src/app.py:10" in result
         assert "L10" not in result
 
     def test_finding_with_line_map(self):
-        findings = [
-            {"cwe": 89, "severity": "HIGH", "line": 5, "explanation": "SQL injection"}
-        ]
+        findings = [{"cwe": 89, "severity": "HIGH", "line": 5, "explanation": "SQL injection"}]
         line_map = {5: ("src/db.py", 42)}
         result = format_findings(findings, "staged changes", line_map=line_map)
         assert "src/db.py:42" in result
         assert "L5" not in result
 
     def test_finding_line_map_miss(self):
-        findings = [
-            {"cwe": 89, "severity": "HIGH", "line": 99, "explanation": "SQL injection"}
-        ]
+        findings = [{"cwe": 89, "severity": "HIGH", "line": 99, "explanation": "SQL injection"}]
         line_map = {5: ("src/db.py", 42)}
         result = format_findings(findings, "staged changes", line_map=line_map)
         assert "L99" in result
 
     def test_line_map_takes_precedence_over_file_path(self):
-        findings = [
-            {"cwe": 89, "severity": "HIGH", "line": 5, "explanation": "SQL injection"}
-        ]
+        findings = [{"cwe": 89, "severity": "HIGH", "line": 5, "explanation": "SQL injection"}]
         line_map = {5: ("src/db.py", 42)}
         result = format_findings(
             findings, "staged changes", file_path="/other.py", line_map=line_map
@@ -186,9 +178,7 @@ class TestFormatFindings:
 
     def test_source_line_fallback_when_blob_miss(self):
         """LLM returns source-relative line numbers, not blob positions."""
-        findings = [
-            {"cwe": 770, "severity": "HIGH", "line": 42, "explanation": "unbounded"}
-        ]
+        findings = [{"cwe": 770, "severity": "HIGH", "line": 42, "explanation": "unbounded"}]
         # blob key 99 maps to src/db.py:42 — finding line 42 is NOT a blob key,
         # but 42 IS a known source line, so fallback should resolve it.
         line_map = {99: ("src/db.py", 42)}
@@ -198,18 +188,14 @@ class TestFormatFindings:
 
     def test_source_line_fallback_ambiguous(self):
         """If the same source line appears in multiple files, fall back to L{num}."""
-        findings = [
-            {"cwe": 770, "severity": "HIGH", "line": 10, "explanation": "unbounded"}
-        ]
+        findings = [{"cwe": 770, "severity": "HIGH", "line": 10, "explanation": "unbounded"}]
         line_map = {50: ("a.py", 10), 80: ("b.py", 10)}
         result = format_findings(findings, "unstaged changes", line_map=line_map)
         assert "L10" in result
 
     def test_string_line_number_coercion(self):
         """Line numbers that come back as strings should still match line_map."""
-        findings = [
-            {"cwe": 89, "severity": "HIGH", "line": "5", "explanation": "SQLi"}
-        ]
+        findings = [{"cwe": 89, "severity": "HIGH", "line": "5", "explanation": "SQLi"}]
         line_map = {5: ("src/db.py", 42)}
         result = format_findings(findings, "staged changes", line_map=line_map)
         assert "src/db.py:42" in result
@@ -246,12 +232,8 @@ class TestFormatFindings:
         assert "(2 file(s))" in result
 
     def test_header_with_findings_and_changed_files(self):
-        findings = [
-            {"cwe": 89, "severity": "HIGH", "line": 10, "explanation": "SQLi"}
-        ]
-        result = format_findings(
-            findings, "staged changes", changed_files=["a.py", "b.py"]
-        )
+        findings = [{"cwe": 89, "severity": "HIGH", "line": 10, "explanation": "SQLi"}]
+        result = format_findings(findings, "staged changes", changed_files=["a.py", "b.py"])
         assert "SCAN staged changes (2 file(s)): 1 finding(s)" in result
 
 

@@ -464,7 +464,10 @@ async def scan_diff(
                 await ctx.info(msg)
 
     report = format_findings(
-        active, label, line_map=line_map, changed_files=changed_files,
+        active,
+        label,
+        line_map=line_map,
+        changed_files=changed_files,
         suppression_summary=suppression_summary,
     )
     _cache_scan(

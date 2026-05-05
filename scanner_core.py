@@ -167,7 +167,7 @@ def format_findings(
         else:
             location = f"L{raw_line}"
 
-        parts = [f"[{i+1}] {severity} CWE-{cwe}{cwe_label} {location}: {explanation}"]
+        parts = [f"[{i + 1}] {severity} CWE-{cwe}{cwe_label} {location}: {explanation}"]
         if has_secret:
             parts[0] += " [SECRET]"
         if tainted:
@@ -188,6 +188,7 @@ def format_findings(
 
 
 _MAX_DIFF_LINES = 50_000
+
 
 def build_diff_line_map(
     diff_text: str,
@@ -215,7 +216,7 @@ def build_diff_line_map(
                 changed_files.append(current_file)
         elif line.startswith("--- ") or line.startswith("diff --git"):
             continue
-        elif (m := hunk_re.match(line)):
+        elif m := hunk_re.match(line):
             current_source_line = int(m.group(1))
         elif line.startswith("+"):
             if current_file:
