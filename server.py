@@ -104,7 +104,7 @@ async def _run_scan(
                 await ctx.info(msg)
 
     report = format_findings(
-        active, filename, file_path=file_path, suppression_summary=suppression_summary
+        active, filename, file_path=file_path or "", suppression_summary=suppression_summary
     )
     _cache_scan(
         report,
