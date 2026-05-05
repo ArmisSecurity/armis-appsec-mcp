@@ -12,14 +12,15 @@ def test_relative_plugin_sources_stay_within_marketplace_root():
 
     metadata = manifest.get("metadata", {})
     source_base = metadata.get("pluginRoot", ".")
-    marketplace_root = marketplace_path.parent.parent.resolve()
+    marketplace_root = repo_root.resolve()
 
     for plugin in manifest["plugins"]:
         source = plugin["source"]
         if not isinstance(source, str) or not source.startswith("./"):
             continue
 
-        resolved_source = (marketplace_root / source_base / source).resolve()
+        # pluginRoot is relative to the manifest directory (.claude-plugin/)
+        resolved_source = (marketplace_path.parent / source_base / source).resolve()
         assert resolved_source.is_relative_to(marketplace_root), (
             f"Plugin source escapes marketplace root: {plugin['name']} -> {source_base}/{source}"
         )
