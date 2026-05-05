@@ -91,6 +91,15 @@ def format_findings(
     if not findings and not suppressed_count:
         return f"SCAN {filename}: clean, no findings."
     if not findings and suppressed_count:
+        by_inline = (suppression_summary or {}).get("by_inline", 0)
+        by_armisignore = suppressed_count - by_inline
+        if by_inline and by_armisignore:
+            return (
+                f"SCAN {filename}: 0 finding(s) "
+                f"({by_armisignore} suppressed by .armisignore, {by_inline} by armis:ignore inline)"
+            )
+        elif by_inline:
+            return f"SCAN {filename}: 0 finding(s) ({by_inline} suppressed by armis:ignore inline)"
         return f"SCAN {filename}: 0 finding(s) ({suppressed_count} suppressed by .armisignore)"
 
     severity_rank = {s: i for i, s in enumerate(SEVERITY_ORDER)}
@@ -125,8 +134,11 @@ def format_findings(
     # Append suppression summary line
     if suppressed_count:
         by_directive = (suppression_summary or {}).get("by_directive", {})
-        directive_parts = [f"{count} by {d}" for d, count in by_directive.items()]
-        lines.append(f"[{suppressed_count} finding(s) suppressed: {', '.join(directive_parts)}]")
+        by_inline = (suppression_summary or {}).get("by_inline", 0)
+        parts = [f"{count} by {d}" for d, count in by_directive.items()]
+        if by_inline:
+            parts.append(f"{by_inline} by armis:ignore inline")
+        lines.append(f"[{suppressed_count} finding(s) suppressed: {', '.join(parts)}]")
 
     return "\n".join(lines)
 

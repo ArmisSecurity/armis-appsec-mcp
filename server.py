@@ -46,6 +46,7 @@ from scanner_core import (
 )
 from suppression import (
     ArmisIgnoreConfig,
+    apply_inline_suppressions,
     apply_suppressions,
     filter_diff_excluded_paths,
     find_git_root,
@@ -63,6 +64,8 @@ async def _run_scan(
     is_staged_scan: bool = False,
     scan_hash: str = "",
     config: ArmisIgnoreConfig | None = None,
+    file_path: str | None = None,
+    source_lines: list[str] | None = None,
 ) -> str:
     """Shared scan pipeline: call API, parse, suppress, format, cache, report progress."""
     t0 = time.monotonic()
@@ -81,7 +84,16 @@ async def _run_scan(
         config = load_armisignore(git_root)
     active, suppressed, suppression_summary = apply_suppressions(findings, config)
 
-    # Warn on suppressed CRITICAL findings
+    # Apply inline armis:ignore suppression (scan_file only)
+    if file_path:
+        active, inline_suppressed = apply_inline_suppressions(active, file_path, source_lines)
+        if inline_suppressed:
+            suppression_summary["suppressed"] += len(inline_suppressed)
+            suppression_summary["active"] -= len(inline_suppressed)
+            suppression_summary["by_inline"] = len(inline_suppressed)
+            suppressed = suppressed + inline_suppressed
+
+    # Warn on suppressed CRITICAL findings (from any source)
     if suppressed:
         suppressed_critical = [f for f in suppressed if f.get("severity", "").upper() == "CRITICAL"]
         if suppressed_critical:
@@ -361,7 +373,10 @@ async def scan_file(
         await ctx.info(f"Scanning {filename} ({len(code)} chars)")
     logger.info(f"Scanning file: {file_path} ({len(code)} chars)")
 
-    return await _run_scan(code, filename, ctx, config=config)
+    source_lines = code.splitlines()
+    return await _run_scan(
+        code, filename, ctx, config=config, file_path=resolved, source_lines=source_lines
+    )
 
 
 @mcp.tool()

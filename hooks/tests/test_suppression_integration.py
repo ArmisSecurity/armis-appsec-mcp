@@ -338,3 +338,154 @@ class TestFormatFindingsWithSuppression:
     def test_no_findings_no_suppression(self):
         result = format_findings([], "app.py")
         assert result == "SCAN app.py: clean, no findings."
+
+
+# ---------------------------------------------------------------------------
+# Category E: Inline armis:ignore integration tests
+# ---------------------------------------------------------------------------
+class TestInlineSuppressionIntegration:
+    @pytest.mark.asyncio
+    async def test_scan_file_inline_suppression(self, tmp_path, monkeypatch):
+        """scan_file with inline armis:ignore suppresses matching findings."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+        raw_response = (
+            '```json\n[{"cwe": 798, "severity": "HIGH", "line": 1, '
+            '"explanation": "hardcoded secret", "has_secret": true, '
+            '"confidence": 0.9, "cwe_name": "Use of Hard-coded Credentials", '
+            '"tainted_function_references": []}]\n```'
+        )
+        config = ArmisIgnoreConfig()
+        source_lines = ["password = 'secret'  # armis:ignore cwe:798"]
+
+        with patch("server.call_appsec_api", return_value=raw_response):
+            report = await server._run_scan(
+                "password = 'secret'",
+                "app.py",
+                config=config,
+                file_path=str(tmp_path / "app.py"),
+                source_lines=source_lines,
+            )
+
+        assert "hardcoded secret" not in report
+        assert "suppressed" in report
+        assert "armis:ignore inline" in report
+
+    @pytest.mark.asyncio
+    async def test_scan_code_no_inline(self):
+        """scan_code (no file_path) skips inline suppression."""
+        raw_response = (
+            '```json\n[{"cwe": 798, "severity": "HIGH", "line": 1, '
+            '"explanation": "hardcoded", "has_secret": true, '
+            '"confidence": 0.9, "cwe_name": "Hardcoded", '
+            '"tainted_function_references": []}]\n```'
+        )
+        config = ArmisIgnoreConfig()
+
+        with patch("server.call_appsec_api", return_value=raw_response):
+            report = await server._run_scan("code", "snippet", config=config)
+
+        assert "hardcoded" in report
+
+    @pytest.mark.asyncio
+    async def test_combined_armisignore_and_inline(self, tmp_path, monkeypatch):
+        """Both .armisignore and inline suppression are reported."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+        raw_response = (
+            "```json\n["
+            '{"cwe": 798, "severity": "HIGH", "line": 1, '
+            '"explanation": "hardcoded", "has_secret": true, '
+            '"confidence": 0.9, "cwe_name": "Hardcoded", '
+            '"tainted_function_references": []},'
+            '{"cwe": 89, "severity": "HIGH", "line": 2, '
+            '"explanation": "sqli", "has_secret": false, '
+            '"confidence": 0.9, "cwe_name": "SQLi", '
+            '"tainted_function_references": []}'
+            "]\n```"
+        )
+        config = ArmisIgnoreConfig(cwes=[798])
+        source_lines = [
+            "password = 'secret'",
+            "query = f'{input}'  # armis:ignore cwe:89",
+        ]
+
+        with patch("server.call_appsec_api", return_value=raw_response):
+            report = await server._run_scan(
+                "code",
+                "app.py",
+                config=config,
+                file_path=str(tmp_path / "app.py"),
+                source_lines=source_lines,
+            )
+
+        assert "0 finding(s)" in report
+        assert ".armisignore" in report
+        assert "armis:ignore inline" in report
+
+    @pytest.mark.asyncio
+    async def test_inline_critical_still_blocks_scan_pass(self, tmp_path, monkeypatch):
+        """Inline-suppressed CRITICAL findings still block .scan-pass."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+        raw_response = (
+            '```json\n[{"cwe": 798, "severity": "CRITICAL", "line": 1, '
+            '"explanation": "critical secret", "has_secret": true, '
+            '"confidence": 0.9, "cwe_name": "Hardcoded", '
+            '"tainted_function_references": []}]\n```'
+        )
+        config = ArmisIgnoreConfig()
+        source_lines = ["password = 'admin'  # armis:ignore"]
+
+        with patch("server.call_appsec_api", return_value=raw_response):
+            await server._run_scan(
+                "code",
+                "staged changes",
+                config=config,
+                file_path=str(tmp_path / "app.py"),
+                source_lines=source_lines,
+                is_staged_scan=True,
+                scan_hash="hash123",
+            )
+
+        scan_pass = tmp_path / ".scan-pass"
+        assert not scan_pass.exists()
+
+    def test_suppression_metadata_uniform(self, tmp_path, monkeypatch):
+        """Both armisignore and inline suppressed findings have metadata keys (D5)."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+        from suppression import apply_inline_suppressions, apply_suppressions
+
+        findings = [
+            {"cwe": 798, "severity": "HIGH", "has_secret": True, "line": 1},
+            {"cwe": 89, "severity": "HIGH", "has_secret": False, "line": 2},
+        ]
+        config = ArmisIgnoreConfig(cwes=[798])
+        active, suppressed_armis, _ = apply_suppressions(findings, config)
+        assert suppressed_armis[0]["_suppression_source"] == "armisignore"
+        assert suppressed_armis[0]["_suppressed_by"] == "cwe:798"
+
+        source_lines = ["x = 1", "query = f'{x}'  # armis:ignore cwe:89"]
+        still_active, suppressed_inline = apply_inline_suppressions(
+            active, str(tmp_path / "app.py"), source_lines
+        )
+        assert suppressed_inline[0]["_suppression_source"] == "inline"
+        assert "armis:ignore" in suppressed_inline[0]["_suppressed_by"]
+
+    def test_format_findings_backward_compat_no_by_inline(self):
+        """format_findings with no by_inline key produces unchanged output (D6)."""
+        summary = {"total": 2, "active": 1, "suppressed": 1, "by_directive": {"cwe:798": 1}}
+        findings = [{"cwe": 89, "severity": "HIGH", "line": 10, "explanation": "SQLi"}]
+        result = format_findings(findings, "app.py", suppression_summary=summary)
+        assert "armis:ignore inline" not in result
+        assert "1 by cwe:798" in result
+
+    def test_format_findings_inline_only(self):
+        """format_findings with only inline suppressions shows correct message."""
+        summary = {"total": 2, "active": 1, "suppressed": 1, "by_directive": {}, "by_inline": 1}
+        findings = [{"cwe": 89, "severity": "HIGH", "line": 10, "explanation": "SQLi"}]
+        result = format_findings(findings, "app.py", suppression_summary=summary)
+        assert "1 by armis:ignore inline" in result
+
+    def test_format_findings_all_suppressed_inline_only(self):
+        """All findings suppressed by inline → correct message."""
+        summary = {"total": 2, "active": 0, "suppressed": 2, "by_directive": {}, "by_inline": 2}
+        result = format_findings([], "app.py", suppression_summary=summary)
+        assert "2 suppressed by armis:ignore inline" in result

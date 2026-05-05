@@ -2,12 +2,14 @@
 .armisignore file parser and finding suppression logic.
 
 Reads suppression directives from {git_root}/.armisignore and applies them
-to scan findings. Fail-open: any parse/IO error leaves findings active.
+to scan findings. Also handles inline armis:ignore comment detection.
+Fail-open: any parse/IO error leaves findings active.
 """
 
 import fnmatch
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 
@@ -238,6 +240,8 @@ def apply_suppressions(
     for finding in findings:
         directive = _finding_matches_config(finding, config)
         if directive:
+            finding["_suppression_source"] = "armisignore"
+            finding["_suppressed_by"] = directive
             suppressed.append(finding)
             by_directive[directive] = by_directive.get(directive, 0) + 1
         else:
@@ -308,3 +312,201 @@ def _extract_diff_path(section: str) -> str | None:
 def _is_empty_config(config: ArmisIgnoreConfig) -> bool:
     """Check if config has no finding-level directives (file_patterns/rule_ids irrelevant)."""
     return not (config.cwes or config.severities or config.categories)
+
+
+# ---------------------------------------------------------------------------
+# Inline armis:ignore suppression
+# ---------------------------------------------------------------------------
+
+_COMMENT_PREFIXES: dict[str, list[str]] = {
+    ".py": ["#"],
+    ".rb": ["#"],
+    ".sh": ["#"],
+    ".bash": ["#"],
+    ".zsh": ["#"],
+    ".yaml": ["#"],
+    ".yml": ["#"],
+    ".tf": ["#"],
+    ".hcl": ["#"],
+    ".toml": ["#"],
+    ".r": ["#"],
+    ".js": ["//"],
+    ".ts": ["//"],
+    ".jsx": ["//"],
+    ".tsx": ["//"],
+    ".java": ["//"],
+    ".c": ["//"],
+    ".h": ["//"],
+    ".cpp": ["//"],
+    ".cc": ["//"],
+    ".go": ["//"],
+    ".rs": ["//"],
+    ".swift": ["//"],
+    ".kt": ["//"],
+    ".kts": ["//"],
+    ".scala": ["//"],
+    ".dart": ["//"],
+    ".groovy": ["//"],
+    ".cs": ["//"],
+    ".php": ["//", "#"],
+    ".sql": ["--"],
+    ".lua": ["--"],
+    ".hs": ["--"],
+    ".ada": ["--"],
+    ".ini": [";"],
+    ".cfg": [";"],
+    ".html": ["<!--"],
+    ".xml": ["<!--"],
+    ".svg": ["<!--"],
+    ".css": ["/*"],
+}
+
+_ARMIS_IGNORE_RE = re.compile(r"armis:ignore", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class InlineDirective:
+    category: str | None = None
+    cwe: int | None = None
+    severity: str | None = None
+    reason: str | None = None
+    is_bare: bool = False
+
+
+def _get_comment_prefixes(file_path: str) -> list[str]:
+    """Return comment prefixes for a file based on its extension."""
+    ext = os.path.splitext(file_path)[1].lower()
+    return _COMMENT_PREFIXES.get(ext, ["#", "//"])
+
+
+def _extract_comment_text(line: str, prefixes: list[str]) -> str | None:
+    """Extract text from the comment portion of a line. Returns None if no comment."""
+    for prefix in prefixes:
+        if prefix == "<!--":
+            start = line.find("<!--")
+            if start != -1:
+                end = line.find("-->", start + 4)
+                if end != -1:
+                    return line[start + 4 : end].strip()
+        elif prefix == "/*":
+            start = line.find("/*")
+            if start != -1:
+                end = line.find("*/", start + 2)
+                if end != -1:
+                    return line[start + 2 : end].strip()
+        else:
+            idx = line.find(prefix)
+            if idx != -1:
+                return line[idx + len(prefix) :].strip()
+    return None
+
+
+def _parse_inline_directive(text: str) -> InlineDirective | None:
+    """Parse an armis:ignore directive from comment text. Flexible param ordering."""
+    match = _ARMIS_IGNORE_RE.search(text)
+    if not match:
+        return None
+
+    remainder = text[match.end() :].strip()
+    if not remainder:
+        return InlineDirective(is_bare=True)
+
+    category = None
+    cwe = None
+    severity = None
+    reason = None
+    has_rule_only = False
+
+    reason_match = re.search(r"\breason:\s*(.+)", remainder, re.IGNORECASE)
+    if reason_match:
+        reason = reason_match.group(1).strip()
+        remainder = remainder[: reason_match.start()].strip()
+
+    for token in remainder.split():
+        lower = token.lower()
+        if lower.startswith("category:"):
+            category = token[9:]
+        elif lower.startswith("cwe:"):
+            try:
+                cwe = int(token[4:])
+            except ValueError:
+                pass
+        elif lower.startswith("severity:"):
+            severity = token[9:]
+        elif lower.startswith("rule:"):
+            has_rule_only = True
+
+    if not any([category, cwe, severity]):
+        if has_rule_only:
+            return InlineDirective(reason=reason)
+        return InlineDirective(is_bare=True, reason=reason)
+
+    return InlineDirective(category=category, cwe=cwe, severity=severity, reason=reason)
+
+
+def _finding_matches_inline(finding: dict, directive: InlineDirective) -> bool:
+    """Check if a finding matches an inline directive (AND logic for specified params)."""
+    if directive.is_bare:
+        return True
+    if not any([directive.category, directive.cwe, directive.severity]):
+        return False
+
+    if directive.cwe is not None:
+        if finding.get("cwe") != directive.cwe:
+            return False
+    if directive.severity is not None:
+        if (finding.get("severity") or "").upper() != directive.severity.upper():
+            return False
+    if directive.category is not None:
+        if _derive_category(finding) != directive.category.lower():
+            return False
+    return True
+
+
+def apply_inline_suppressions(
+    findings: list[dict],
+    file_path: str,
+    source_lines: list[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Apply inline armis:ignore comments to findings. Fail-open on any error."""
+    if not findings:
+        return findings, []
+
+    if source_lines is None:
+        try:
+            with open(file_path, encoding="utf-8-sig") as f:
+                source_lines = f.read().splitlines()
+        except (OSError, UnicodeDecodeError):
+            return findings, []
+
+    prefixes = _get_comment_prefixes(file_path)
+    active: list[dict] = []
+    suppressed: list[dict] = []
+
+    for finding in findings:
+        line_num = finding.get("line")
+        if not isinstance(line_num, int) or line_num < 1 or line_num > len(source_lines):
+            active.append(finding)
+            continue
+
+        matched = False
+        lines_to_check = [line_num - 1]  # 0-indexed: the finding line
+        if line_num >= 2:
+            lines_to_check.append(line_num - 2)  # line above
+
+        for idx in lines_to_check:
+            comment_text = _extract_comment_text(source_lines[idx], prefixes)
+            if comment_text and _ARMIS_IGNORE_RE.search(comment_text):
+                directive = _parse_inline_directive(comment_text)
+                if directive and _finding_matches_inline(finding, directive):
+                    raw = comment_text.strip()
+                    finding["_suppression_source"] = "inline"
+                    finding["_suppressed_by"] = raw
+                    suppressed.append(finding)
+                    matched = True
+                    break
+
+        if not matched:
+            active.append(finding)
+
+    return active, suppressed
