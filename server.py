@@ -40,6 +40,7 @@ from auth import get_auth_status, init_auth
 from hash_utils import compute_staged_hash
 from scanner_core import (
     APPSEC_API_URL,
+    build_diff_line_map,
     call_appsec_api,
     format_findings,
     parse_findings,
@@ -102,7 +103,9 @@ async def _run_scan(
             if ctx:
                 await ctx.info(msg)
 
-    report = format_findings(active, filename, suppression_summary=suppression_summary)
+    report = format_findings(
+        active, filename, file_path=file_path or "", suppression_summary=suppression_summary
+    )
     _cache_scan(
         report,
         active,
@@ -203,8 +206,8 @@ def _validate_file_path(file_path: str) -> str:
 # ---------------------------------------------------------------------------
 # Testable sync helpers (extracted from MCP tools for unit testing)
 # ---------------------------------------------------------------------------
-def read_and_validate_file(file_path: str) -> tuple[str, str]:
-    """Read and validate a file for scanning. Returns (code, filename).
+def read_and_validate_file(file_path: str) -> tuple[str, str, str]:
+    """Read and validate a file for scanning. Returns (code, filename, resolved_path).
 
     Performs: path validation, existence check, size check, binary detection,
     empty check, and truncation. Raises ToolError on failure.
@@ -242,7 +245,7 @@ def read_and_validate_file(file_path: str) -> tuple[str, str]:
         code = code[:_MAX_CODE_CHARS]
         logger.warning("Truncated %s to %d chars", file_path, _MAX_CODE_CHARS)
 
-    return code, os.path.basename(file_path)
+    return code, os.path.basename(file_path), resolved
 
 
 def run_git_diff(repo_path: str = "", ref: str = "", staged: bool = False) -> str:
@@ -367,7 +370,7 @@ async def scan_file(
         logger.info("scan_file: %s excluded by .armisignore", file_path)
         return f"SCAN {os.path.basename(file_path)}: skipped (excluded by .armisignore)"
 
-    code, filename = read_and_validate_file(file_path)
+    code, filename, resolved_path = read_and_validate_file(file_path)
 
     if ctx:
         await ctx.info(f"Scanning {filename} ({len(code)} chars)")
@@ -375,7 +378,7 @@ async def scan_file(
 
     source_lines = code.splitlines()
     return await _run_scan(
-        code, filename, ctx, config=config, file_path=resolved, source_lines=source_lines
+        code, filename, ctx, config=config, file_path=resolved_path, source_lines=source_lines
     )
 
 
@@ -436,14 +439,52 @@ async def scan_diff(
             )
             return report
 
-    return await _run_scan(
-        diff_text,
+    line_map, changed_files = build_diff_line_map(diff_text)
+
+    t0 = time.monotonic()
+    try:
+        raw = await asyncio.to_thread(call_appsec_api, diff_text)
+    except RuntimeError as e:
+        raise ToolError(str(e)) from e
+    except Exception as e:
+        raise ToolError(f"Scan failed: {e}") from e
+
+    findings = parse_findings(raw)
+
+    # Apply .armisignore suppression
+    active, suppressed, suppression_summary = apply_suppressions(findings, config)
+
+    # Warn on suppressed CRITICAL findings
+    if suppressed:
+        suppressed_critical = [f for f in suppressed if f.get("severity", "").upper() == "CRITICAL"]
+        if suppressed_critical:
+            msg = _format_critical_warning(suppressed_critical)
+            logger.warning(msg)
+            if ctx:
+                await ctx.info(msg)
+
+    report = format_findings(
+        active,
         label,
-        ctx,
+        line_map=line_map,
+        changed_files=changed_files,
+        suppression_summary=suppression_summary,
+    )
+    _cache_scan(
+        report,
+        active,
+        label,
         is_staged_scan=is_shipping_scan,
         scan_hash=scan_hash,
-        config=config,
+        suppressed=suppressed,
+        suppression_summary=suppression_summary,
     )
+
+    if ctx:
+        elapsed = time.monotonic() - t0
+        await ctx.info(f"Scan complete: {len(active)} finding(s) in {elapsed:.1f}s")
+
+    return report
 
 
 @mcp.tool()
