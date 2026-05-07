@@ -1,0 +1,3 @@
+CWE-78 Command Injection
+Taint: request.form (app.py) -> process_file (service.py) -> subprocess.run (system_utils.py)
+Requires depth-2 context: the sink is two imports deep from the primary file.

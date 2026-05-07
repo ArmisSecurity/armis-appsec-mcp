@@ -38,7 +38,7 @@ python server.py
 
 ## Architecture: the shared core
 
-`scanner_core.py`, `auth.py`, `suppression.py`, and `hash_utils.py` are the load-bearing shared modules. The MCP server and the hooks both import from them — a change in any of these affects **both** the tool-call flow and the commit-gate flow.
+`scanner_core.py`, `auth.py`, `suppression.py`, `hash_utils.py`, `path_security.py`, `context.py`, and `security_db.py` are the load-bearing shared modules. The MCP server and the hooks both import from them — a change in any of these affects **both** the tool-call flow and the commit-gate flow.
 
 - `scanner_core.call_appsec_api()` → POSTs to `{APPSEC_API_URL}/scan/fast` with `{code, mode: "fast"}` and a JWT Bearer. HTTPS is enforced (localhost exempt).
 - `scanner_core.parse_findings()` → extracts the JSON block from the LLM response; findings with `cwe in (None, 0)` are filtered out to match the production pipeline.
@@ -46,6 +46,10 @@ python server.py
 - `auth.JWTAuth` → OAuth2 client-credentials against `/auth/token`. Token cached in memory, re-exchanged when within 5 minutes of `exp`. `_parse_jwt_exp` bounds-checks `exp` (must be future, ≤24h out).
 - `suppression` → `.armisignore` at git root. Supports `cwe:`, `severity:`, `category:`, `rule:` directives and path patterns (basename, glob, or `dir/` prefix). Fail-open on any parse/IO error.
 - `hash_utils.compute_staged_hash()` → SHA-256 of `git diff --cached --no-color --no-ext-diff`; used by both server and hook to agree on "same staged diff."
+- `path_security.validate_file_path()` → allowlist/blocklist path validation extracted from `server.py`. Shared by `server.py` (scan_file) and `context.py` (import resolution). Tests clear `_ALLOWED_ROOTS` between runs.
+- `context.resolve_import_context()` → cross-file context injection. Extracts imports via regex (Python, JS/TS, Go), resolves to files on disk, classifies by security relevance using `security_db.py`, prepends prioritized context to the code field within a 25k char budget. Depth-2 resolution is security-gated (only follows when depth-1 contains sinks/sources). Fail-open on all errors.
+- `context.resolve_blast_radius()` → reverse dependency lookup. Uses `git ls-files` to enumerate tracked files, finds callers of a given function.
+- `security_db.SECURITY_DB` → curated list of ~160 sinks, sources, and sanitizers for Python/JS/TS/Go. Used by `context.py` for budget prioritization and source/sink annotations in `format_findings()`. Not user-extensible in v1.
 
 ## The `.scan-pass` commit gate (critical invariant)
 
@@ -72,6 +76,28 @@ Don't "simplify" any of this without reading `.context/0008-*.md` — the guard 
 - `scan_file` also short-circuits *before* the API call if the file path is excluded by `.armisignore` — avoids paying API cost on ignored files.
 - Category is derived, not declared: `has_secret: true` → `"secrets"`, else `"sast"`.
 
+## Cross-file context injection (`context.py`)
+
+`scan_file()` automatically injects cross-file context before sending code to the API. This enables detection of vulnerabilities that span multiple files (e.g., tainted input in module A reaching a SQL sink in module B).
+
+**How it works:**
+1. Extract imports via regex (supports Python `import`/`from`, JS/TS `import`/`require`, Go `import`)
+2. Resolve import paths to files on disk (relative imports, extension probing, Go local packages)
+3. Classify resolved files using `security_db.py` (DB match) or heuristic (function name patterns)
+4. Security-gated depth-2: only follow transitive imports if depth-1 contains sinks/sources (cap: 5 per)
+5. Assemble context within budget: `min(25_000, 90_000 - len(primary_code))` chars
+6. Priority order: sinks > sources > sanitizers > depth-2 > non-security imports
+
+**Budget rule:** The primary file always gets 100% of its content. Context fills the remaining budget. If the primary is >65k chars, context budget shrinks proportionally.
+
+**Fail-open:** If any step fails (unresolvable imports, path validation rejection, file read error), the scan proceeds without context — exactly like before this feature existed. Context injection never blocks or degrades a scan.
+
+**Source/sink annotations:** When `format_findings()` receives a `taint_map`, it annotates findings with `[SINK]`/`[SOURCE]`/`[SANITIZER]` labels via exact string match against the finding's explanation text.
+
+**New MCP tools:**
+- `scan_blast_radius(function_name, file_path)` → finds all callers of a function across the repo (uses `git ls-files`, caps at 500 files)
+- `debug_context(file_path)` → shows resolved imports, classifications, budget usage without running a scan
+
 ## Fail-open vs fail-closed
 
 | Component | Policy | Rationale |
@@ -79,6 +105,7 @@ Don't "simplify" any of this without reading `.context/0008-*.md` — the guard 
 | `hooks/pre_commit_scan.py` | **Fail open** (catch-all wraps `main()`) | Plugin bugs must never block the developer |
 | `hooks/protect_scan_pass.py` | **Fail open** | Same |
 | `suppression.load_armisignore` | **Fail open** on IO/parse errors | Never lose findings due to a malformed ignore file |
+| `context.resolve_import_context` | **Fail open** | Context is additive; errors degrade to single-file scan (same as before) |
 | `auth.JWTAuth` | **Fail closed** | Can't scan without auth; errors propagate as `RuntimeError` → `ToolError` |
 | CI scanner (separate pipeline) | **Fail closed** | Second line of defense |
 

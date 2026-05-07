@@ -41,8 +41,9 @@ sys.modules["mcp.server.fastmcp.exceptions"] = _mock_exceptions
 # Now we can import server — ToolError is our _FakeToolError
 import importlib
 
+if "path_security" in sys.modules:
+    importlib.reload(sys.modules["path_security"])
 if "server" in sys.modules:
-    # Reload to pick up the mocked ToolError
     importlib.reload(sys.modules["server"])
 import server
 
