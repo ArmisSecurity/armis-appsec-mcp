@@ -303,12 +303,28 @@ def get_debug_config() -> str:
     # ("not initialized", "expired", "valid, expires in Xm"), never tokens.
     auth_status = get_auth_status()
 
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir)
+    version_file = os.path.join(_plugin_dir, ".installed-version")
+    version = "unknown"
+    if os.path.isfile(version_file):
+        try:
+            version = open(version_file).read().strip() or "unknown"
+        except OSError:
+            pass
+
+    env_exists = os.path.isfile(os.path.join(_plugin_dir, ".env"))
+    scan_pass_exists = os.path.isfile(os.path.join(plugin_root, ".scan-pass"))
+
     return (
         f"Auth: {auth_status}\n"
         f"API URL: {api_url}\n"
         f"Env: {env}\n"
         f"Client ID: {client_id}\n"
-        f"Client Secret: {has_secret}"
+        f"Client Secret: {has_secret}\n"
+        f"Plugin version: {version}\n"
+        f"Plugin dir: {_plugin_dir}\n"
+        f"Credentials file: {'present' if env_exists else 'missing'}\n"
+        f"Scan pass: {'present' if scan_pass_exists else 'none'}"
     )
 
 
