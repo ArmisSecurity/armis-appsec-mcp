@@ -3,6 +3,7 @@
 import hashlib
 import json
 import subprocess
+import uuid
 
 import pytest
 
@@ -96,8 +97,12 @@ class TestNonShippingCommands:
 # ---------------------------------------------------------------------------
 
 
-def _init_git_repo(path):
-    """Create a minimal git repo with one staged file, return the staged diff hash."""
+def _init_git_repo(path, unique=False):
+    """Create a minimal git repo with one staged file, return the staged diff hash.
+
+    When unique=True, stages randomized content so the hash cannot accidentally
+    collide with .scan-pass files from other test runs or development usage.
+    """
     subprocess.run(["git", "init"], cwd=str(path), capture_output=True, check=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
@@ -117,8 +122,9 @@ def _init_git_repo(path):
         cwd=str(path),
         capture_output=True,
     )
-    # Stage a test file
-    (path / "test.py").write_text("print('hello')\n")
+    # Stage a test file — unique content prevents hash collisions with other .scan-pass files
+    content = f"# {uuid.uuid4()}\nprint('hello')\n" if unique else "print('hello')\n"
+    (path / "test.py").write_text(content)
     subprocess.run(["git", "add", "test.py"], cwd=str(path), capture_output=True)
     # Compute the staged diff hash
     result = subprocess.run(
@@ -372,8 +378,8 @@ class TestCWE73PluginRootValidation:
 
     def test_plugin_root_outside_repo_rejects(self, run_hook, tmp_path):
         """Path outside git repo should be rejected (falls back to default)."""
-        # Create git repo in tmp_path
-        _init_git_repo(tmp_path)
+        # Stage unique content so hash never matches any .scan-pass in fallback location
+        _init_git_repo(tmp_path, unique=True)
 
         # Create attacker-controlled dir outside repo
         attacker_dir = tmp_path.parent / "attacker_controlled"
@@ -383,17 +389,17 @@ class TestCWE73PluginRootValidation:
 
         # Try to bypass by pointing CLAUDE_PLUGIN_ROOT outside repo
         stdout, stderr, rc = run_hook(
-            "git push", env_override={"CLAUDE_PLUGIN_ROOT": str(attacker_dir)}
+            "git commit -m 'msg'", env_override={"CLAUDE_PLUGIN_ROOT": str(attacker_dir)}
         )
-        # Should block because the hook falls back to default location,
-        # which doesn't have .scan-pass
+        # Should block: attacker path rejected (not in git repo), fallback's
+        # .scan-pass (if any) has a different hash than our unique staged diff
         assert rc == 2, "Path outside repo should be rejected, causing block"
         data = json.loads(stderr)
         assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     def test_plugin_root_path_traversal_rejects(self, run_hook, tmp_path):
         """Path traversal attempts should be rejected."""
-        _init_git_repo(tmp_path)
+        _init_git_repo(tmp_path, unique=True)
 
         # Try path traversal to escape repo
         attacker_dir = tmp_path.parent / "escape"
@@ -404,12 +410,14 @@ class TestCWE73PluginRootValidation:
         # Attempt path traversal (will be resolved by realpath)
         traversal = str(tmp_path / ".." / "escape")
 
-        stdout, stderr, rc = run_hook("git push", env_override={"CLAUDE_PLUGIN_ROOT": traversal})
+        stdout, stderr, rc = run_hook(
+            "git commit -m 'msg'", env_override={"CLAUDE_PLUGIN_ROOT": traversal}
+        )
         assert rc == 2, "Path traversal should be rejected"
 
     def test_plugin_root_symlink_escape_rejects(self, run_hook, tmp_path):
         """Symlink pointing outside repo should be rejected."""
-        _init_git_repo(tmp_path)
+        _init_git_repo(tmp_path, unique=True)
 
         # Create attacker dir outside repo
         attacker_dir = tmp_path.parent / "attacker_symlink_target"
@@ -425,32 +433,35 @@ class TestCWE73PluginRootValidation:
             pytest.skip("Symlinks not supported on this platform")
 
         stdout, stderr, rc = run_hook(
-            "git push", env_override={"CLAUDE_PLUGIN_ROOT": str(symlink_path)}
+            "git commit -m 'msg'", env_override={"CLAUDE_PLUGIN_ROOT": str(symlink_path)}
         )
         # realpath() resolves symlink to attacker_dir, which is outside repo
         assert rc == 2, "Symlink escape should be rejected"
 
     def test_plugin_root_nonexistent_path_falls_back(self, run_hook, tmp_path):
         """Nonexistent path should fall back to default."""
-        _init_git_repo(tmp_path)
+        _init_git_repo(tmp_path, unique=True)
 
         stdout, stderr, rc = run_hook(
-            "git push",
+            "git commit -m 'msg'",
             env_override={"CLAUDE_PLUGIN_ROOT": "/nonexistent/fake/path/12345"},
         )
         assert rc == 2, "Nonexistent path should fall back and block"
 
     def test_plugin_root_empty_string_uses_fallback(self, run_hook, tmp_path):
         """Empty CLAUDE_PLUGIN_ROOT should use fallback (hook script location)."""
-        _init_git_repo(tmp_path)
-        # Note: .scan-pass is NOT created in the fallback location,
-        # so the hook should block even though one exists in tmp_path
+        staged_hash = _init_git_repo(tmp_path, unique=True)
+        # Write .scan-pass in tmp_path with the correct hash — but it shouldn't
+        # be used because empty CLAUDE_PLUGIN_ROOT falls back to script location
         scan_pass = tmp_path / ".scan-pass"
-        scan_pass.write_text("content")
+        scan_pass.write_text(staged_hash)
 
-        stdout, stderr, rc = run_hook("git push", env_override={"CLAUDE_PLUGIN_ROOT": ""})
-        # Empty string causes fallback to hook script location, not tmp_path
-        assert rc == 2, "Empty string uses script location, .scan-pass not found there"
+        stdout, stderr, rc = run_hook(
+            "git commit -m 'msg'", env_override={"CLAUDE_PLUGIN_ROOT": ""}
+        )
+        # Empty string causes fallback to hook script location, not tmp_path.
+        # The fallback's .scan-pass (if any) has a different hash than our unique staged diff.
+        assert rc == 2, "Empty string uses script location, hash won't match"
 
     def test_find_git_root_helper(self, hook_module, tmp_path):
         """Unit test for _find_git_root helper."""

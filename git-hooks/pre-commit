@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Armis AppSec Scanner — portable git pre-commit hook
+# Installed via: make install-hooks | Fails OPEN by default
+# Set APPSEC_HOOK_STRICT=1 for fail-closed behavior.
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Symlink: .git/hooks/pre-commit -> ../../git-hooks/pre-commit
+PLUGIN_DIR="$(cd "$HOOK_DIR/../.." && pwd)"
+SCAN_PASS="${PLUGIN_DIR}/.scan-pass"
+STRICT="${APPSEC_HOOK_STRICT:-0}"
+
+fail_open() {
+    if [ "$STRICT" = "1" ]; then
+        echo "appsec: STRICT MODE — blocking commit: $1" >&2
+        exit 1
+    fi
+    echo "appsec: warning — $1 (commit allowed, scan recommended)" >&2
+    exit 0
+}
+
+if [ ! -f "$SCAN_PASS" ]; then
+    echo "appsec: No scan pass found. Scan staged changes before committing." >&2
+    echo "  Hint: ask your AI assistant to 'scan staged changes'" >&2
+    echo "  Or: $PLUGIN_DIR/.venv/bin/python $PLUGIN_DIR/git-hooks/scan-staged.py" >&2
+    fail_open "no .scan-pass"
+fi
+
+# Compute current staged hash using the SAME Python function as server.py
+CURRENT_HASH=$(APPSEC_PLUGIN_DIR="$PLUGIN_DIR" "$PLUGIN_DIR/.venv/bin/python" -c "
+import os, sys
+sys.path.insert(0, os.environ['APPSEC_PLUGIN_DIR'])
+from hash_utils import compute_staged_hash
+h = compute_staged_hash()
+print(h) if h else sys.exit(1)
+" 2>/dev/null) || fail_open "could not compute staged hash"
+
+STORED_HASH=$(cat "$SCAN_PASS" 2>/dev/null || echo "")
+if [ "$CURRENT_HASH" != "$STORED_HASH" ]; then
+    echo "appsec: .scan-pass is stale (staged changes differ from last scan)." >&2
+    echo "  Re-scan staged changes before committing." >&2
+    fail_open "stale .scan-pass"
+fi
+
+exit 0

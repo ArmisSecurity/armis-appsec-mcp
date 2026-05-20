@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "armis-scanner": {
+      "command": "/absolute/path/to/armis-appsec-mcp/run.sh",
+      "args": []
+    }
+  }
+}

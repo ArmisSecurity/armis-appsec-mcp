@@ -308,7 +308,8 @@ def get_debug_config() -> str:
     version = "unknown"
     if os.path.isfile(version_file):
         try:
-            version = open(version_file).read().strip() or "unknown"
+            with open(version_file) as vf:
+                version = vf.read().strip() or "unknown"
         except OSError:
             pass
 

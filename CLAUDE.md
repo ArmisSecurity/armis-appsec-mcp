@@ -28,6 +28,11 @@ make check         # format-check + lint + typecheck + test  (full CI gate local
 pytest hooks/tests/test_suppression.py -v
 pytest hooks/tests/test_server_helpers.py::test_validate_file_path_blocks_etc -v
 
+# Other useful targets
+make install-hooks   # symlink git-hooks/pre-commit into .git/hooks/
+make uninstall-hooks # remove the symlink
+make setup CLIENT=cursor  # generate MCP config (cursor|vscode|gemini|copilot)
+
 # Run the MCP server directly (stdio transport, reads .env)
 ./run.sh
 # or, if deps already installed:
@@ -117,3 +122,19 @@ When you edit either hook, preserve the outer `try: ... except Exception: print(
 | `APPSEC_DEBUG` | unset | Any truthy value enables debug logging |
 | `APPSEC_TRANSPORT` | `stdio` | MCP transport passed to `mcp.run()` |
 | `CLAUDE_PLUGIN_ROOT` | auto | Set by Claude Code; must resolve inside a git repo or it's ignored |
+
+## Two hook systems
+
+The repo has two distinct hook systems serving different audiences:
+
+- **`hooks/`** — Claude Code **PreToolUse** hooks (manifest: `hooks/hooks.json`). These fire inside Claude Code's tool execution pipeline and are installed automatically via the plugin. They enforce the `.scan-pass` gate on `Bash` (commit/push/PR commands) and block `Write`/`Edit` to `.scan-pass` (anti-forgery).
+- **`git-hooks/`** — Portable **git** hooks (`pre-commit` shell script + `scan-staged.py`). These work with any client (Cursor, VS Code, Gemini, Copilot CLI) and are installed via `make install-hooks`. They call the scanner directly (no MCP client needed) and write `.scan-pass` using the same hash format, so they're interchangeable with the MCP `scan_diff` flow.
+
+Both systems share the same core modules and the same `.scan-pass` file format — a SHA-256 of the staged diff. Code scanned via `git-hooks/scan-staged.py` will satisfy the Claude Code hook and vice versa.
+
+## Multi-client support
+
+The MCP server works with 5 clients: Claude Code, Cursor, VS Code (GitHub Copilot), Gemini CLI, and GitHub Copilot CLI.
+
+- `config-templates/` — JSON templates for each client's MCP config format, used by `make setup CLIENT=...`.
+- `AGENTS.md`, `.github/copilot-instructions.md`, `.cursor/rules/security-scanning.mdc` — instruction files for non-Claude clients. All contain the same "scan before commit" guidance. **Keep these in sync** — if you update one, update the others.
