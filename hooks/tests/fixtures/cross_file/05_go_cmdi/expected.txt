@@ -1,0 +1,3 @@
+CWE-78 Command Injection
+Taint: r.FormValue (main.go) -> handler.ProcessFile -> exec.Command (handler.go)
+Requires cross-file context: main.go has user input, handler.go has the shell exec.

@@ -78,6 +78,17 @@ def parse_findings(raw: str) -> list[dict]:
     return [f for f in findings if f.get("cwe") and f.get("cwe") != 0]
 
 
+def _annotate_with_taint_map(explanation: str, tainted_refs: list[str], taint_map: list) -> str:
+    """Match finding text against taint map entries, return annotation string."""
+    annotations = []
+    text = explanation + " " + " ".join(tainted_refs)
+    for entry in taint_map:
+        if hasattr(entry, "function_name") and entry.function_name in text:
+            label = entry.kind.upper()
+            annotations.append(f"{entry.function_name} [{label}]")
+    return ", ".join(annotations[:3]) if annotations else ""
+
+
 def format_findings(
     findings: list[dict],
     filename: str,
@@ -85,6 +96,7 @@ def format_findings(
     line_map: dict[int, tuple[str, int]] | None = None,
     changed_files: list[str] | None = None,
     suppression_summary: dict | None = None,
+    taint_map: list | None = None,
 ) -> str:
     """Format findings as compact plain text optimized for LLM consumption.
 
@@ -172,6 +184,11 @@ def format_findings(
             parts[0] += " [SECRET]"
         if tainted:
             parts.append(f"    tainted: {', '.join(tainted)}")
+
+        if taint_map:
+            annotations = _annotate_with_taint_map(explanation, tainted, taint_map)
+            if annotations:
+                parts.append(f"    context: {annotations}")
 
         lines.extend(parts)
 

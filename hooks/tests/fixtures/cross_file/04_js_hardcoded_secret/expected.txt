@@ -1,0 +1,3 @@
+CWE-798 Hardcoded Credentials
+Secret: API_KEY in config.ts used by api.ts for auth headers.
+Requires cross-file context: api.ts only calls getApiKey(), secret is in config.ts.

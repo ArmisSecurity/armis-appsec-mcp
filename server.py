@@ -19,7 +19,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 
 # Ensure scanner_core is importable regardless of cwd
@@ -67,6 +66,7 @@ async def _run_scan(
     config: ArmisIgnoreConfig | None = None,
     file_path: str | None = None,
     source_lines: list[str] | None = None,
+    taint_map: list | None = None,
 ) -> str:
     """Shared scan pipeline: call API, parse, suppress, format, cache, report progress."""
     t0 = time.monotonic()
@@ -104,7 +104,11 @@ async def _run_scan(
                 await ctx.info(msg)
 
     report = format_findings(
-        active, filename, file_path=file_path or "", suppression_summary=suppression_summary
+        active,
+        filename,
+        file_path=file_path or "",
+        suppression_summary=suppression_summary,
+        taint_map=taint_map,
     )
     _cache_scan(
         report,
@@ -155,52 +159,18 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 # Security: path validation for scan_file
 # ---------------------------------------------------------------------------
-_BLOCKED_PREFIXES = ("/etc/", "/proc/", "/sys/", "/private/etc/")
-_BLOCKED_DOTDIRS = {".ssh", ".gnupg", ".aws", ".config/gcloud"}
-_MAX_CODE_CHARS = 90_000
+from path_security import (  # noqa: E402
+    _ALLOWED_ROOTS,  # noqa: F401 — re-exported for tests
+)
+from path_security import (
+    MAX_CODE_CHARS as _MAX_CODE_CHARS,
+)
+from path_security import (
+    validate_file_path as _validate_file_path,
+)
 
 # Git ref validation: alphanumeric + common ref chars (branch, tag, SHA, HEAD~3)
 _VALID_GIT_REF = re.compile(r"^[a-zA-Z0-9_./\-~^@{}]+$")
-
-
-_ALLOWED_ROOTS: list[str] = []
-
-
-def _get_allowed_roots() -> list[str]:
-    """Lazily compute allowed root directories for path validation."""
-    if not _ALLOWED_ROOTS:
-        home = os.path.realpath(os.path.expanduser("~"))
-        # Include /tmp, macOS /private/tmp, and the system temp directory
-        # (on macOS, tempfile.gettempdir() returns /var/folders/... -> /private/var/folders/...)
-        sys_tmp = os.path.realpath(tempfile.gettempdir())
-        roots = {home, "/tmp", "/private/tmp", sys_tmp}  # noqa: S108
-        _ALLOWED_ROOTS.extend(sorted(roots))
-    return _ALLOWED_ROOTS
-
-
-def _validate_file_path(file_path: str) -> str:
-    """Resolve and validate a file path. Returns the resolved path or raises ToolError."""
-    resolved = os.path.realpath(file_path)
-
-    # Allowlist: path must be under HOME, /tmp, or /private/tmp
-    allowed = _get_allowed_roots()
-    if not any(resolved == root or resolved.startswith(root + "/") for root in allowed):
-        raise ToolError(f"Path '{file_path}' is outside allowed directories (home, /tmp).")
-
-    # Blocklist (defense-in-depth): system paths
-    for prefix in _BLOCKED_PREFIXES:
-        normalized = prefix.rstrip("/")
-        if resolved == normalized or resolved.startswith(normalized + "/"):
-            raise ToolError(f"Scanning system path '{resolved}' is not allowed.")
-
-    # Blocklist (defense-in-depth): sensitive dotdirs under HOME
-    home = os.path.realpath(os.path.expanduser("~"))
-    for dotdir in _BLOCKED_DOTDIRS:
-        blocked_dir = os.path.join(home, dotdir)
-        if resolved == blocked_dir or resolved.startswith(blocked_dir + os.sep):
-            raise ToolError(f"Scanning '{resolved}' is blocked (sensitive directory).")
-
-    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -372,13 +342,33 @@ async def scan_file(
 
     code, filename, resolved_path = read_and_validate_file(file_path)
 
+    # Cross-file context injection: resolve imports and prepend security context
+    taint_map: list = []
+    try:
+        from context import resolve_import_context  # noqa: E402
+
+        context_budget = _MAX_CODE_CHARS - len(code)
+        if context_budget > 500:
+            import_context, taint_map = resolve_import_context(resolved_path, code, context_budget)
+            if import_context:
+                code = import_context + "\n" + code
+                logger.info("Injected %d chars of cross-file context", len(import_context))
+    except Exception:
+        logger.debug("Context injection failed (non-fatal)", exc_info=True)
+
     if ctx:
         await ctx.info(f"Scanning {filename} ({len(code)} chars)")
     logger.info(f"Scanning file: {file_path} ({len(code)} chars)")
 
     source_lines = code.splitlines()
     return await _run_scan(
-        code, filename, ctx, config=config, file_path=resolved_path, source_lines=source_lines
+        code,
+        filename,
+        ctx,
+        config=config,
+        file_path=resolved_path,
+        source_lines=source_lines,
+        taint_map=taint_map,
     )
 
 
@@ -656,6 +646,139 @@ def last_scan_results() -> str:
 
 # ---------------------------------------------------------------------------
 # Prompt: security review template
+# ---------------------------------------------------------------------------
+# Blast radius and context debugging tools
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def scan_blast_radius(
+    function_name: str,
+    file_path: str,
+    ctx: Context | None = None,
+) -> str:
+    """Show all files that import and call a function, and their security impact.
+
+    Use this to understand what other code depends on a function before
+    refactoring or when investigating a vulnerability's blast radius.
+
+    Args:
+        function_name: The function to trace callers for (e.g., "execute_query").
+        file_path: The file where the function is defined.
+
+    Returns:
+        A report showing which files call this function and their security context.
+    """
+    resolved = _validate_file_path(file_path)
+    if not os.path.isfile(resolved):
+        raise ToolError(f"File not found: {file_path}")
+
+    try:
+        from context import resolve_blast_radius  # noqa: E402
+
+        callers = await asyncio.to_thread(resolve_blast_radius, function_name, resolved)
+    except Exception as e:
+        raise ToolError(f"Blast radius analysis failed: {e}") from e
+
+    if not callers:
+        return f"No callers of '{function_name}' found in the repository."
+
+    lines = [f"BLAST RADIUS: {function_name} ({os.path.basename(file_path)})"]
+    lines.append(f"{len(callers)} caller(s) found:\n")
+    for i, caller in enumerate(callers, 1):
+        rel = os.path.relpath(caller.file_path)
+        lines.append(f"  [{i}] {rel}:{caller.line}")
+        lines.append(f"      {caller.context}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def debug_context(
+    file_path: str,
+    ctx: Context | None = None,
+) -> str:
+    """Show what context would be injected for a file scan (without scanning).
+
+    Use this to understand which imports the scanner resolves, their security
+    classifications, and budget allocation -- without paying API cost.
+
+    Args:
+        file_path: The file to analyze imports for.
+
+    Returns:
+        Resolved imports, taint classifications, budget allocation,
+        and any unresolved imports with reasons.
+    """
+    resolved = _validate_file_path(file_path)
+    if not os.path.isfile(resolved):
+        raise ToolError(f"File not found: {file_path}")
+
+    try:
+        from context import (  # noqa: E402
+            _safe_read_file,
+            detect_language,
+            extract_imports,
+            resolve_import_context,
+            resolve_imports,
+        )
+    except ImportError as e:
+        raise ToolError(f"Context module not available: {e}") from e
+
+    code = _safe_read_file(resolved)
+    if code is None:
+        raise ToolError(f"Cannot read file: {file_path}")
+
+    language = detect_language(resolved)
+    if not language:
+        fname = os.path.basename(file_path)
+        return f"DEBUG CONTEXT: {fname}\nLanguage not supported (no context injection)."
+
+    context_budget = _MAX_CODE_CHARS - len(code)
+    import_context, taint_map = await asyncio.to_thread(
+        resolve_import_context, resolved, code, context_budget
+    )
+
+    imports = extract_imports(code, language)
+    base_dir = os.path.dirname(resolved)
+    resolved_paths = resolve_imports(imports, base_dir, language)
+
+    lines = [f"DEBUG CONTEXT: {os.path.basename(file_path)}"]
+    lines.append(f"Language: {language}")
+    lines.append(f"Primary file: {len(code)} chars")
+    lines.append(f"Context budget: {min(25000, context_budget)} chars")
+    lines.append(f"Context injected: {len(import_context)} chars")
+    lines.append("")
+
+    lines.append(f"Imports found: {len(imports)}")
+    lines.append(f"Resolved to files: {len(resolved_paths)}")
+    lines.append("")
+
+    if taint_map:
+        sources = [e for e in taint_map if e.kind == "source"]
+        sinks = [e for e in taint_map if e.kind == "sink"]
+        sanitizers = [e for e in taint_map if e.kind == "sanitizer"]
+
+        def _fmt(e):
+            return f"{e.function_name} ({os.path.basename(e.file_path)}:{e.line})"
+
+        lines.append("Taint map:")
+        if sinks:
+            lines.append(f"  SINKS: {', '.join(_fmt(e) for e in sinks[:5])}")
+        if sources:
+            lines.append(f"  SOURCES: {', '.join(_fmt(e) for e in sources[:5])}")
+        if sanitizers:
+            lines.append(f"  SANITIZERS: {', '.join(_fmt(e) for e in sanitizers[:5])}")
+    else:
+        lines.append("Taint map: (empty — no security-relevant functions found)")
+
+    unresolved = set(imports) - {os.path.basename(p).rsplit(".", 1)[0] for p in resolved_paths}
+    if unresolved:
+        lines.append("")
+        lines.append(f"Unresolved imports ({len(unresolved)}):")
+        for u in sorted(unresolved)[:10]:
+            lines.append(f"  - {u}")
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 @mcp.prompt()
 def security_review(code: str, language: str = "auto") -> str:

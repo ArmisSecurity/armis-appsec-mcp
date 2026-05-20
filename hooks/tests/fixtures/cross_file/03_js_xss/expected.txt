@@ -1,0 +1,3 @@
+CWE-79 Cross-Site Scripting (XSS)
+Taint: req.query (routes.ts) -> renderTemplate -> template literal (template.ts)
+Requires cross-file context: routes.ts has no HTML output, template.ts has no user input.

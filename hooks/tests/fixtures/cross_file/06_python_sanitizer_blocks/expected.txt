@@ -1,0 +1,4 @@
+NEGATIVE CASE: No finding expected.
+The sanitizer (html.escape in sanitize.py) properly neutralizes the user input.
+The scanner should recognize that the taint flow is interrupted by the sanitizer.
+If a CWE-79 finding is reported, it's a false positive.

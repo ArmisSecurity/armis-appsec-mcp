@@ -1,0 +1,3 @@
+CWE-89 SQL Injection
+Taint: request.form (app.py) -> run_query -> cursor.execute (db.py)
+Requires cross-file context to detect: app.py alone has no SQL, db.py alone has no user input.
