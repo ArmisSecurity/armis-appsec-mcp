@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "armis-scanner": {
+      "type": "stdio",
+      "command": "/absolute/path/to/armis-appsec-mcp/run.sh",
+      "args": []
+    }
+  }
+}

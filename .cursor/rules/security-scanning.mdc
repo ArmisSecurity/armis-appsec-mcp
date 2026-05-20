@@ -1,0 +1,9 @@
+---
+description: Security scanning before commits
+alwaysApply: true
+---
+
+Before running git commit, git push, or creating a PR, call the armis-scanner
+MCP tool `scan_diff` with `staged=true`. If HIGH/CRITICAL findings exist,
+fix them or ask the user for approval before proceeding. See AGENTS.md for
+full instructions.

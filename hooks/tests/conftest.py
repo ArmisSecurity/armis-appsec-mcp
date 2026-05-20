@@ -39,9 +39,15 @@ def run_hook(tmp_path):
     The hook subprocess runs with cwd=tmp_path so that _compute_staged_hash()
     can find the git repo created by test helpers like _init_git_repo().
 
+    Initializes a bare git repo in tmp_path so that CLAUDE_PLUGIN_ROOT passes
+    CWE-73 validation (must be within a git repo) and doesn't fall back to the
+    real plugin root which may have a .scan-pass from development usage.
+
     Returns:
         Tuple of (stdout_str, stderr_str, returncode).
     """
+    # Ensure tmp_path is a git repo so _plugin_root() CWE-73 validation passes
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
 
     def _run(command="", tool_name="Bash", env_override=None):
         hook_input = {"tool_name": tool_name, "tool_input": {"command": command}}
@@ -73,6 +79,7 @@ def run_hook_raw(tmp_path):
     Use this for error-handling tests where the input is not valid JSON.
     Returns the CompletedProcess for full inspection.
     """
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
 
     def _run(raw_stdin=""):
         env = os.environ.copy()
