@@ -19,16 +19,21 @@ def _init_git_repo(path, staged_content="print('hello')\n"):
     """Create a git repo with a staged file, return the staged diff hash."""
     subprocess.run(["git", "init"], cwd=str(path), capture_output=True, check=True)
     subprocess.run(
-        ["git", "config", "user.email", "test@test.com"], cwd=str(path), capture_output=True
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=str(path),
+        capture_output=True,
+        check=True,
     )
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(path), capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=str(path), capture_output=True, check=True
+    )
 
     (path / "init.txt").write_text("init")
-    subprocess.run(["git", "add", "init.txt"], cwd=str(path), capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(path), capture_output=True)
+    subprocess.run(["git", "add", "init.txt"], cwd=str(path), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(path), capture_output=True, check=True)
 
     (path / "test.py").write_text(staged_content)
-    subprocess.run(["git", "add", "test.py"], cwd=str(path), capture_output=True)
+    subprocess.run(["git", "add", "test.py"], cwd=str(path), capture_output=True, check=True)
 
     result = subprocess.run(
         ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
@@ -120,12 +125,19 @@ class TestNoStagedChanges:
         # Init repo but don't stage anything new
         subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
         subprocess.run(
-            ["git", "config", "user.email", "t@t.com"], cwd=str(tmp_path), capture_output=True
+            ["git", "config", "user.email", "t@t.com"],
+            cwd=str(tmp_path),
+            capture_output=True,
+            check=True,
         )
-        subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp_path), capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.name", "T"], cwd=str(tmp_path), capture_output=True, check=True
+        )
         (tmp_path / "x.txt").write_text("x")
-        subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=str(tmp_path), capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"], cwd=str(tmp_path), capture_output=True, check=True
+        )
         # No new staged changes after commit
         stdout, stderr, rc = _run_scan_staged(tmp_path)
         assert rc == 0

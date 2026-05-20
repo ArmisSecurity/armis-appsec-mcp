@@ -38,13 +38,15 @@ def _setup_plugin_structure(tmp_path):
     hooks_dir.mkdir()
 
     # Copy the hook script
-    hook_src = open(_GIT_HOOK_SCRIPT).read()
+    with open(_GIT_HOOK_SCRIPT) as f:
+        hook_src = f.read()
     hook_dest = git_hooks_dir / "pre-commit"
     hook_dest.write_text(hook_src)
     hook_dest.chmod(0o755)
 
     # Copy hash_utils.py
-    hash_utils_src = open(os.path.join(_PLUGIN_ROOT, "hash_utils.py")).read()
+    with open(os.path.join(_PLUGIN_ROOT, "hash_utils.py")) as f:
+        hash_utils_src = f.read()
     (tmp_path / "hash_utils.py").write_text(hash_utils_src)
 
     # Symlink python
@@ -62,18 +64,23 @@ def _init_git_repo(path):
     """Initialize a real git repo and stage a file. Returns staged diff hash."""
     subprocess.run(["git", "init"], cwd=str(path), capture_output=True, check=True)
     subprocess.run(
-        ["git", "config", "user.email", "test@test.com"], cwd=str(path), capture_output=True
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=str(path),
+        capture_output=True,
+        check=True,
     )
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(path), capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=str(path), capture_output=True, check=True
+    )
 
     # Initial commit so HEAD exists
     (path / "init.txt").write_text("init")
-    subprocess.run(["git", "add", "init.txt"], cwd=str(path), capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(path), capture_output=True)
+    subprocess.run(["git", "add", "init.txt"], cwd=str(path), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(path), capture_output=True, check=True)
 
     # Stage a test file
     (path / "test.py").write_text("print('hello')\n")
-    subprocess.run(["git", "add", "test.py"], cwd=str(path), capture_output=True)
+    subprocess.run(["git", "add", "test.py"], cwd=str(path), capture_output=True, check=True)
 
     # Compute expected staged hash
     result = subprocess.run(
@@ -221,15 +228,16 @@ class TestEdgeCases:
         assert "stale" in stderr or "commit allowed" in stderr
 
     def test_scan_pass_with_trailing_newline(self, hook_env):
-        """Some editors add trailing newlines — hash comparison should handle it."""
+        """Trailing newlines in .scan-pass should be trimmed before comparison."""
         tmp_path, hook, staged_hash = hook_env
-        # cat reads .scan-pass which may have trailing newline from write
         (tmp_path / ".scan-pass").write_text(staged_hash + "\n")
         stdout, stderr, rc = _run_hook(tmp_path, hook)
-        # cat preserves the newline, Python print adds one — they may mismatch
-        # Either passes (if both have newlines) or fails open
         assert rc == 0
+        assert "stale" not in stderr
 
     def test_hook_is_executable(self):
         """The hook script in the repo should be executable."""
-        assert os.access(_GIT_HOOK_SCRIPT, os.X_OK) or True  # chmod in Makefile
+        assert os.path.isfile(_GIT_HOOK_SCRIPT), f"Hook script not found: {_GIT_HOOK_SCRIPT}"
+        assert os.access(_GIT_HOOK_SCRIPT, os.X_OK), (
+            f"Hook script not executable: {_GIT_HOOK_SCRIPT}"
+        )

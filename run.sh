@@ -34,9 +34,12 @@ fi
 
 # Pre-flight: check credentials exist (env vars OR .env file)
 ENV_FILE="$PLUGIN_DIR/.env"
-if [ -z "${ARMIS_CLIENT_ID:-}" ]; then
+if [ -z "${ARMIS_CLIENT_ID:-}" ] || [ -z "${ARMIS_CLIENT_SECRET:-}" ]; then
     if [ ! -f "$ENV_FILE" ]; then
-        echo "ERROR: ARMIS_CLIENT_ID not set and .env not found at $ENV_FILE" >&2
+        MISSING=""
+        [ -z "${ARMIS_CLIENT_ID:-}" ] && MISSING="ARMIS_CLIENT_ID"
+        [ -z "${ARMIS_CLIENT_SECRET:-}" ] && MISSING="${MISSING:+$MISSING, }ARMIS_CLIENT_SECRET"
+        echo "ERROR: $MISSING not set and .env not found at $ENV_FILE" >&2
         echo "  Either export ARMIS_CLIENT_ID/ARMIS_CLIENT_SECRET, or create .env:" >&2
         echo "    ARMIS_CLIENT_ID=<your-id>" >&2
         echo "    ARMIS_CLIENT_SECRET=<your-secret>" >&2

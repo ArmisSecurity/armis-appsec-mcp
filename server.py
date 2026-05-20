@@ -304,7 +304,7 @@ def get_debug_config() -> str:
     auth_status = get_auth_status()
 
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir)
-    version_file = os.path.join(_plugin_dir, ".installed-version")
+    version_file = os.path.join(plugin_root, ".installed-version")
     version = "unknown"
     if os.path.isfile(version_file):
         try:
@@ -313,20 +313,23 @@ def get_debug_config() -> str:
         except OSError:
             pass
 
-    env_exists = os.path.isfile(os.path.join(_plugin_dir, ".env"))
+    env_exists = os.path.isfile(os.path.join(plugin_root, ".env"))
     scan_pass_exists = os.path.isfile(os.path.join(plugin_root, ".scan-pass"))
 
-    return (
-        f"Auth: {auth_status}\n"
-        f"API URL: {api_url}\n"
-        f"Env: {env}\n"
-        f"Client ID: {client_id}\n"
-        f"Client Secret: {has_secret}\n"
-        f"Plugin version: {version}\n"
-        f"Plugin dir: {_plugin_dir}\n"
-        f"Credentials file: {'present' if env_exists else 'missing'}\n"
-        f"Scan pass: {'present' if scan_pass_exists else 'none'}"
-    )
+    lines = [
+        f"Auth: {auth_status}",
+        f"API URL: {api_url}",
+        f"Env: {env}",
+        f"Client ID: {client_id}",
+        f"Client Secret: {has_secret}",
+        f"Plugin version: {version}",
+        f"Plugin root: {plugin_root}",
+    ]
+    if plugin_root != _plugin_dir:
+        lines.append(f"Source dir: {_plugin_dir}")
+    lines.append(f"Credentials file: {'present' if env_exists else 'missing'}")
+    lines.append(f"Scan pass: {'present' if scan_pass_exists else 'none'}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

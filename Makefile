@@ -22,6 +22,8 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 install-hooks:
+	@test -d .git || { echo "ERROR: not a git repository. Run from the repo root." >&2; exit 1; }
+	@mkdir -p .git/hooks
 	@ln -sf ../../git-hooks/pre-commit .git/hooks/pre-commit
 	@chmod +x git-hooks/pre-commit
 	@echo "Pre-commit hook installed (fail-open). Set APPSEC_HOOK_STRICT=1 for strict mode."

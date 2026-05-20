@@ -67,8 +67,10 @@ def main() -> None:
 
     staged_hash = hashlib.sha256(result.stdout.encode()).hexdigest()
     scan_pass_path = os.path.join(_plugin_dir, ".scan-pass")
-    with open(scan_pass_path, "w") as f:
+    tmp_path_file = scan_pass_path + ".tmp"
+    with open(tmp_path_file, "w") as f:
         f.write(staged_hash)
+    os.replace(tmp_path_file, scan_pass_path)
     print("appsec: scan clean. .scan-pass written.", file=sys.stderr)
 
     sys.exit(0)

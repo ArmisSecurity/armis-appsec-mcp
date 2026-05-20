@@ -34,7 +34,8 @@ h = compute_staged_hash()
 print(h) if h else sys.exit(1)
 " 2>/dev/null) || fail_open "could not compute staged hash"
 
-STORED_HASH=$(cat "$SCAN_PASS" 2>/dev/null || echo "")
+STORED_HASH=$(tr -d '[:space:]' < "$SCAN_PASS" 2>/dev/null || echo "")
+CURRENT_HASH=$(printf '%s' "$CURRENT_HASH" | tr -d '[:space:]')
 if [ "$CURRENT_HASH" != "$STORED_HASH" ]; then
     echo "appsec: .scan-pass is stale (staged changes differ from last scan)." >&2
     echo "  Re-scan staged changes before committing." >&2
