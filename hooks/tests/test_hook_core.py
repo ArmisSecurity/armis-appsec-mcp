@@ -188,6 +188,14 @@ class TestCrossAdapterInterop:
                 "cursor_pre_tool.py",
                 {"tool_name": "terminal", "tool_input": {"command": "git commit -m 'x'"}},
             ),
+            (
+                "copilot_pre_tool.py",
+                {"toolName": "bash", "toolArgs": {"command": "git commit -m 'x'"}},
+            ),
+            (
+                "cline_pre_tool.py",
+                {"tool": {"name": "execute_command", "input": {"command": "git commit -m 'x'"}}},
+            ),
         ]
 
         env = os.environ.copy()

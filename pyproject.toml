@@ -50,6 +50,8 @@ ignore = [
 "hooks/gemini_pre_tool.py" = ["E402"]
 "hooks/codex_pre_tool.py" = ["E402"]
 "hooks/cursor_pre_tool.py" = ["E402"]
+"hooks/copilot_pre_tool.py" = ["E402"]
+"hooks/cline_pre_tool.py" = ["E402"]
 "server.py" = ["E402"]
 
 [tool.ruff.format]
