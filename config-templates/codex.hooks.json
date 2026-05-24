@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "shell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/armis-appsec-mcp/hooks/codex_pre_tool.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "write_file|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/armis-appsec-mcp/hooks/codex_pre_tool.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

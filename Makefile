@@ -38,6 +38,12 @@ setup:
 	@PLUGIN_DIR=$$(pwd) && \
 	TEMPLATE="config-templates/$(CLIENT).mcp.json" && \
 	[ ! -f "$$TEMPLATE" ] && TEMPLATE="config-templates/$(CLIENT)-cli.mcp.json"; \
-	sed "s|/absolute/path/to/armis-appsec-mcp|$$PLUGIN_DIR|g" "$$TEMPLATE"
+	echo "=== MCP Server Config ===" && \
+	sed "s|/absolute/path/to/armis-appsec-mcp|$$PLUGIN_DIR|g" "$$TEMPLATE" && \
+	HOOKS_TEMPLATE="config-templates/$(CLIENT).hooks.json" && \
+	if [ -f "$$HOOKS_TEMPLATE" ]; then \
+		echo "" && echo "=== Hook Config (commit gate) ===" && \
+		sed "s|/absolute/path/to/armis-appsec-mcp|$$PLUGIN_DIR|g" "$$HOOKS_TEMPLATE"; \
+	fi
 	@echo ""
-	@echo "Copy the above JSON to your client config file."
+	@echo "Copy the above JSON to your client config files."
