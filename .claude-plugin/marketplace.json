@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "AI-powered security scanner — scans code, files, and diffs for vulnerabilities using MCP",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "pluginRoot": ".."
   },
   "plugins": [

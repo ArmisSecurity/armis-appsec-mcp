@@ -12,7 +12,19 @@ import json
 import os
 import sys
 
+_hooks_dir = os.path.dirname(os.path.abspath(__file__))
+if _hooks_dir not in sys.path:
+    sys.path.insert(0, _hooks_dir)
+
+from hook_core import is_scan_pass_file  # noqa: E402
+
 _MAX_STDIN_BYTES = 1_048_576  # 1MB — hook input is small JSON
+
+_DENY_MSG = (
+    "BLOCKED: Direct writes to .scan-pass are not allowed. "
+    "The scan-pass file is managed by the security scanner. "
+    "Run scan_diff() to scan your code instead."
+)
 
 
 def main():
@@ -24,27 +36,19 @@ def main():
     except Exception:
         hook_input = {}
 
-    # Fail-open: wrap all logic so our bugs never block the developer.
     try:
         tool_input = hook_input.get("tool_input", {})
         if not isinstance(tool_input, dict):
             tool_input = {}
 
         file_path = tool_input.get("file_path", "")
-        if not isinstance(file_path, str) or not file_path.strip():
-            print(json.dumps({}))
-            sys.exit(0)
 
-        if os.path.basename(file_path) == ".scan-pass":
+        if is_scan_pass_file(file_path):
             sys.stderr.write(
                 json.dumps(
                     {
                         "hookSpecificOutput": {"permissionDecision": "deny"},
-                        "systemMessage": (
-                            "BLOCKED: Direct writes to .scan-pass are not allowed. "
-                            "The scan-pass file is managed by the security scanner. "
-                            "Run scan_diff() to scan your code instead."
-                        ),
+                        "systemMessage": _DENY_MSG,
                     }
                 )
             )
@@ -54,7 +58,6 @@ def main():
         sys.exit(0)
 
     except Exception:
-        # Fail open: never block due to our own bugs.
         print(
             "appsec-hook: fail-open on internal error",
             file=sys.stderr,

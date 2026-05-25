@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "python3 /absolute/path/to/armis-appsec-mcp/hooks/copilot_pre_tool.py",
+        "matcher": "bash|powershell|create|edit",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

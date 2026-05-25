@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "python3 /absolute/path/to/armis-appsec-mcp/hooks/cline_pre_tool.py",
+        "matcher": "execute_command|write_to_file|replace_in_file",
+        "timeout": 10
+      }
+    ]
+  }
+}

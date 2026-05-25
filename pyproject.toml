@@ -8,7 +8,7 @@ exclude = ["hooks.tests*"]
 
 [project]
 name = "armis-appsec-mcp"
-version = "0.1.0"
+version = "1.1.0"
 description = "AI-powered security scanner MCP plugin for Claude Code"
 requires-python = ">=3.12"
 dependencies = [
@@ -46,6 +46,12 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "hooks/tests/*" = ["S", "E402", "B017"]
 "hooks/pre_commit_scan.py" = ["E402"]
+"hooks/hook_core.py" = ["E402"]
+"hooks/gemini_pre_tool.py" = ["E402"]
+"hooks/codex_pre_tool.py" = ["E402"]
+"hooks/cursor_pre_tool.py" = ["E402"]
+"hooks/copilot_pre_tool.py" = ["E402"]
+"hooks/cline_pre_tool.py" = ["E402"]
 "server.py" = ["E402"]
 
 [tool.ruff.format]

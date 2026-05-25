@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "shell|bash|run_shell_command|write_file|edit_file|patch_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/armis-appsec-mcp/hooks/gemini_pre_tool.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

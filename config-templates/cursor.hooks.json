@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "python3 /absolute/path/to/armis-appsec-mcp/hooks/cursor_pre_tool.py",
+        "matcher": "git\\s+(commit|push)|gh\\s+pr\\s+create",
+        "timeout": 10
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "python3 /absolute/path/to/armis-appsec-mcp/hooks/cursor_pre_tool.py",
+        "matcher": "Write|Edit",
+        "timeout": 5
+      }
+    ]
+  }
+}
