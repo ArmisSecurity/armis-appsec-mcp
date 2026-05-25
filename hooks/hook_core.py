@@ -45,7 +45,8 @@ _PUSH_PR_PATTERNS = [
 _COMMIT_ALL_FLAG = re.compile(r"\bgit\s+commit\b.*(?:\s-a\b|\s--all\b)")
 
 _SCAN_PASS_WRITE_PATTERN = re.compile(
-    r"[>|][^;&|]*(?:^|/)\.scan-pass\b" r"|(?:tee|cp|mv)\s+[^;&|]*(?:^|/)\.scan-pass\b"
+    r"[>|][^;&|]*(?:^|/|\s)\.scan-pass\b"
+    r"|(?:tee|cp|mv)\s+[^;&|]*(?:^|/|\s)\.scan-pass\b"
 )
 
 
@@ -103,10 +104,10 @@ def resolve_plugin_root() -> str:
     """Resolve the plugin root directory.
 
     Checks CLAUDE_PLUGIN_ROOT (set by Claude Code runtime), validates it
-    against CWE-73 (must be within a git repo), falls back to this script's
-    grandparent directory.
+    against CWE-73 (must be within a git repo), falls back to the current
+    working directory's git root (so .scan-pass is repo-scoped), then to
+    this script's grandparent directory.
     """
-    fallback = _plugin_root_dir
     raw = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
     if raw:
         resolved = os.path.realpath(raw)
@@ -123,7 +124,12 @@ def resolve_plugin_root() -> str:
                         return resolved
             except (OSError, ValueError):
                 pass
-    return fallback
+
+    cwd_git_root = _find_git_root(os.getcwd())
+    if cwd_git_root:
+        return cwd_git_root
+
+    return _plugin_root_dir
 
 
 # ---------------------------------------------------------------------------

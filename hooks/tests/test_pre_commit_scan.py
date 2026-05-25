@@ -448,20 +448,17 @@ class TestCWE73PluginRootValidation:
         )
         assert rc == 2, "Nonexistent path should fall back and block"
 
-    def test_plugin_root_empty_string_uses_fallback(self, run_hook, tmp_path):
-        """Empty CLAUDE_PLUGIN_ROOT should use fallback (hook script location)."""
+    def test_plugin_root_empty_string_falls_back_to_cwd_git_root(self, run_hook, tmp_path):
+        """Empty CLAUDE_PLUGIN_ROOT should fall back to CWD's git root."""
         staged_hash = _init_git_repo(tmp_path, unique=True)
-        # Write .scan-pass in tmp_path with the correct hash — but it shouldn't
-        # be used because empty CLAUDE_PLUGIN_ROOT falls back to script location
         scan_pass = tmp_path / ".scan-pass"
         scan_pass.write_text(staged_hash)
 
         stdout, stderr, rc = run_hook(
             "git commit -m 'msg'", env_override={"CLAUDE_PLUGIN_ROOT": ""}
         )
-        # Empty string causes fallback to hook script location, not tmp_path.
-        # The fallback's .scan-pass (if any) has a different hash than our unique staged diff.
-        assert rc == 2, "Empty string uses script location, hash won't match"
+        # CWD is tmp_path (a git root) and .scan-pass hash matches → allow
+        assert rc == 0, "Empty CLAUDE_PLUGIN_ROOT should use CWD git root"
 
     def test_find_git_root_helper(self, hook_module, tmp_path):
         """Unit test for _find_git_root helper."""

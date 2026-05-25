@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "write_file|apply_patch",
+        "matcher": "write_file|apply_patch|edit_file",
         "hooks": [
           {
             "type": "command",
