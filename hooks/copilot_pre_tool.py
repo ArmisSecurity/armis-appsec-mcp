@@ -2,7 +2,8 @@
 """GitHub Copilot CLI preToolUse hook -- Security gate for shipping commands.
 
 Protocol:
-- Input: {"toolName": "bash", "toolArgs": {"command": "..."}, ...}
+- Input: {"toolName": "bash", "toolArgs": "{\"command\": \"...\"}", ...}
+  (toolArgs may be a JSON-encoded string or a nested object)
 - Allow: {"permissionDecision": "allow"} on stdout, exit 0
 - Deny: {"permissionDecision": "deny", "permissionDecisionReason": "..."} on stdout, exit 0
 """
@@ -33,6 +34,11 @@ def main():
 
         tool_name = hook_input.get("toolName", "")
         tool_args = hook_input.get("toolArgs", {})
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except (json.JSONDecodeError, ValueError):
+                tool_args = {}
         if not isinstance(tool_args, dict):
             tool_args = {}
 

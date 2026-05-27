@@ -125,3 +125,84 @@ class TestFailOpen:
         assert result.returncode == 0
         data = json.loads(result.stdout)
         assert data["permissionDecision"] == "allow"
+
+
+class TestJsonStringToolArgs:
+    """Copilot CLI sends toolArgs as a JSON-encoded string, not a dict."""
+
+    @pytest.fixture
+    def run_copilot_hook_raw(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
+
+        def _run(hook_input_dict, env_override=None):
+            env = os.environ.copy()
+            env["CLAUDE_PLUGIN_ROOT"] = str(tmp_path)
+            if env_override:
+                env.update(env_override)
+
+            result = subprocess.run(
+                [sys.executable, HOOK_PATH],
+                input=json.dumps(hook_input_dict),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+                cwd=str(tmp_path),
+            )
+            return result
+
+        return _run
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git commit -m 'feat: x'",
+            "git push",
+            "gh pr create --title 'PR'",
+        ],
+    )
+    def test_shipping_commands_deny_with_string_tool_args(self, run_copilot_hook_raw, cmd):
+        hook_input = {
+            "toolName": "bash",
+            "toolArgs": json.dumps({"command": cmd}),
+        }
+        result = run_copilot_hook_raw(hook_input)
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["permissionDecision"] == "deny"
+        assert "Security scan required" in data["permissionDecisionReason"]
+
+    @pytest.mark.parametrize(
+        "cmd",
+        ["git status", "ls -la", "python app.py", "git diff"],
+    )
+    def test_non_shipping_allows_with_string_tool_args(self, run_copilot_hook_raw, cmd):
+        hook_input = {
+            "toolName": "bash",
+            "toolArgs": json.dumps({"command": cmd}),
+        }
+        result = run_copilot_hook_raw(hook_input)
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["permissionDecision"] == "allow"
+
+    def test_write_to_scan_pass_denied_with_string_tool_args(self, run_copilot_hook_raw):
+        hook_input = {
+            "toolName": "create",
+            "toolArgs": json.dumps({"file_path": "/project/.scan-pass"}),
+        }
+        result = run_copilot_hook_raw(hook_input)
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["permissionDecision"] == "deny"
+        assert "BLOCKED" in data["permissionDecisionReason"]
+
+    def test_invalid_json_string_tool_args_allows(self, run_copilot_hook_raw):
+        hook_input = {
+            "toolName": "bash",
+            "toolArgs": "not valid json{{",
+        }
+        result = run_copilot_hook_raw(hook_input)
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["permissionDecision"] == "allow"
