@@ -22,6 +22,9 @@ _WRITE_TOOLS = {"write_file", "replace", "create_file"}
 
 _COMMAND_FIELDS = ("command", "cmd")
 
+_FAST_SHIP_KEYWORDS = ("git commit", "git push", "gh pr create", ".scan-pass")
+_SCAN_PASS = ".scan-pass"  # noqa: S105
+
 _DEBUG = bool(os.environ.get("APPSEC_DEBUG"))
 
 
@@ -60,22 +63,16 @@ def main():
     _debug(f"received: tool_name={hook_input.get('tool_name', '<missing>')}")
 
     try:
-        from hook_core import check_gate, is_scan_pass_file  # noqa: E402
-    except ImportError as e:
-        _debug(f"CRITICAL: cannot import hook_core: {e}")
-        print(_ALLOW)
-        sys.exit(0)
-
-    try:
         tool_name = hook_input.get("tool_name", "")
         tool_input = hook_input.get("tool_input", {})
         if not isinstance(tool_input, dict):
             tool_input = {}
 
+        # Fast path: write-tool anti-forgery (pure string check, no imports needed)
         if tool_name in _WRITE_TOOLS:
             file_path = tool_input.get("file_path", tool_input.get("path", ""))
             _debug(f"write-tool check: tool={tool_name}, path={file_path}")
-            if is_scan_pass_file(file_path):
+            if os.path.basename(file_path) == _SCAN_PASS:
                 _deny(
                     "BLOCKED: Direct writes to .scan-pass are not allowed. "
                     "Run scan_diff() to scan your code instead."
@@ -83,12 +80,21 @@ def main():
             print(_ALLOW)
             sys.exit(0)
 
+        # Fast path: extract command and skip non-shipping commands immediately
         cmd = _extract_command(tool_input)
         _debug(f"shell-tool check: tool={tool_name}, cmd={cmd!r:.200}")
         if not cmd:
             _debug("no command extracted, allowing")
             print(_ALLOW)
             sys.exit(0)
+
+        if not any(kw in cmd for kw in _FAST_SHIP_KEYWORDS):
+            _debug("fast-path: not a shipping command, allowing")
+            print(_ALLOW)
+            sys.exit(0)
+
+        # Slow path: shipping command detected, import gate logic (runs git subprocess)
+        from hook_core import check_gate  # noqa: E402
 
         result = check_gate(cmd)
         if result.decision == "deny":
@@ -99,6 +105,10 @@ def main():
         print(_ALLOW)
         sys.exit(0)
 
+    except ImportError as e:
+        _debug(f"CRITICAL: cannot import hook_core: {e}")
+        print(_ALLOW)
+        sys.exit(0)
     except Exception as e:
         _debug(f"operational error (fail-open): {type(e).__name__}: {e}")
         print(_ALLOW)
