@@ -2,7 +2,7 @@
   "hooks": {
     "BeforeTool": [
       {
-        "matcher": "shell|bash|run_shell_command|write_file|edit_file|patch_file",
+        "matcher": "run_shell_command|write_file|replace",
         "hooks": [
           {
             "type": "command",

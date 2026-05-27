@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Gemini CLI BeforeTool hook -- Security gate for shipping commands.
 
-Protocol: stdout JSON with {"decision": "allow"} or {"decision": "deny", "reason": "..."}.
-Exit code is always 0 (Gemini uses JSON decision field, not exit codes for deny).
+Protocol (per Gemini CLI docs):
+- Allow: {"decision": "allow"} on stdout, exit 0
+- Deny (hard block): reason on stderr, exit 2
+  Also writes full JSON to stdout as belt-and-suspenders.
 """
 
 import json
@@ -16,8 +18,33 @@ if _hooks_dir not in sys.path:
 _ALLOW = json.dumps({"decision": "allow"})
 _MAX_STDIN_BYTES = 1_048_576
 
-_SHELL_TOOLS = {"shell", "bash", "run_shell_command", "terminal", "execute_command"}
-_WRITE_TOOLS = {"write_file", "edit_file", "patch_file", "create_file", "replace"}
+_WRITE_TOOLS = {"write_file", "replace", "create_file"}
+
+_COMMAND_FIELDS = ("command", "cmd")
+
+_DEBUG = bool(os.environ.get("APPSEC_DEBUG"))
+
+
+def _debug(msg: str) -> None:
+    if _DEBUG:
+        sys.stderr.write(f"[appsec-gemini-hook] {msg}\n")
+        sys.stderr.flush()
+
+
+def _deny(reason: str) -> None:
+    """Deny via exit code 2 (hard block). Reason goes to stderr AND stdout JSON."""
+    sys.stderr.write(reason)
+    sys.stderr.flush()
+    print(json.dumps({"decision": "deny", "reason": reason, "systemMessage": reason}))
+    sys.exit(2)
+
+
+def _extract_command(tool_input: dict) -> str:
+    for field in _COMMAND_FIELDS:
+        val = tool_input.get(field, "")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
 
 
 def main():
@@ -26,47 +53,54 @@ def main():
         hook_input = json.loads(raw) if raw.strip() else {}
         if not isinstance(hook_input, dict):
             hook_input = {}
-    except Exception:
+    except Exception as e:
+        _debug(f"stdin parse error: {e}")
         hook_input = {}
+
+    _debug(f"received: tool_name={hook_input.get('tool_name', '<missing>')}")
 
     try:
         from hook_core import check_gate, is_scan_pass_file  # noqa: E402
+    except ImportError as e:
+        _debug(f"CRITICAL: cannot import hook_core: {e}")
+        print(_ALLOW)
+        sys.exit(0)
 
+    try:
         tool_name = hook_input.get("tool_name", "")
         tool_input = hook_input.get("tool_input", {})
         if not isinstance(tool_input, dict):
             tool_input = {}
 
-        if tool_name in _SHELL_TOOLS:
-            cmd = tool_input.get("command", "")
-            if not isinstance(cmd, str) or not cmd.strip():
-                print(_ALLOW)
-                sys.exit(0)
-            result = check_gate(cmd)
-            if result.decision == "deny":
-                print(json.dumps({"decision": "deny", "reason": result.system_message}))
-                sys.exit(0)
-
-        elif tool_name in _WRITE_TOOLS:
+        if tool_name in _WRITE_TOOLS:
             file_path = tool_input.get("file_path", tool_input.get("path", ""))
+            _debug(f"write-tool check: tool={tool_name}, path={file_path}")
             if is_scan_pass_file(file_path):
-                print(
-                    json.dumps(
-                        {
-                            "decision": "deny",
-                            "reason": (
-                                "BLOCKED: Direct writes to .scan-pass are not allowed. "
-                                "Run scan_diff() to scan your code instead."
-                            ),
-                        }
-                    )
+                _deny(
+                    "BLOCKED: Direct writes to .scan-pass are not allowed. "
+                    "Run scan_diff() to scan your code instead."
                 )
-                sys.exit(0)
+            print(_ALLOW)
+            sys.exit(0)
 
+        cmd = _extract_command(tool_input)
+        _debug(f"shell-tool check: tool={tool_name}, cmd={cmd!r:.200}")
+        if not cmd:
+            _debug("no command extracted, allowing")
+            print(_ALLOW)
+            sys.exit(0)
+
+        result = check_gate(cmd)
+        if result.decision == "deny":
+            _debug(f"DENY: {result.system_message[:100]}")
+            _deny(result.system_message)
+
+        _debug("gate passed, allowing")
         print(_ALLOW)
         sys.exit(0)
 
-    except Exception:
+    except Exception as e:
+        _debug(f"operational error (fail-open): {type(e).__name__}: {e}")
         print(_ALLOW)
         sys.exit(0)
 
