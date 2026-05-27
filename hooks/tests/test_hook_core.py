@@ -178,7 +178,7 @@ class TestCrossAdapterInterop:
             ("pre_commit_scan.py", {"tool_input": {"command": "git commit -m 'x'"}}),
             (
                 "gemini_pre_tool.py",
-                {"tool_name": "shell", "tool_input": {"command": "git commit -m 'x'"}},
+                {"tool_name": "run_shell_command", "tool_input": {"command": "git commit -m 'x'"}},
             ),
             (
                 "codex_pre_tool.py",
