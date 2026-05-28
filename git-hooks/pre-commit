@@ -6,7 +6,9 @@
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Symlink: .git/hooks/pre-commit -> ../../git-hooks/pre-commit
 PLUGIN_DIR="$(cd "$HOOK_DIR/../.." && pwd)"
-SCAN_PASS="${PLUGIN_DIR}/.scan-pass"
+# Resolve .scan-pass from git root (matches server.py and hook_core.py)
+GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || GIT_ROOT="$PLUGIN_DIR"
+SCAN_PASS="${GIT_ROOT}/.scan-pass"
 STRICT="${APPSEC_HOOK_STRICT:-0}"
 
 fail_open() {
