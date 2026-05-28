@@ -21,6 +21,19 @@ if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
 
 
+@pytest.fixture(autouse=True)
+def _ensure_tmp_is_git_repo(tmp_path, request):
+    """Ensure tmp_path looks like a git repo for resolve_scan_pass_path() CWE-73 checks.
+
+    Skipped for tests that manage their own .git setup (marked with no_auto_git).
+    """
+    if "no_auto_git" in request.keywords:
+        return
+    git_dir = tmp_path / ".git"
+    if not git_dir.exists():
+        git_dir.mkdir()
+
+
 @pytest.fixture
 def hook_module():
     """Import pre_commit_scan module for direct function calls in unit tests.

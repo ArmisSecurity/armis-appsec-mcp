@@ -460,9 +460,13 @@ class TestCWE73PluginRootValidation:
         # CWD is tmp_path (a git root) and .scan-pass hash matches → allow
         assert rc == 0, "Empty CLAUDE_PLUGIN_ROOT should use CWD git root"
 
+    @pytest.mark.no_auto_git
     def test_find_git_root_helper(self, hook_module, tmp_path):
         """Unit test for _find_git_root helper."""
-        # No git repo
+        # No git repo — remove auto-created .git from conftest
+        git_dir = tmp_path / ".git"
+        if git_dir.exists():
+            git_dir.rmdir()
         assert hook_module._find_git_root(str(tmp_path)) is None
 
         # Create git repo

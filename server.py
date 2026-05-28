@@ -37,7 +37,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from auth import get_auth_status, init_auth
-from hash_utils import compute_staged_hash
+from hash_utils import compute_staged_hash, resolve_scan_pass_path
 from scanner_core import (
     APPSEC_API_URL,
     build_diff_line_map,
@@ -314,7 +314,7 @@ def get_debug_config() -> str:
             pass
 
     env_exists = os.path.isfile(os.path.join(plugin_root, ".env"))
-    scan_pass_exists = os.path.isfile(os.path.join(plugin_root, ".scan-pass"))
+    scan_pass_exists = os.path.isfile(resolve_scan_pass_path())
 
     lines = [
         f"Auth: {auth_status}",
@@ -535,7 +535,7 @@ _last_scan: dict = {
 
 def _scan_pass_path() -> str:
     """Return the path to the .scan-pass file."""
-    return os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir), ".scan-pass")
+    return resolve_scan_pass_path()
 
 
 def do_approve_findings(reason: str) -> str:

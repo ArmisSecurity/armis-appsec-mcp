@@ -33,9 +33,9 @@ def _setup_plugin_structure(tmp_path):
     venv_bin = tmp_path / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     git_dir = tmp_path / ".git"
-    git_dir.mkdir()
+    git_dir.mkdir(exist_ok=True)
     hooks_dir = git_dir / "hooks"
-    hooks_dir.mkdir()
+    hooks_dir.mkdir(exist_ok=True)
 
     # Copy the hook script
     with open(_GIT_HOOK_SCRIPT) as f:
