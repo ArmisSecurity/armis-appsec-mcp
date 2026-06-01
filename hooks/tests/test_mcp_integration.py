@@ -50,15 +50,19 @@ _HIGH_FINDINGS = [{"cwe": 89, "severity": "HIGH", "line": 10, "explanation": "SQ
 
 
 @pytest.fixture
-def plugin_root(tmp_path):
-    """Set CLAUDE_PLUGIN_ROOT to a temp dir for .scan-pass isolation."""
-    old = os.environ.get("CLAUDE_PLUGIN_ROOT")
-    os.environ["CLAUDE_PLUGIN_ROOT"] = str(tmp_path)
-    yield tmp_path
-    if old is not None:
-        os.environ["CLAUDE_PLUGIN_ROOT"] = old
-    else:
-        os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+def plugin_root(tmp_path, monkeypatch):
+    """Redirect server.py's scan-pass into a temp dir for isolation.
+
+    The scan-pass path is resolved by git from CWD (CLAUDE_PLUGIN_ROOT is no
+    longer consulted), so we patch server._scan_pass_path directly and
+    neutralize the legacy cleanup. Returns the dir; the scan-pass file is
+    ``<dir>/armis-scan-pass``.
+    """
+    import server
+
+    monkeypatch.setattr(server, "_scan_pass_path", lambda: str(tmp_path / "armis-scan-pass"))
+    monkeypatch.setattr(server, "cleanup_legacy_scan_pass", lambda: None)
+    return tmp_path
 
 
 def _init_git_repo(path):
@@ -97,7 +101,7 @@ class TestScanPassForgeryPrevention:
     def test_cache_scan_without_staged_flag_does_not_write(self, plugin_root):
         """scan_code/scan_file path: is_staged_scan=False -> no .scan-pass."""
         server._cache_scan("clean report", _CLEAN_FINDINGS, "snippet.py")
-        scan_pass = plugin_root / ".scan-pass"
+        scan_pass = plugin_root / "armis-scan-pass"
         assert not scan_pass.exists(), "_cache_scan with is_staged_scan=False wrote .scan-pass"
 
     def test_cache_scan_with_staged_flag_writes(self, plugin_root, tmp_path):
@@ -117,14 +121,14 @@ class TestScanPassForgeryPrevention:
         finally:
             os.chdir(original_cwd)
 
-        scan_pass = plugin_root / ".scan-pass"
+        scan_pass = plugin_root / "armis-scan-pass"
         assert scan_pass.exists(), "_cache_scan with is_staged_scan=True should write .scan-pass"
         assert scan_pass.read_text().strip() == staged_hash
 
     def test_cache_scan_with_findings_removes_scan_pass(self, plugin_root, tmp_path):
         """HIGH findings + is_staged_scan=True -> removes existing .scan-pass."""
         _init_git_repo(tmp_path)
-        (plugin_root / ".scan-pass").write_text("old-hash")
+        (plugin_root / "armis-scan-pass").write_text("old-hash")
 
         original_cwd = os.getcwd()
         try:
@@ -138,7 +142,7 @@ class TestScanPassForgeryPrevention:
         finally:
             os.chdir(original_cwd)
 
-        scan_pass = plugin_root / ".scan-pass"
+        scan_pass = plugin_root / "armis-scan-pass"
         assert not scan_pass.exists(), ".scan-pass should be removed when HIGH findings are present"
 
     def test_cache_scan_updates_last_scan_cache(self):
@@ -217,7 +221,7 @@ class TestApproveFindings:
                 "staged changes",
                 is_staged_scan=True,
             )
-            assert not (plugin_root / ".scan-pass").exists()
+            assert not (plugin_root / "armis-scan-pass").exists()
 
             # Now approve
             result = server.do_approve_findings(reason="false positives on deleted code")
@@ -225,7 +229,7 @@ class TestApproveFindings:
             os.chdir(original_cwd)
 
         assert "Approved 1 HIGH/CRITICAL" in result
-        scan_pass = plugin_root / ".scan-pass"
+        scan_pass = plugin_root / "armis-scan-pass"
         assert scan_pass.exists()
         assert scan_pass.read_text().strip() == staged_hash
 

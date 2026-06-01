@@ -109,6 +109,11 @@ class TestNonShippingAllow:
 
 
 class TestWriteToolGuard:
+    def test_write_to_armis_scan_pass_denied(self, run_gemini_hook):
+        result = run_gemini_hook(tool_name="write_file", file_path="/project/.git/armis-scan-pass")
+        assert result.returncode == 2
+        assert "BLOCKED" in result.stderr
+
     def test_write_to_scan_pass_denied(self, run_gemini_hook):
         result = run_gemini_hook(tool_name="write_file", file_path="/project/.scan-pass")
         assert result.returncode == 2

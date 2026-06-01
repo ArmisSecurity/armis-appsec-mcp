@@ -18,7 +18,7 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv(os.path.join(_plugin_dir, ".env"))
 
 from auth import init_auth  # noqa: E402
-from hash_utils import resolve_scan_pass_path  # noqa: E402
+from hash_utils import cleanup_legacy_scan_pass, resolve_scan_pass_path  # noqa: E402
 from scanner_core import (  # noqa: E402
     APPSEC_API_URL,
     call_appsec_api,
@@ -67,12 +67,13 @@ def main() -> None:
         sys.exit(1)
 
     staged_hash = hashlib.sha256(result.stdout.encode()).hexdigest()
+    cleanup_legacy_scan_pass()  # remove any stale working-tree .scan-pass
     scan_pass_path = resolve_scan_pass_path()
     tmp_path_file = scan_pass_path + ".tmp"
     with open(tmp_path_file, "w") as f:
         f.write(staged_hash)
     os.replace(tmp_path_file, scan_pass_path)
-    print("appsec: scan clean. .scan-pass written.", file=sys.stderr)
+    print("appsec: scan clean. scan-pass written.", file=sys.stderr)
 
     sys.exit(0)
 

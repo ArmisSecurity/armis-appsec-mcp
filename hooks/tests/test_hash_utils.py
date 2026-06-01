@@ -1,4 +1,11 @@
-"""Tests for hash_utils.resolve_scan_pass_path — the unified .scan-pass resolver."""
+"""Tests for hash_utils.resolve_scan_pass_path — the unified scan-pass resolver.
+
+The resolver locates the scan-pass via `git rev-parse --absolute-git-dir`, so
+the MCP server (writer) and the commit-gate hook (reader) always agree — even
+inside git worktrees, where `.git` is a *file*, not a directory. The worktree
+case is the one the old dual-resolver code got wrong (isdir vs exists), so it
+gets dedicated coverage here.
+"""
 
 import os
 import subprocess
@@ -8,61 +15,77 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from hash_utils import resolve_scan_pass_path  # noqa: E402
+from hash_utils import (  # noqa: E402
+    SCAN_PASS_BASENAME,
+    cleanup_legacy_scan_pass,
+    resolve_scan_pass_path,
+)
+
+
+def _git(args, cwd):
+    subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, check=True)
 
 
 @pytest.fixture()
 def git_repo(tmp_path, monkeypatch):
     """Create a git repo in tmp_path and chdir into it."""
-    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.com"],
-        cwd=str(tmp_path),
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"],
-        cwd=str(tmp_path),
-        capture_output=True,
-    )
+    _git(["init"], tmp_path)
+    _git(["config", "user.email", "test@test.com"], tmp_path)
+    _git(["config", "user.name", "Test"], tmp_path)
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
 
+def _expected_git_dir(repo):
+    """The absolute git dir git itself reports for repo (symlink-resolved)."""
+    return subprocess.run(
+        ["git", "rev-parse", "--absolute-git-dir"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
 class TestResolveScanPassPath:
-    def test_no_env_var_uses_cwd_git_root(self, git_repo, monkeypatch):
+    def test_resolves_into_git_dir(self, git_repo, monkeypatch):
+        """Path is <absolute-git-dir>/armis-scan-pass, inside .git/."""
         monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
         result = resolve_scan_pass_path()
-        assert result == os.path.join(str(git_repo), ".scan-pass")
+        assert result == os.path.join(_expected_git_dir(git_repo), SCAN_PASS_BASENAME)
+        # Lives inside .git/ — never in the working tree.
+        assert os.path.basename(result) == "armis-scan-pass"
+        assert ".git" in result
 
-    def test_env_var_set_uses_env_var(self, git_repo, monkeypatch):
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(git_repo))
+    def test_ignores_claude_plugin_root(self, git_repo, monkeypatch, tmp_path):
+        """CLAUDE_PLUGIN_ROOT is no longer consulted; the CWD git dir wins."""
+        other = tmp_path.parent / "elsewhere"
+        other.mkdir(exist_ok=True)
+        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(other))
         result = resolve_scan_pass_path()
-        assert result == os.path.join(str(git_repo), ".scan-pass")
+        assert result == os.path.join(_expected_git_dir(git_repo), SCAN_PASS_BASENAME)
 
-    def test_env_var_subdir_of_repo(self, git_repo, monkeypatch):
-        subdir = git_repo / "subdir"
-        subdir.mkdir()
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(subdir))
+    def test_cwd_in_subdirectory_resolves_to_repo_git_dir(self, git_repo, monkeypatch):
+        """CWD deep in the repo still resolves to the repo's git dir."""
+        subdir = git_repo / "a" / "b" / "c"
+        subdir.mkdir(parents=True)
+        monkeypatch.chdir(subdir)
         result = resolve_scan_pass_path()
-        assert result == os.path.join(str(subdir), ".scan-pass")
+        assert result == os.path.join(_expected_git_dir(git_repo), SCAN_PASS_BASENAME)
 
-    def test_env_var_outside_git_falls_back_to_cwd(self, git_repo, monkeypatch, tmp_path):
-        # Create a directory that is NOT inside any git repo
+    def test_not_a_git_repo_falls_back_to_plugin_dir(self, monkeypatch):
+        """Outside any git repo, fall back to the plugin install dir."""
         import tempfile
 
         with tempfile.TemporaryDirectory() as isolated:
-            monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", isolated)
+            monkeypatch.chdir(isolated)
             result = resolve_scan_pass_path()
-            assert result == os.path.join(str(git_repo), ".scan-pass")
+        plugin_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        assert result == os.path.join(plugin_dir, SCAN_PASS_BASENAME)
 
-    def test_env_var_nonexistent_path_falls_back(self, git_repo, monkeypatch):
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", "/nonexistent/path/xyz")
-        result = resolve_scan_pass_path()
-        assert result == os.path.join(str(git_repo), ".scan-pass")
-
-    def test_server_and_hooks_resolve_same_path(self, git_repo, monkeypatch):
-        """Both resolve_scan_pass_path and hook_core.resolve_plugin_root agree."""
+    def test_server_and_hook_resolve_same_path(self, git_repo, monkeypatch):
+        """Regression: the gate reader (hook_core) and the writer (hash_utils)
+        must resolve the SAME path. They previously diverged in worktrees."""
         monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
 
         hooks_dir = os.path.join(
@@ -73,15 +96,61 @@ class TestResolveScanPassPath:
             sys.path.insert(0, hooks_dir)
         import hook_core
 
-        server_path = resolve_scan_pass_path()
-        hook_path = os.path.join(hook_core.resolve_plugin_root(), ".scan-pass")
-        assert server_path == hook_path
+        # hook_core imports resolve_scan_pass_path from hash_utils — same source.
+        assert hook_core.resolve_scan_pass_path() == resolve_scan_pass_path()
 
-    def test_cwd_in_subdirectory(self, git_repo, monkeypatch):
-        """CWD deep in repo still resolves to repo root."""
-        subdir = git_repo / "a" / "b" / "c"
-        subdir.mkdir(parents=True)
-        monkeypatch.chdir(subdir)
-        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
-        result = resolve_scan_pass_path()
-        assert result == os.path.join(str(git_repo), ".scan-pass")
+
+class TestWorktree:
+    """The bug that motivated this change: in a git worktree `.git` is a file,
+    not a directory, so the old filesystem walker (isdir) and the writer
+    (exists) disagreed and the gate denied forever. With git-based resolution
+    they agree."""
+
+    def test_resolves_in_worktree(self, git_repo, monkeypatch, tmp_path):
+        # Need a commit before `git worktree add` works.
+        (git_repo / "seed.txt").write_text("seed")
+        _git(["add", "seed.txt"], git_repo)
+        _git(["commit", "-m", "seed"], git_repo)
+
+        worktree = tmp_path.parent / "wt"
+        _git(["worktree", "add", str(worktree)], git_repo)
+        try:
+            # `.git` in a worktree is a FILE, not a directory.
+            assert (worktree / ".git").is_file()
+
+            monkeypatch.chdir(worktree)
+            monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+
+            result = resolve_scan_pass_path()
+            expected_git_dir = _expected_git_dir(worktree)
+
+            # Resolves into the PER-WORKTREE git dir, not the shared common dir.
+            assert result == os.path.join(expected_git_dir, SCAN_PASS_BASENAME)
+            assert "worktrees" in expected_git_dir
+            # And the writer can actually create it there.
+            with open(result, "w") as f:
+                f.write("deadbeef")
+            assert os.path.isfile(result)
+        finally:
+            _git(["worktree", "remove", "--force", str(worktree)], git_repo)
+
+
+class TestCleanupLegacyScanPass:
+    def test_removes_legacy_working_tree_file(self, git_repo):
+        legacy = git_repo / ".scan-pass"
+        legacy.write_text("old-hash")
+        cleanup_legacy_scan_pass()
+        assert not legacy.exists()
+
+    def test_noop_when_absent(self, git_repo):
+        # Should not raise when there is nothing to clean up.
+        cleanup_legacy_scan_pass()
+        assert not (git_repo / ".scan-pass").exists()
+
+    def test_noop_outside_git_repo(self, monkeypatch):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as isolated:
+            monkeypatch.chdir(isolated)
+            # No git repo → no toplevel → silently does nothing.
+            cleanup_legacy_scan_pass()

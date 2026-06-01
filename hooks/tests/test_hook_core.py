@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 import pytest
+from conftest import scan_pass_path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import hook_core
@@ -60,6 +61,10 @@ class TestHasAllFlag:
 
 class TestIsScanPassFile:
     def test_basename_match(self):
+        # Current name
+        assert hook_core.is_scan_pass_file("/some/path/armis-scan-pass")
+        assert hook_core.is_scan_pass_file("armis-scan-pass")
+        # Legacy name still blocked
         assert hook_core.is_scan_pass_file("/some/path/.scan-pass")
         assert hook_core.is_scan_pass_file(".scan-pass")
 
@@ -81,20 +86,32 @@ class TestCheckGate:
         assert result.decision == "deny"
         assert "BLOCKED" in result.system_message
 
+    def test_armis_scan_pass_write_denies(self):
+        result = hook_core.check_gate("echo hash > /path/armis-scan-pass")
+        assert result.decision == "deny"
+        assert "BLOCKED" in result.system_message
+
     def test_scan_pass_tee_denies(self):
         result = hook_core.check_gate("tee /path/.scan-pass")
         assert result.decision == "deny"
         assert "BLOCKED" in result.system_message
 
+    def test_armis_scan_pass_tee_denies(self):
+        result = hook_core.check_gate("tee /path/armis-scan-pass")
+        assert result.decision == "deny"
+        assert "BLOCKED" in result.system_message
+
     def test_shipping_without_scan_pass_denies(self, tmp_path):
-        os.environ["CLAUDE_PLUGIN_ROOT"] = str(tmp_path)
         subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+        old_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
         try:
+            # Fresh repo, no scan-pass in its git dir → deny.
             result = hook_core.check_gate("git commit -m 'msg'")
             assert result.decision == "deny"
             assert "Security scan required" in result.system_message
         finally:
-            del os.environ["CLAUDE_PLUGIN_ROOT"]
+            os.chdir(old_cwd)
 
     def test_shipping_with_valid_scan_pass_allows(self, tmp_path):
         subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
@@ -119,17 +136,16 @@ class TestCheckGate:
             text=True,
         )
         staged_hash = hashlib.sha256(diff_result.stdout.encode()).hexdigest()
-        (tmp_path / ".scan-pass").write_text(staged_hash)
 
-        os.environ["CLAUDE_PLUGIN_ROOT"] = str(tmp_path)
         old_cwd = os.getcwd()
         os.chdir(str(tmp_path))
         try:
+            # Write the scan-pass where the gate (resolving via CWD git) reads it.
+            scan_pass_path(tmp_path).write_text(staged_hash)
             result = hook_core.check_gate("git commit -m 'msg'")
             assert result.decision == "allow"
         finally:
             os.chdir(old_cwd)
-            del os.environ["CLAUDE_PLUGIN_ROOT"]
 
 
 class TestBuildSystemMessage:
@@ -171,7 +187,8 @@ class TestCrossAdapterInterop:
             text=True,
         )
         staged_hash = hashlib.sha256(diff_result.stdout.encode()).hexdigest()
-        (tmp_path / ".scan-pass").write_text(staged_hash)
+        # All adapters run with cwd=tmp_path and resolve the scan-pass via git.
+        scan_pass_path(tmp_path).write_text(staged_hash)
 
         hooks_dir = os.path.join(os.path.dirname(__file__), "..")
         adapters = [

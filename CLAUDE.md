@@ -56,15 +56,17 @@ python server.py
 
 This is the trickiest cross-file interaction. The commit gate works like a handshake:
 
-1. Agent calls `scan_diff(staged=True)` (or `ref=...`). On success with **no HIGH/CRITICAL findings**, `server._cache_scan()` writes `SHA-256(staged diff)` to `{CLAUDE_PLUGIN_ROOT}/.scan-pass`.
+1. Agent calls `scan_diff(staged=True)` (or `ref=...`). On success with **no HIGH/CRITICAL findings**, `server._cache_scan()` writes `SHA-256(staged diff)` to the scan-pass file. The file lives **inside the repo's git dir** as `<git-dir>/armis-scan-pass` — resolved by `hash_utils.resolve_scan_pass_path()` via `git rev-parse --absolute-git-dir`. Keeping it in `.git/` means it never appears in the working tree (no `git status` noise, nothing to gitignore) and it resolves correctly inside **git worktrees** (every Conductor workspace), where `.git` is a *file*, not a directory.
 2. Agent calls `git commit`. `hooks/pre_commit_scan.py` fires (PreToolUse on Bash), computes the **current** staged hash, and allows the command only if it equals the stored hash. Stale passes (someone staged more code since scanning) are rejected.
 3. For `git push` / `gh pr create`, file presence alone is sufficient — the commit already enforced the hash match.
 4. If the agent needs to ship despite HIGH/CRITICAL findings, the user must explicitly approve; the agent then calls `approve_findings(reason=...)` which writes `.scan-pass` with the approval hash. **The agent must never call `approve_findings` on its own** — the system message in `_build_system_message` spells this out.
 
 **Forgery protection:**
-- `hooks/protect_scan_pass.py` denies any `Write`/`Edit` whose basename is `.scan-pass`.
-- `hooks/pre_commit_scan.py` denies any Bash command matching `_SCAN_PASS_WRITE_PATTERN` (redirects, `tee`, `cp`, `mv` targeting `.scan-pass`).
-- `CLAUDE_PLUGIN_ROOT` is validated in `_plugin_root()` — it must resolve inside a git repository, mitigating CWE-73 path traversal.
+- `hooks/protect_scan_pass.py` denies any `Write`/`Edit` whose basename is `armis-scan-pass` (or the legacy `.scan-pass`) — see `hook_core.is_scan_pass_file`.
+- `hooks/pre_commit_scan.py` denies any Bash command matching `_SCAN_PASS_WRITE_PATTERN` (redirects, `tee`, `cp`, `mv` targeting `armis-scan-pass` / `.scan-pass`).
+- The scan-pass path is computed by `git` itself (`git rev-parse --absolute-git-dir`), not from an env var, so there is no externally-controlled path to traverse (the old `CLAUDE_PLUGIN_ROOT`-based resolution and its CWE-73 mitigation are gone).
+
+**Reader/writer must agree (the worktree bug):** the gate reader (`hook_core`) and the scanner writer (`server`, `git-hooks`) **both** call `hash_utils.resolve_scan_pass_path()`. They previously used two private `_find_git_root` walkers that disagreed on a worktree's `.git` *file* (`os.path.isdir` vs `os.path.exists`), so the gate denied forever in every Conductor workspace. Never reintroduce a second resolver.
 
 Don't "simplify" any of this without reading `.context/0008-*.md` — the guard rails are deliberate.
 
@@ -127,10 +129,10 @@ When you edit either hook, preserve the outer `try: ... except Exception: print(
 
 The repo has two distinct hook systems serving different audiences:
 
-- **`hooks/`** — Claude Code **PreToolUse** hooks (manifest: `hooks/hooks.json`). These fire inside Claude Code's tool execution pipeline and are installed automatically via the plugin. They enforce the `.scan-pass` gate on `Bash` (commit/push/PR commands) and block `Write`/`Edit` to `.scan-pass` (anti-forgery).
-- **`git-hooks/`** — Portable **git** hooks (`pre-commit` shell script + `scan-staged.py`). These work with any client (Cursor, VS Code, Gemini, Copilot CLI) and are installed via `make install-hooks`. They call the scanner directly (no MCP client needed) and write `.scan-pass` using the same hash format, so they're interchangeable with the MCP `scan_diff` flow.
+- **`hooks/`** — Claude Code **PreToolUse** hooks (manifest: `hooks/hooks.json`). These fire inside Claude Code's tool execution pipeline and are installed automatically via the plugin. They enforce the scan-pass gate on `Bash` (commit/push/PR commands) and block `Write`/`Edit` to the scan-pass file (anti-forgery).
+- **`git-hooks/`** — Portable **git** hooks (`pre-commit` shell script + `scan-staged.py`). These work with any client (Cursor, VS Code, Gemini, Copilot CLI) and are installed via `make install-hooks`. They call the scanner directly (no MCP client needed) and write the scan-pass using the same path and hash format, so they're interchangeable with the MCP `scan_diff` flow.
 
-Both systems share the same core modules and the same `.scan-pass` file format — a SHA-256 of the staged diff. Code scanned via `git-hooks/scan-staged.py` will satisfy the Claude Code hook and vice versa.
+Both systems share the same core modules and resolve the scan-pass to the same place — `<git-dir>/armis-scan-pass`, holding a SHA-256 of the staged diff (the shell hook uses `git rev-parse --absolute-git-dir`; Python uses `hash_utils.resolve_scan_pass_path()`). Code scanned via `git-hooks/scan-staged.py` will satisfy the Claude Code hook and vice versa.
 
 ## Multi-client support
 

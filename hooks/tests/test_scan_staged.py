@@ -11,6 +11,8 @@ import subprocess
 import sys
 import textwrap
 
+from conftest import scan_pass_path
+
 _PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _SCAN_STAGED_SCRIPT = os.path.join(_PLUGIN_ROOT, "git-hooks", "scan-staged.py")
 
@@ -152,7 +154,10 @@ class TestCleanScan:
         stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response="```json\n[]\n```")
         assert rc == 0
         assert "scan clean" in stderr
-        assert ".scan-pass written" in stderr
+        assert "scan-pass written" in stderr
+        # Written inside the git dir, not the working tree.
+        assert scan_pass_path(tmp_path).exists()
+        assert not (tmp_path / ".scan-pass").exists()
 
     def test_low_medium_findings_allow_commit(self, tmp_path):
         """LOW and MEDIUM findings should NOT block — only HIGH/CRITICAL do."""

@@ -138,9 +138,8 @@ class TestScanFilePathExclusion:
 # Category E: _cache_scan with suppression data
 # ---------------------------------------------------------------------------
 class TestCacheScanSuppression:
-    def test_stores_suppressed_findings(self, tmp_path, monkeypatch):
+    def test_stores_suppressed_findings(self):
         """_cache_scan stores suppressed findings in _last_scan."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
         suppressed = [{"cwe": 798, "severity": "HIGH"}]
         summary = {"total": 2, "active": 1, "suppressed": 1, "by_directive": {"cwe:798": 1}}
 
@@ -155,9 +154,8 @@ class TestCacheScanSuppression:
         assert server._last_scan["suppressed"] == suppressed
         assert server._last_scan["suppression_summary"] == summary
 
-    def test_suppressed_critical_blocks_scan_pass(self, tmp_path, monkeypatch):
-        """Suppressed CRITICAL findings prevent .scan-pass from being written."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+    def test_suppressed_critical_blocks_scan_pass(self, isolated_server_scan_pass):
+        """Suppressed CRITICAL findings prevent the scan-pass from being written."""
         suppressed = [{"cwe": 798, "severity": "CRITICAL"}]
 
         server._cache_scan(
@@ -170,12 +168,10 @@ class TestCacheScanSuppression:
             suppression_summary={"total": 1, "active": 0, "suppressed": 1, "by_directive": {}},
         )
 
-        scan_pass = tmp_path / ".scan-pass"
-        assert not scan_pass.exists()
+        assert not isolated_server_scan_pass.exists()
 
-    def test_suppressed_high_does_not_block_scan_pass(self, tmp_path, monkeypatch):
-        """Suppressed HIGH findings do NOT block .scan-pass (only CRITICAL)."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+    def test_suppressed_high_does_not_block_scan_pass(self, isolated_server_scan_pass):
+        """Suppressed HIGH findings do NOT block the scan-pass (only CRITICAL)."""
         suppressed = [{"cwe": 89, "severity": "HIGH"}]
 
         server._cache_scan(
@@ -188,18 +184,16 @@ class TestCacheScanSuppression:
             suppression_summary={"total": 1, "active": 0, "suppressed": 1, "by_directive": {}},
         )
 
-        scan_pass = tmp_path / ".scan-pass"
-        assert scan_pass.exists()
-        assert scan_pass.read_text() == "abc123"
+        assert isolated_server_scan_pass.exists()
+        assert isolated_server_scan_pass.read_text() == "abc123"
 
 
 # ---------------------------------------------------------------------------
 # Category E: approve_findings with suppressed CRITICAL
 # ---------------------------------------------------------------------------
 class TestApproveFindingsSuppressedCritical:
-    def test_suppressed_critical_requires_approval(self, tmp_path, monkeypatch):
+    def test_suppressed_critical_requires_approval(self, isolated_server_scan_pass):
         """Suppressed CRITICAL findings still require approve_findings."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
         server._last_scan.update(
             {
                 "findings": [],
@@ -212,7 +206,7 @@ class TestApproveFindingsSuppressedCritical:
             result = server.do_approve_findings("user accepts risk")
 
         assert "Approved" in result
-        assert (tmp_path / ".scan-pass").exists()
+        assert isolated_server_scan_pass.exists()
 
     def test_no_findings_no_suppressed_critical_errors(self):
         """No active HIGH/CRITICAL + no suppressed CRITICAL → error."""
@@ -232,9 +226,8 @@ class TestApproveFindingsSuppressedCritical:
 # Category E: scan_diff path exclusion (tests the wiring logic via helpers)
 # ---------------------------------------------------------------------------
 class TestScanDiffPathExclusion:
-    def test_all_excluded_writes_scan_pass(self, tmp_path, monkeypatch):
-        """When filter_diff_excluded_paths removes all files, _cache_scan writes .scan-pass."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+    def test_all_excluded_writes_scan_pass(self, tmp_path, isolated_server_scan_pass):
+        """When filter_diff_excluded_paths removes all files, _cache_scan writes the scan-pass."""
         diff_text = (
             "diff --git a/vendor/lib.js b/vendor/lib.js\n"
             "index 1234..5678 100644\n"
@@ -254,9 +247,8 @@ class TestScanDiffPathExclusion:
         report = f"SCAN {label}: all changed files excluded by .armisignore"
         server._cache_scan(report, [], label, is_staged_scan=True, scan_hash=scan_hash)
 
-        scan_pass = tmp_path / ".scan-pass"
-        assert scan_pass.exists()
-        assert scan_pass.read_text() == scan_hash
+        assert isolated_server_scan_pass.exists()
+        assert isolated_server_scan_pass.read_text() == scan_hash
 
     def test_partial_exclusion_filters_diff(self, tmp_path):
         """filter_diff_excluded_paths removes excluded files, keeps the rest."""
@@ -279,9 +271,8 @@ class TestScanDiffPathExclusion:
         assert "src/app.py" in filtered
 
     @pytest.mark.asyncio
-    async def test_partial_exclusion_sends_filtered_to_api(self, tmp_path, monkeypatch):
+    async def test_partial_exclusion_sends_filtered_to_api(self, tmp_path):
         """_run_scan receives only the filtered diff content."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
         diff_text = (
             "diff --git a/vendor/lib.js b/vendor/lib.js\n"
             "--- a/vendor/lib.js\n"
@@ -345,9 +336,8 @@ class TestFormatFindingsWithSuppression:
 # ---------------------------------------------------------------------------
 class TestInlineSuppressionIntegration:
     @pytest.mark.asyncio
-    async def test_scan_file_inline_suppression(self, tmp_path, monkeypatch):
+    async def test_scan_file_inline_suppression(self, tmp_path):
         """scan_file with inline armis:ignore suppresses matching findings."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
         raw_response = (
             '```json\n[{"cwe": 798, "severity": "HIGH", "line": 1, '
             '"explanation": "hardcoded secret", "has_secret": true, '
@@ -422,9 +412,10 @@ class TestInlineSuppressionIntegration:
         assert "armis:ignore inline" in report
 
     @pytest.mark.asyncio
-    async def test_inline_critical_still_blocks_scan_pass(self, tmp_path, monkeypatch):
-        """Inline-suppressed CRITICAL findings still block .scan-pass."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+    async def test_inline_critical_still_blocks_scan_pass(
+        self, tmp_path, isolated_server_scan_pass
+    ):
+        """Inline-suppressed CRITICAL findings still block the scan-pass."""
         raw_response = (
             '```json\n[{"cwe": 798, "severity": "CRITICAL", "line": 1, '
             '"explanation": "critical secret", "has_secret": true, '
@@ -445,12 +436,10 @@ class TestInlineSuppressionIntegration:
                 scan_hash="hash123",
             )
 
-        scan_pass = tmp_path / ".scan-pass"
-        assert not scan_pass.exists()
+        assert not isolated_server_scan_pass.exists()
 
-    def test_suppression_metadata_uniform(self, tmp_path, monkeypatch):
+    def test_suppression_metadata_uniform(self, tmp_path):
         """Both armisignore and inline suppressed findings have metadata keys (D5)."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
         from suppression import apply_inline_suppressions, apply_suppressions
 
         findings = [

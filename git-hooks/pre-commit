@@ -6,9 +6,11 @@
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Symlink: .git/hooks/pre-commit -> ../../git-hooks/pre-commit
 PLUGIN_DIR="$(cd "$HOOK_DIR/../.." && pwd)"
-# Resolve .scan-pass from git root (matches server.py and hook_core.py)
-GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || GIT_ROOT="$PLUGIN_DIR"
-SCAN_PASS="${GIT_ROOT}/.scan-pass"
+# Resolve scan-pass inside the git dir (matches hash_utils.resolve_scan_pass_path).
+# --absolute-git-dir is worktree-correct: it returns the per-worktree git dir
+# (.git is a *file* in a worktree, so a work-tree path would diverge).
+GIT_DIR="$(git rev-parse --absolute-git-dir 2>/dev/null)" || GIT_DIR="$PLUGIN_DIR"
+SCAN_PASS="${GIT_DIR}/armis-scan-pass"
 STRICT="${APPSEC_HOOK_STRICT:-0}"
 
 fail_open() {

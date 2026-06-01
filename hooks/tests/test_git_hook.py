@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 import pytest
+from conftest import scan_pass_path
 
 # Actual plugin root — used to copy hash_utils.py
 _PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -132,7 +133,7 @@ class TestFailOpen:
     def test_stale_scan_pass_warns_but_allows(self, hook_env):
         tmp_path, hook, _hash = hook_env
         # Write a stale hash that doesn't match current staged diff
-        (tmp_path / ".scan-pass").write_text("0" * 64)
+        scan_pass_path(tmp_path).write_text("0" * 64)
         stdout, stderr, rc = _run_hook(tmp_path, hook)
         assert rc == 0, f"Expected fail-open (exit 0), got {rc}. stderr: {stderr}"
         assert "stale" in stderr
@@ -141,7 +142,7 @@ class TestFailOpen:
     def test_missing_python_fails_open(self, hook_env):
         tmp_path, hook, _hash = hook_env
         # Write .scan-pass so hook proceeds to hash computation
-        (tmp_path / ".scan-pass").write_text("something")
+        scan_pass_path(tmp_path).write_text("something")
         # Break the python symlink
         python_link = tmp_path / ".venv" / "bin" / "python"
         python_link.unlink()
@@ -163,14 +164,14 @@ class TestFailClosed:
 
     def test_stale_scan_pass_blocks_in_strict_mode(self, hook_env):
         tmp_path, hook, _hash = hook_env
-        (tmp_path / ".scan-pass").write_text("0" * 64)
+        scan_pass_path(tmp_path).write_text("0" * 64)
         stdout, stderr, rc = _run_hook(tmp_path, hook, {"APPSEC_HOOK_STRICT": "1"})
         assert rc == 1, f"Expected strict block (exit 1), got {rc}. stderr: {stderr}"
         assert "STRICT MODE" in stderr
 
     def test_missing_python_blocks_in_strict_mode(self, hook_env):
         tmp_path, hook, _hash = hook_env
-        (tmp_path / ".scan-pass").write_text("something")
+        scan_pass_path(tmp_path).write_text("something")
         python_link = tmp_path / ".venv" / "bin" / "python"
         python_link.unlink()
         python_link.symlink_to("/nonexistent/python3")
@@ -185,7 +186,7 @@ class TestValidScanPass:
 
     def test_matching_hash_allows_commit(self, hook_env):
         tmp_path, hook, staged_hash = hook_env
-        (tmp_path / ".scan-pass").write_text(staged_hash)
+        scan_pass_path(tmp_path).write_text(staged_hash)
         stdout, stderr, rc = _run_hook(tmp_path, hook)
         assert rc == 0, f"Expected exit 0 (allow), got {rc}. stderr: {stderr}"
         assert "STRICT" not in stderr
@@ -193,7 +194,7 @@ class TestValidScanPass:
 
     def test_hash_invalidated_by_new_staged_changes(self, hook_env):
         tmp_path, hook, staged_hash = hook_env
-        (tmp_path / ".scan-pass").write_text(staged_hash)
+        scan_pass_path(tmp_path).write_text(staged_hash)
 
         # Stage additional changes — invalidates the hash
         (tmp_path / "new_file.py").write_text("import os\n")
@@ -206,7 +207,7 @@ class TestValidScanPass:
 
     def test_hash_invalidated_blocks_in_strict_mode(self, hook_env):
         tmp_path, hook, staged_hash = hook_env
-        (tmp_path / ".scan-pass").write_text(staged_hash)
+        scan_pass_path(tmp_path).write_text(staged_hash)
 
         # Stage additional changes
         (tmp_path / "extra.py").write_text("x = 1\n")
@@ -222,7 +223,7 @@ class TestEdgeCases:
 
     def test_empty_scan_pass_fails_open(self, hook_env):
         tmp_path, hook, _hash = hook_env
-        (tmp_path / ".scan-pass").write_text("")
+        scan_pass_path(tmp_path).write_text("")
         stdout, stderr, rc = _run_hook(tmp_path, hook)
         assert rc == 0
         assert "stale" in stderr or "commit allowed" in stderr
@@ -230,7 +231,7 @@ class TestEdgeCases:
     def test_scan_pass_with_trailing_newline(self, hook_env):
         """Trailing newlines in .scan-pass should be trimmed before comparison."""
         tmp_path, hook, staged_hash = hook_env
-        (tmp_path / ".scan-pass").write_text(staged_hash + "\n")
+        scan_pass_path(tmp_path).write_text(staged_hash + "\n")
         stdout, stderr, rc = _run_hook(tmp_path, hook)
         assert rc == 0
         assert "stale" not in stderr
