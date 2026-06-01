@@ -16,7 +16,7 @@ _plugin_root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _plugin_root_dir not in sys.path:
     sys.path.insert(0, _plugin_root_dir)
 
-from hash_utils import compute_staged_hash  # noqa: E402
+from hash_utils import compute_staged_hash, resolve_scan_pass_path  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -44,9 +44,11 @@ _PUSH_PR_PATTERNS = [
 
 _COMMIT_ALL_FLAG = re.compile(r"\bgit\s+commit\b.*(?:\s-a\b|\s--all\b)")
 
+# Matches both the current "armis-scan-pass" and the legacy ".scan-pass".
+_SCAN_PASS_NAMES = r"(?:\.scan-pass|armis-scan-pass)"  # noqa: S105 — filenames, not a secret
 _SCAN_PASS_WRITE_PATTERN = re.compile(
-    r"[>|][^;&|]*(?:^|/|\s)\.scan-pass\b"
-    r"|(?:tee|cp|mv)\s+[^;&|]*(?:^|/|\s)\.scan-pass\b"
+    rf"[>|][^;&|]*(?:^|/|\s){_SCAN_PASS_NAMES}\b"
+    rf"|(?:tee|cp|mv)\s+[^;&|]*(?:^|/|\s){_SCAN_PASS_NAMES}\b"
 )
 
 
@@ -76,70 +78,31 @@ def _is_scan_pass_write_bash(cmd: str) -> bool:
 
 
 def is_scan_pass_file(file_path: str) -> bool:
-    """Check if a file path targets .scan-pass (for Write/Edit guard)."""
+    """Check if a file path targets the scan-pass file (for Write/Edit guard).
+
+    Matches both the current "armis-scan-pass" and the legacy ".scan-pass".
+    """
     if not isinstance(file_path, str) or not file_path.strip():
         return False
-    return os.path.basename(file_path) == ".scan-pass"
-
-
-# ---------------------------------------------------------------------------
-# Plugin root resolution
-# ---------------------------------------------------------------------------
-
-
-def _find_git_root(start_path: str):
-    """Walk up from start_path to find .git directory."""
-    current = os.path.abspath(start_path)
-    for _ in range(50):
-        if os.path.isdir(os.path.join(current, ".git")):
-            return current
-        parent = os.path.dirname(current)
-        if parent == current:
-            break
-        current = parent
-    return None
-
-
-def resolve_plugin_root() -> str:
-    """Resolve the plugin root directory.
-
-    Checks CLAUDE_PLUGIN_ROOT (set by Claude Code runtime), validates it
-    against CWE-73 (must be within a git repo), falls back to the current
-    working directory's git root (so .scan-pass is repo-scoped), then to
-    this script's grandparent directory.
-    """
-    raw = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-    if raw:
-        resolved = os.path.realpath(raw)
-        if os.path.isdir(resolved):
-            try:
-                git_root = _find_git_root(resolved)
-                if git_root:
-                    resolved_abs = os.path.abspath(resolved)
-                    git_root_abs = os.path.abspath(git_root)
-                    if (
-                        resolved_abs.startswith(git_root_abs + os.sep)
-                        or resolved_abs == git_root_abs
-                    ):
-                        return resolved
-            except (OSError, ValueError):
-                pass
-
-    cwd_git_root = _find_git_root(os.getcwd())
-    if cwd_git_root:
-        return cwd_git_root
-
-    return _plugin_root_dir
+    return os.path.basename(file_path) in ("armis-scan-pass", ".scan-pass")
 
 
 # ---------------------------------------------------------------------------
 # Scan pass validation
 # ---------------------------------------------------------------------------
+#
+# The gate (reader) MUST locate the scan-pass with the exact same logic as the
+# scanner (writer). Both call hash_utils.resolve_scan_pass_path(), which uses
+# `git rev-parse --absolute-git-dir`. A previous version resolved the path here
+# with a private filesystem walker using os.path.isdir(".git"); inside a git
+# worktree (every Conductor workspace) `.git` is a *file*, so that walker
+# silently disagreed with the writer's os.path.exists check and the gate denied
+# forever. Delegating to git removes that whole class of bug.
 
 
 def _has_matching_scan_pass() -> bool:
-    """Check if .scan-pass hash matches current staged changes."""
-    scan_pass_path = os.path.join(resolve_plugin_root(), ".scan-pass")
+    """Check if the scan-pass hash matches current staged changes."""
+    scan_pass_path = resolve_scan_pass_path()
     try:
         if not os.path.isfile(scan_pass_path):
             return False
@@ -156,8 +119,8 @@ def _has_matching_scan_pass() -> bool:
 
 
 def _has_scan_pass_for_push() -> bool:
-    """For push/PR: check that a .scan-pass file exists."""
-    scan_pass_path = os.path.join(resolve_plugin_root(), ".scan-pass")
+    """For push/PR: check that a scan-pass file exists."""
+    scan_pass_path = resolve_scan_pass_path()
     try:
         return os.path.isfile(scan_pass_path)
     except OSError:

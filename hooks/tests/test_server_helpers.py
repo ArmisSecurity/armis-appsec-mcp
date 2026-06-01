@@ -283,9 +283,8 @@ class TestGetDebugConfigNoCreds:
 class TestCacheScanRefScanPass:
     """Tests for ref-based scans writing .scan-pass (comments #8+#9 fix)."""
 
-    def test_ref_scan_writes_scan_pass_when_clean(self, tmp_path, monkeypatch):
-        """Clean ref scan with scan_hash should write .scan-pass."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+    def test_ref_scan_writes_scan_pass_when_clean(self, isolated_server_scan_pass):
+        """Clean ref scan with scan_hash should write the scan-pass."""
         server._cache_scan(
             report="No findings",
             findings=[],
@@ -293,13 +292,11 @@ class TestCacheScanRefScanPass:
             is_staged_scan=True,
             scan_hash="abc123deadbeef",
         )
-        scan_pass = tmp_path / ".scan-pass"
-        assert scan_pass.exists()
-        assert scan_pass.read_text() == "abc123deadbeef"
+        assert isolated_server_scan_pass.exists()
+        assert isolated_server_scan_pass.read_text() == "abc123deadbeef"
 
-    def test_ref_scan_no_write_on_critical(self, tmp_path, monkeypatch):
-        """Ref scan with CRITICAL findings should NOT write .scan-pass."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+    def test_ref_scan_no_write_on_critical(self, isolated_server_scan_pass):
+        """Ref scan with CRITICAL findings should NOT write the scan-pass."""
         server._cache_scan(
             report="Found issues",
             findings=[{"severity": "CRITICAL", "cwe": 79}],
@@ -307,14 +304,11 @@ class TestCacheScanRefScanPass:
             is_staged_scan=True,
             scan_hash="abc123deadbeef",
         )
-        scan_pass = tmp_path / ".scan-pass"
-        assert not scan_pass.exists()
+        assert not isolated_server_scan_pass.exists()
 
-    def test_ref_scan_removes_existing_pass_on_critical(self, tmp_path, monkeypatch):
-        """Critical findings should remove an existing .scan-pass."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
-        scan_pass = tmp_path / ".scan-pass"
-        scan_pass.write_text("old-hash")
+    def test_ref_scan_removes_existing_pass_on_critical(self, isolated_server_scan_pass):
+        """Critical findings should remove an existing scan-pass."""
+        isolated_server_scan_pass.write_text("old-hash")
 
         server._cache_scan(
             report="Found issues",
@@ -323,11 +317,10 @@ class TestCacheScanRefScanPass:
             is_staged_scan=True,
             scan_hash="abc123deadbeef",
         )
-        assert not scan_pass.exists()
+        assert not isolated_server_scan_pass.exists()
 
-    def test_non_shipping_scan_does_not_write_pass(self, tmp_path, monkeypatch):
-        """scan_code/scan_file should NOT write .scan-pass."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
+    def test_non_shipping_scan_does_not_write_pass(self, isolated_server_scan_pass):
+        """scan_code/scan_file should NOT write the scan-pass."""
         server._cache_scan(
             report="No findings",
             findings=[],
@@ -335,12 +328,10 @@ class TestCacheScanRefScanPass:
             is_staged_scan=False,
             scan_hash="",
         )
-        scan_pass = tmp_path / ".scan-pass"
-        assert not scan_pass.exists()
+        assert not isolated_server_scan_pass.exists()
 
-    def test_scan_hash_fallback_to_compute(self, tmp_path, monkeypatch):
+    def test_scan_hash_fallback_to_compute(self, isolated_server_scan_pass):
         """When scan_hash is empty, falls back to compute_staged_hash()."""
-        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
         with patch("server.compute_staged_hash", return_value="staged-hash-123"):
             server._cache_scan(
                 report="No findings",
@@ -349,6 +340,5 @@ class TestCacheScanRefScanPass:
                 is_staged_scan=True,
                 scan_hash="",
             )
-        scan_pass = tmp_path / ".scan-pass"
-        assert scan_pass.exists()
-        assert scan_pass.read_text() == "staged-hash-123"
+        assert isolated_server_scan_pass.exists()
+        assert isolated_server_scan_pass.read_text() == "staged-hash-123"

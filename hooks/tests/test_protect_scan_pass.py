@@ -25,7 +25,24 @@ def _run_hook(hook_input, tmp_path):
 
 
 class TestBlocksScanPass:
-    """Write/Edit to .scan-pass must be denied."""
+    """Write/Edit to the scan-pass file must be denied (current + legacy names)."""
+
+    def test_write_armis_scan_pass_blocked(self, tmp_path):
+        stdin = {"tool_name": "Write", "tool_input": {"file_path": "armis-scan-pass"}}
+        stdout, stderr, rc = _run_hook(stdin, tmp_path)
+        assert rc == 2
+        data = json.loads(stderr)
+        assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_write_armis_scan_pass_with_path_blocked(self, tmp_path):
+        stdin = {
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/home/user/project/.git/armis-scan-pass"},
+        }
+        stdout, stderr, rc = _run_hook(stdin, tmp_path)
+        assert rc == 2
+        data = json.loads(stderr)
+        assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     def test_write_scan_pass_blocked(self, tmp_path):
         stdin = {"tool_name": "Write", "tool_input": {"file_path": ".scan-pass"}}
@@ -43,6 +60,11 @@ class TestBlocksScanPass:
         assert rc == 2
         data = json.loads(stderr)
         assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_edit_armis_scan_pass_blocked(self, tmp_path):
+        stdin = {"tool_name": "Edit", "tool_input": {"file_path": "armis-scan-pass"}}
+        stdout, stderr, rc = _run_hook(stdin, tmp_path)
+        assert rc == 2
 
     def test_edit_scan_pass_blocked(self, tmp_path):
         stdin = {"tool_name": "Edit", "tool_input": {"file_path": ".scan-pass"}}

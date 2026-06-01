@@ -22,8 +22,10 @@ _WRITE_TOOLS = {"write_file", "replace", "create_file"}
 
 _COMMAND_FIELDS = ("command", "cmd")
 
-_FAST_SHIP_KEYWORDS = ("git commit", "git push", "gh pr create", ".scan-pass")
-_SCAN_PASS = ".scan-pass"  # noqa: S105
+# "scan-pass" (no leading dot) matches both ".scan-pass" (legacy) and
+# "armis-scan-pass" (current) as substrings.
+_FAST_SHIP_KEYWORDS = ("git commit", "git push", "gh pr create", "scan-pass")
+_SCAN_PASS_NAMES = ("armis-scan-pass", ".scan-pass")  # noqa: S105
 
 _DEBUG = bool(os.environ.get("APPSEC_DEBUG"))
 
@@ -72,9 +74,9 @@ def main():
         if tool_name in _WRITE_TOOLS:
             file_path = tool_input.get("file_path", tool_input.get("path", ""))
             _debug(f"write-tool check: tool={tool_name}, path={file_path}")
-            if os.path.basename(file_path) == _SCAN_PASS:
+            if os.path.basename(file_path) in _SCAN_PASS_NAMES:
                 _deny(
-                    "BLOCKED: Direct writes to .scan-pass are not allowed. "
+                    "BLOCKED: Direct writes to the scan-pass file are not allowed. "
                     "Run scan_diff() to scan your code instead."
                 )
             print(_ALLOW)

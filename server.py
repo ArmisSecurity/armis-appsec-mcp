@@ -37,7 +37,11 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from auth import get_auth_status, init_auth
-from hash_utils import compute_staged_hash, resolve_scan_pass_path
+from hash_utils import (
+    cleanup_legacy_scan_pass,
+    compute_staged_hash,
+    resolve_scan_pass_path,
+)
 from scanner_core import (
     APPSEC_API_URL,
     build_diff_line_map,
@@ -571,11 +575,12 @@ def do_approve_findings(reason: str) -> str:
         return "ERROR: No changes found to approve. Run scan_diff first."
 
     scan_pass_path = _scan_pass_path()
+    cleanup_legacy_scan_pass()  # remove any stale working-tree .scan-pass
     try:
         with open(scan_pass_path, "w") as f:
             f.write(approval_hash)
     except OSError as e:
-        return f"ERROR: Could not write .scan-pass: {e}"
+        return f"ERROR: Could not write scan-pass: {e}"
 
     severities = [f.get("severity", "UNKNOWN") for f in all_requiring_approval]
     logger.warning(
@@ -654,6 +659,7 @@ def _cache_scan(
         f.get("severity", "").upper() == "CRITICAL" for f in (suppressed or [])
     )
     scan_pass_path = _scan_pass_path()
+    cleanup_legacy_scan_pass()  # remove any stale working-tree .scan-pass
     try:
         if not has_critical and not has_suppressed_critical:
             effective_hash = scan_hash or compute_staged_hash()

@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -21,9 +22,51 @@ if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
 
 
+@pytest.fixture
+def isolated_server_scan_pass(tmp_path, monkeypatch):
+    """Redirect server.py's scan-pass writes into tmp_path for in-process tests.
+
+    In-process tests call server._cache_scan()/do_approve_findings() directly.
+    The scan-pass path is now resolved by git from CWD (CLAUDE_PLUGIN_ROOT is no
+    longer consulted), so without this fixture those writes would land in the
+    real repo running the test suite. Patch the path helper to a temp file and
+    neutralize the legacy-cleanup (it would `git rev-parse` the real CWD).
+
+    Yields the redirected scan-pass Path so tests can assert on it.
+    """
+    import server
+
+    sp = tmp_path / "armis-scan-pass"
+    monkeypatch.setattr(server, "_scan_pass_path", lambda: str(sp))
+    monkeypatch.setattr(server, "cleanup_legacy_scan_pass", lambda: None)
+    return sp
+
+
+def scan_pass_path(repo_dir):
+    """Return the Path where the scan-pass lives for a repo at ``repo_dir``.
+
+    Asks git for the absolute git dir (worktree-correct, symlink-resolved) and
+    joins ``armis-scan-pass`` — i.e. exactly what hash_utils.resolve_scan_pass_path
+    computes when run with cwd inside ``repo_dir``. Use this in tests instead of
+    hardcoding ``repo_dir / ".scan-pass"``.
+    """
+    git_dir = subprocess.run(
+        ["git", "rev-parse", "--absolute-git-dir"],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return Path(git_dir) / "armis-scan-pass"
+
+
 @pytest.fixture(autouse=True)
 def _ensure_tmp_is_git_repo(tmp_path, request):
-    """Ensure tmp_path looks like a git repo for resolve_scan_pass_path() CWE-73 checks.
+    """Ensure tmp_path is a real git repo so resolve_scan_pass_path() works.
+
+    resolve_scan_pass_path() now locates the scan-pass via
+    `git rev-parse --absolute-git-dir`, which requires a *real* repo — a bare
+    `mkdir .git` no longer suffices (git returns "not a git repository").
 
     Skipped for tests that manage their own .git setup (marked with no_auto_git).
     """
@@ -31,7 +74,7 @@ def _ensure_tmp_is_git_repo(tmp_path, request):
         return
     git_dir = tmp_path / ".git"
     if not git_dir.exists():
-        git_dir.mkdir()
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
 
 
 @pytest.fixture

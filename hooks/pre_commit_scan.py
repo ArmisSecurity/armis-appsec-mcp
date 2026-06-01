@@ -20,7 +20,6 @@ if _hooks_dir not in sys.path:
 
 from hook_core import (  # noqa: E402
     GateResult,
-    _find_git_root,  # noqa: F401 — re-exported for backward compat with tests
     _has_all_flag,  # noqa: F401
     _is_push_or_pr,  # noqa: F401
     _is_shipping_command,  # noqa: F401

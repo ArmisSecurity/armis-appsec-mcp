@@ -131,7 +131,7 @@ For a client-agnostic commit gate that works regardless of which AI tool you use
 make install-hooks
 ```
 
-This installs a git pre-commit hook that verifies `.scan-pass` before allowing commits. It fails **open** by default (plugin bugs never block developers). Set `APPSEC_HOOK_STRICT=1` for fail-closed behavior.
+This installs a git pre-commit hook that verifies the scan-pass (stored inside `.git/`, so it never clutters your working tree) before allowing commits. It fails **open** by default (plugin bugs never block developers). Set `APPSEC_HOOK_STRICT=1` for fail-closed behavior.
 
 To remove: `make uninstall-hooks`
 

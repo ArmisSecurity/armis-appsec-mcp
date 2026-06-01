@@ -6,6 +6,7 @@ import subprocess
 import uuid
 
 import pytest
+from conftest import scan_pass_path
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +142,7 @@ class TestScanPass:
 
     def test_matching_hash_allows_commit(self, run_hook, tmp_path):
         staged_hash = _init_git_repo(tmp_path)
-        scan_pass = tmp_path / ".scan-pass"
+        scan_pass = scan_pass_path(tmp_path)
         scan_pass.write_text(staged_hash)
 
         stdout, stderr, rc = run_hook("git commit -m 'msg'")
@@ -150,7 +151,7 @@ class TestScanPass:
 
     def test_mismatched_hash_blocks_commit(self, run_hook, tmp_path):
         _init_git_repo(tmp_path)
-        scan_pass = tmp_path / ".scan-pass"
+        scan_pass = scan_pass_path(tmp_path)
         scan_pass.write_text("0000000000000000000000000000000000000000000000000000000000000000")
 
         stdout, stderr, rc = run_hook("git commit -m 'msg'")
@@ -163,7 +164,7 @@ class TestScanPass:
 
     def test_empty_scan_pass_blocks(self, run_hook, tmp_path):
         _init_git_repo(tmp_path)
-        scan_pass = tmp_path / ".scan-pass"
+        scan_pass = scan_pass_path(tmp_path)
         scan_pass.write_text("")
 
         stdout, stderr, rc = run_hook("git commit -m 'msg'")
@@ -172,7 +173,7 @@ class TestScanPass:
     def test_push_with_scan_pass_allows(self, run_hook, tmp_path):
         """Push checks file existence only (commit already enforced hash)."""
         _init_git_repo(tmp_path)  # CWE-73: path must be in git repo
-        scan_pass = tmp_path / ".scan-pass"
+        scan_pass = scan_pass_path(tmp_path)
         scan_pass.write_text("any-content-works-for-push")
 
         stdout, stderr, rc = run_hook("git push origin main")
@@ -184,7 +185,7 @@ class TestScanPass:
 
     def test_pr_create_with_scan_pass_allows(self, run_hook, tmp_path):
         _init_git_repo(tmp_path)  # CWE-73: path must be in git repo
-        scan_pass = tmp_path / ".scan-pass"
+        scan_pass = scan_pass_path(tmp_path)
         scan_pass.write_text("any-content-works-for-pr")
 
         stdout, stderr, rc = run_hook("gh pr create --title 'PR'")
@@ -193,7 +194,7 @@ class TestScanPass:
     def test_new_staged_changes_after_scan_blocks(self, run_hook, tmp_path):
         """Stage new code after scan -> hash mismatch -> block."""
         old_hash = _init_git_repo(tmp_path)
-        scan_pass = tmp_path / ".scan-pass"
+        scan_pass = scan_pass_path(tmp_path)
         scan_pass.write_text(old_hash)
 
         # Stage additional file (changes the staged diff hash)
@@ -348,132 +349,49 @@ class TestHelpers:
 
 
 # ---------------------------------------------------------------------------
-# CWE-73: External Control of File Name or Path
+# Scan-pass location: resolved from CWD's git dir, not from any env var
 # ---------------------------------------------------------------------------
-class TestCWE73PluginRootValidation:
-    """CWE-73 mitigation: CLAUDE_PLUGIN_ROOT must be within git repo bounds."""
+class TestScanPassLocation:
+    """The scan-pass is located via `git rev-parse --absolute-git-dir` on the
+    CWD. CLAUDE_PLUGIN_ROOT is no longer consulted, which closes the old
+    CWE-73 redirect vector entirely (there is no external path to traverse)."""
 
-    def test_plugin_root_within_repo_accepts(self, run_hook, tmp_path):
-        """Valid path within git repo should be accepted."""
-        _init_git_repo(tmp_path)
-        subdir = tmp_path / "subdir"
-        subdir.mkdir()
-        scan_pass = subdir / ".scan-pass"
-        scan_pass.write_text("any-content")
+    def test_scan_pass_in_cwd_git_dir_allows(self, run_hook, tmp_path):
+        """A matching scan-pass in the CWD repo's git dir allows the commit."""
+        staged_hash = _init_git_repo(tmp_path)
+        scan_pass_path(tmp_path).write_text(staged_hash)
 
-        # Set CLAUDE_PLUGIN_ROOT to subdir within repo
-        stdout, stderr, rc = run_hook("git push", env_override={"CLAUDE_PLUGIN_ROOT": str(subdir)})
-        assert rc == 0, "Valid path within repo should allow push"
+        stdout, stderr, rc = run_hook("git commit -m 'msg'")
+        assert rc == 0, "Matching scan-pass in CWD git dir should allow"
 
-    def test_plugin_root_at_repo_root_accepts(self, run_hook, tmp_path):
-        """CLAUDE_PLUGIN_ROOT at git repo root should be accepted."""
-        _init_git_repo(tmp_path)
-        scan_pass = tmp_path / ".scan-pass"
-        scan_pass.write_text("any-content")
+    def test_claude_plugin_root_is_ignored_even_with_valid_pass(self, run_hook, tmp_path):
+        """Setting CLAUDE_PLUGIN_ROOT to a dir holding a scan-pass with the
+        *correct* hash must NOT bypass the gate — the env var is ignored, and
+        the CWD repo's git dir has no scan-pass, so the commit is blocked.
 
-        stdout, stderr, rc = run_hook(
-            "git push", env_override={"CLAUDE_PLUGIN_ROOT": str(tmp_path)}
-        )
-        assert rc == 0, "Repo root should be accepted"
+        This is the inverse of the old CWE-73 test: it proves an attacker can
+        no longer redirect the gate to an external 'valid' scan-pass."""
+        staged_hash = _init_git_repo(tmp_path, unique=True)
 
-    def test_plugin_root_outside_repo_rejects(self, run_hook, tmp_path):
-        """Path outside git repo should be rejected (falls back to default)."""
-        # Stage unique content so hash never matches any .scan-pass in fallback location
-        _init_git_repo(tmp_path, unique=True)
-
-        # Create attacker-controlled dir outside repo
+        # Attacker dir outside the repo holding a CORRECTLY-hashed scan-pass
         attacker_dir = tmp_path.parent / "attacker_controlled"
         attacker_dir.mkdir(exist_ok=True)
-        fake_scan_pass = attacker_dir / ".scan-pass"
-        fake_scan_pass.write_text("forged-bypass-token")
+        (attacker_dir / "armis-scan-pass").write_text(staged_hash)
+        (attacker_dir / ".scan-pass").write_text(staged_hash)
 
-        # Try to bypass by pointing CLAUDE_PLUGIN_ROOT outside repo
         stdout, stderr, rc = run_hook(
             "git commit -m 'msg'", env_override={"CLAUDE_PLUGIN_ROOT": str(attacker_dir)}
         )
-        # Should block: attacker path rejected (not in git repo), fallback's
-        # .scan-pass (if any) has a different hash than our unique staged diff
-        assert rc == 2, "Path outside repo should be rejected, causing block"
+        assert rc == 2, "CLAUDE_PLUGIN_ROOT must be ignored; CWD has no pass → block"
         data = json.loads(stderr)
         assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
 
-    def test_plugin_root_path_traversal_rejects(self, run_hook, tmp_path):
-        """Path traversal attempts should be rejected."""
-        _init_git_repo(tmp_path, unique=True)
-
-        # Try path traversal to escape repo
-        attacker_dir = tmp_path.parent / "escape"
-        attacker_dir.mkdir(exist_ok=True)
-        fake_scan_pass = attacker_dir / ".scan-pass"
-        fake_scan_pass.write_text("forged")
-
-        # Attempt path traversal (will be resolved by realpath)
-        traversal = str(tmp_path / ".." / "escape")
-
-        stdout, stderr, rc = run_hook(
-            "git commit -m 'msg'", env_override={"CLAUDE_PLUGIN_ROOT": traversal}
-        )
-        assert rc == 2, "Path traversal should be rejected"
-
-    def test_plugin_root_symlink_escape_rejects(self, run_hook, tmp_path):
-        """Symlink pointing outside repo should be rejected."""
-        _init_git_repo(tmp_path, unique=True)
-
-        # Create attacker dir outside repo
-        attacker_dir = tmp_path.parent / "attacker_symlink_target"
-        attacker_dir.mkdir(exist_ok=True)
-        fake_scan_pass = attacker_dir / ".scan-pass"
-        fake_scan_pass.write_text("forged")
-
-        # Create symlink inside repo pointing outside
-        symlink_path = tmp_path / "evil_link"
-        try:
-            symlink_path.symlink_to(attacker_dir)
-        except OSError:
-            pytest.skip("Symlinks not supported on this platform")
-
-        stdout, stderr, rc = run_hook(
-            "git commit -m 'msg'", env_override={"CLAUDE_PLUGIN_ROOT": str(symlink_path)}
-        )
-        # realpath() resolves symlink to attacker_dir, which is outside repo
-        assert rc == 2, "Symlink escape should be rejected"
-
-    def test_plugin_root_nonexistent_path_falls_back(self, run_hook, tmp_path):
-        """Nonexistent path should fall back to default."""
-        _init_git_repo(tmp_path, unique=True)
-
-        stdout, stderr, rc = run_hook(
-            "git commit -m 'msg'",
-            env_override={"CLAUDE_PLUGIN_ROOT": "/nonexistent/fake/path/12345"},
-        )
-        assert rc == 2, "Nonexistent path should fall back and block"
-
-    def test_plugin_root_empty_string_falls_back_to_cwd_git_root(self, run_hook, tmp_path):
-        """Empty CLAUDE_PLUGIN_ROOT should fall back to CWD's git root."""
+    def test_resolves_from_cwd_regardless_of_empty_plugin_root(self, run_hook, tmp_path):
+        """Empty CLAUDE_PLUGIN_ROOT: still resolves from CWD's git dir."""
         staged_hash = _init_git_repo(tmp_path, unique=True)
-        scan_pass = tmp_path / ".scan-pass"
-        scan_pass.write_text(staged_hash)
+        scan_pass_path(tmp_path).write_text(staged_hash)
 
         stdout, stderr, rc = run_hook(
             "git commit -m 'msg'", env_override={"CLAUDE_PLUGIN_ROOT": ""}
         )
-        # CWD is tmp_path (a git root) and .scan-pass hash matches → allow
-        assert rc == 0, "Empty CLAUDE_PLUGIN_ROOT should use CWD git root"
-
-    @pytest.mark.no_auto_git
-    def test_find_git_root_helper(self, hook_module, tmp_path):
-        """Unit test for _find_git_root helper."""
-        # No git repo — remove auto-created .git from conftest
-        git_dir = tmp_path / ".git"
-        if git_dir.exists():
-            git_dir.rmdir()
-        assert hook_module._find_git_root(str(tmp_path)) is None
-
-        # Create git repo
-        _init_git_repo(tmp_path)
-        subdir = tmp_path / "a" / "b" / "c"
-        subdir.mkdir(parents=True)
-
-        # Should find git root from deep subdirectory
-        git_root = hook_module._find_git_root(str(subdir))
-        assert git_root == str(tmp_path)
+        assert rc == 0, "Empty CLAUDE_PLUGIN_ROOT should resolve scan-pass from CWD git dir"
