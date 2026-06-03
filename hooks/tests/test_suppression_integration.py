@@ -28,6 +28,12 @@ if "mcp.server.fastmcp" not in sys.modules:
 
 _ToolError = sys.modules["mcp.server.fastmcp.exceptions"].ToolError
 
+# Make @mcp.tool() an identity decorator so the real async tool coroutines
+# (e.g. scan_diff) survive import and can be awaited directly (eng-review D1).
+# The real FastMCP.tool() likewise returns the function unchanged after
+# registering it. Configured on the shared mock so reloads keep it.
+sys.modules["mcp.server.fastmcp"].FastMCP.return_value.tool.return_value = lambda f: f
+
 import importlib
 
 if "server" in sys.modules:
@@ -478,3 +484,189 @@ class TestInlineSuppressionIntegration:
         summary = {"total": 2, "active": 0, "suppressed": 2, "by_directive": {}, "by_inline": 2}
         result = format_findings([], "app.py", suppression_summary=summary)
         assert "2 suppressed by armis:ignore inline" in result
+
+
+# ---------------------------------------------------------------------------
+# Category F: scan_diff inline armis:ignore suppression (PPSC-903 regression)
+# ---------------------------------------------------------------------------
+def _blob_line(diff_text: str, needle: str) -> int:
+    """1-based blob line number of the line containing ``needle``."""
+    for i, line in enumerate(diff_text.splitlines(), start=1):
+        if needle in line:
+            return i
+    raise AssertionError(f"needle {needle!r} not found in diff")
+
+
+def _findings_json(findings: list[dict]) -> str:
+    """Wrap findings in the ```json fenced block parse_findings expects."""
+    import json
+
+    return f"```json\n{json.dumps(findings)}\n```"
+
+
+class TestScanDiffInlineSuppression:
+    """scan_diff must honor inline armis:ignore directives in the diff blob.
+
+    Patches server.run_git_diff (crafted diff) + server.call_appsec_api (findings
+    whose blob line lands on the directive). Blob lines are located via
+    build_diff_line_map so offsets are not hardcoded.
+    """
+
+    _DIFF = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        '+password = "secret"  # armis:ignore cwe:798\n'
+        '+query = f"SELECT {x}"\n'
+    )
+
+    def _finding(self, needle, **overrides):
+        line = _blob_line(self._DIFF, needle)
+        f = {
+            "cwe": 798,
+            "severity": "HIGH",
+            "line": line,
+            "explanation": "hardcoded secret",
+            "has_secret": True,
+        }
+        f.update(overrides)
+        return f
+
+    @pytest.mark.asyncio
+    async def test_scan_diff_suppresses_inline(self):
+        """REGRESSION (#11): scan_diff applies inline armis:ignore (it did not before)."""
+        raw = _findings_json([self._finding("password")])
+        with patch("server.run_git_diff", return_value=self._DIFF):
+            with patch("server.find_git_root", return_value=None):
+                with patch("server.load_armisignore", return_value=ArmisIgnoreConfig()):
+                    with patch("server.call_appsec_api", return_value=raw):
+                        report = await server.scan_diff(repo_path="/x")
+
+        assert "hardcoded secret" not in report
+        assert "armis:ignore inline" in report
+
+    @pytest.mark.asyncio
+    async def test_scan_diff_non_matching_cwe_not_suppressed(self):
+        """A directive cwe:798 does not suppress a cwe:89 finding on the same line."""
+        raw = _findings_json(
+            [self._finding("password", cwe=89, explanation="sqli", has_secret=False)]
+        )
+        with patch("server.run_git_diff", return_value=self._DIFF):
+            with patch("server.find_git_root", return_value=None):
+                with patch("server.load_armisignore", return_value=ArmisIgnoreConfig()):
+                    with patch("server.call_appsec_api", return_value=raw):
+                        report = await server.scan_diff(repo_path="/x")
+
+        assert "sqli" in report
+
+    @pytest.mark.asyncio
+    async def test_inline_critical_still_blocks_scan_pass(self, isolated_server_scan_pass):
+        """Inline-suppressed CRITICAL must NOT write .scan-pass (still needs approval)."""
+        raw = _findings_json(
+            [self._finding("password", severity="CRITICAL", explanation="critical secret")]
+        )
+        with patch("server.run_git_diff", return_value=self._DIFF):
+            with patch("server.find_git_root", return_value=None):
+                with patch("server.load_armisignore", return_value=ArmisIgnoreConfig()):
+                    with patch("server.call_appsec_api", return_value=raw):
+                        with patch("server.compute_staged_hash", return_value="hash123"):
+                            await server.scan_diff(repo_path="/x", staged=True)
+
+        assert not isolated_server_scan_pass.exists()
+
+    @pytest.mark.asyncio
+    async def test_inline_high_does_not_block_scan_pass(self, isolated_server_scan_pass):
+        """Inline-suppressed HIGH (no other findings) writes .scan-pass."""
+        raw = _findings_json([self._finding("password", severity="HIGH")])
+        with patch("server.run_git_diff", return_value=self._DIFF):
+            with patch("server.find_git_root", return_value=None):
+                with patch("server.load_armisignore", return_value=ArmisIgnoreConfig()):
+                    with patch("server.call_appsec_api", return_value=raw):
+                        with patch("server.compute_staged_hash", return_value="hash123"):
+                            await server.scan_diff(repo_path="/x", staged=True)
+
+        assert isolated_server_scan_pass.exists()
+        assert isolated_server_scan_pass.read_text().strip() == "hash123"
+
+    @pytest.mark.asyncio
+    async def test_combined_armisignore_and_inline(self):
+        """Both .armisignore (cwe:89) and inline (cwe:798) suppress in one diff."""
+        raw = _findings_json(
+            [
+                self._finding("password"),  # cwe 798 -> inline
+                # cwe 89 -> .armisignore
+                self._finding("query", cwe=89, explanation="sqli", has_secret=False),
+            ]
+        )
+        config = ArmisIgnoreConfig(cwes=[89])
+        with patch("server.run_git_diff", return_value=self._DIFF):
+            with patch("server.find_git_root", return_value="/x"):
+                with patch("server.load_armisignore", return_value=config):
+                    with patch("server.call_appsec_api", return_value=raw):
+                        report = await server.scan_diff(repo_path="/x")
+
+        assert "0 finding(s)" in report
+        assert ".armisignore" in report
+        assert "armis:ignore inline" in report
+
+
+class TestMergeInlineSuppressions:
+    """_merge_inline_suppressions bookkeeping (shared by _run_scan and scan_diff)."""
+
+    def test_merges_counts(self):
+        summary = {"total": 3, "active": 3, "suppressed": 0, "by_directive": {}}
+        inline = [{"cwe": 1}, {"cwe": 2}]
+        result = server._merge_inline_suppressions(summary, [], inline)
+        assert summary["suppressed"] == 2
+        assert summary["active"] == 1
+        assert summary["by_inline"] == 2
+        assert result == inline
+
+    def test_empty_inline_is_noop(self):
+        """#15a: empty inline_suppressed leaves summary + suppressed unchanged."""
+        summary = {"total": 1, "active": 1, "suppressed": 0, "by_directive": {}}
+        existing = [{"cwe": 798}]
+        result = server._merge_inline_suppressions(summary, existing, [])
+        assert summary == {"total": 1, "active": 1, "suppressed": 0, "by_directive": {}}
+        assert "by_inline" not in summary
+        assert result == existing
+
+
+class TestFormatCriticalWarning:
+    """_format_critical_warning must name the actual suppression source(s).
+
+    After _merge_inline_suppressions, the suppressed list can mix .armisignore
+    and inline armis:ignore findings; the warning was hard-coded to ".armisignore"
+    (PR #20 review). The source is derived per-finding from _suppression_source.
+    """
+
+    def test_armisignore_source(self):
+        warning = server._format_critical_warning(
+            [{"cwe": 798, "_suppression_source": "armisignore"}]
+        )
+        assert "suppressed by .armisignore" in warning
+        assert "armis:ignore inline" not in warning
+        assert "CWE-798" in warning
+        assert "approve_findings is still required" in warning
+
+    def test_inline_source(self):
+        warning = server._format_critical_warning([{"cwe": 78, "_suppression_source": "inline"}])
+        assert "suppressed by armis:ignore inline" in warning
+        assert ".armisignore" not in warning
+
+    def test_mixed_sources(self):
+        warning = server._format_critical_warning(
+            [
+                {"cwe": 798, "_suppression_source": "armisignore"},
+                {"cwe": 78, "_suppression_source": "inline"},
+            ]
+        )
+        assert ".armisignore / armis:ignore inline" in warning
+        assert "2 CRITICAL finding(s)" in warning
+        assert "CWE-798" in warning and "CWE-78" in warning
+
+    def test_missing_source_defaults_to_armisignore(self):
+        """A finding with no _suppression_source falls back to .armisignore."""
+        warning = server._format_critical_warning([{"cwe": 89}])
+        assert "suppressed by .armisignore" in warning

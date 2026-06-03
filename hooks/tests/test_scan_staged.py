@@ -329,3 +329,121 @@ class TestCWEFiltering:
         stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=mock_response)
         # Both findings filtered out → clean scan
         assert rc == 0
+
+
+def _staged_blob_line(path, needle):
+    """1-based blob line number (within `git diff --cached`) of the line with `needle`.
+
+    Lets inline-suppression tests put the mock finding's `line` exactly where the
+    directive is, without hardcoding diff offsets.
+    """
+    diff = subprocess.run(
+        ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
+        cwd=str(path),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    for i, line in enumerate(diff.splitlines(), start=1):
+        if needle in line:
+            return i
+    raise AssertionError(f"needle {needle!r} not found in staged diff")
+
+
+class TestInlineSuppression:
+    """Inline armis:ignore directives in the staged diff (PPSC-903 regression).
+
+    The git hook must agree with the MCP scan_diff flow: inline-suppressed HIGH
+    allows the commit; inline-suppressed CRITICAL still blocks; a directive on a
+    removed line never suppresses.
+    """
+
+    def test_inline_suppressed_high_allows_commit(self, tmp_path):
+        """REGRESSION (#16): inline armis:ignore on a HIGH finding → commit allowed."""
+        _init_git_repo(tmp_path, staged_content='password = "secret"  # armis:ignore cwe:798\n')
+        line = _staged_blob_line(tmp_path, "password")
+        findings = json.dumps(
+            [
+                {
+                    "severity": "HIGH",
+                    "cwe": 798,
+                    "cwe_name": "Hard-coded Creds",
+                    "line": line,
+                    "explanation": "password in source",
+                }
+            ]
+        )
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{findings}\n```")
+        assert rc == 0
+        assert "scan-pass written" in stderr
+
+    def test_inline_suppressed_critical_still_blocks(self, tmp_path):
+        """Inline armis:ignore on a CRITICAL finding → still blocked (needs approval)."""
+        _init_git_repo(tmp_path, staged_content="os.system(x)  # armis:ignore cwe:78\n")
+        line = _staged_blob_line(tmp_path, "os.system")
+        findings = json.dumps(
+            [
+                {
+                    "severity": "CRITICAL",
+                    "cwe": 78,
+                    "cwe_name": "OS Command Injection",
+                    "line": line,
+                    "explanation": "unsanitized input",
+                }
+            ]
+        )
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{findings}\n```")
+        assert rc == 1
+        assert "HIGH/CRITICAL findings" in stderr
+
+    def test_removed_line_directive_does_not_suppress(self, tmp_path):
+        """A directive on a removed (-) line must NOT suppress a new HIGH finding."""
+        # Commit a line bearing the directive, then replace it (so it becomes a '-' line).
+        _init_git_repo(tmp_path, staged_content="value = old  # armis:ignore cwe:798\n")
+        subprocess.run(
+            ["git", "commit", "-m", "add"], cwd=str(tmp_path), capture_output=True, check=True
+        )
+        (tmp_path / "test.py").write_text("value = secret\n")
+        subprocess.run(
+            ["git", "add", "test.py"], cwd=str(tmp_path), capture_output=True, check=True
+        )
+        line = _staged_blob_line(tmp_path, "+value = secret")
+        findings = json.dumps(
+            [
+                {
+                    "severity": "HIGH",
+                    "cwe": 798,
+                    "cwe_name": "Hard-coded Creds",
+                    "line": line,
+                    "explanation": "secret",
+                }
+            ]
+        )
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{findings}\n```")
+        assert rc == 1
+
+    def test_lowercase_critical_still_blocks(self, tmp_path):
+        """REGRESSION: lowercase severity must block (git hook normalizes to .upper()).
+
+        parse_findings does not normalize case and the model may emit "critical";
+        a case-sensitive gate would write scan-pass and allow the commit, diverging
+        from the MCP scan_diff flow which uses .upper() everywhere.
+        """
+        _init_git_repo(tmp_path, staged_content="os.system(x)\n")
+        line = _staged_blob_line(tmp_path, "os.system")
+        findings = json.dumps(
+            [
+                {
+                    "severity": "critical",
+                    "cwe": 78,
+                    "cwe_name": "OS Command Injection",
+                    "line": line,
+                    "explanation": "unsanitized input",
+                }
+            ]
+        )
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{findings}\n```")
+        assert rc == 1
+        assert "HIGH/CRITICAL findings" in stderr
+        assert "scan-pass written" not in stderr
+        assert "HIGH/CRITICAL findings" in stderr

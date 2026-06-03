@@ -379,26 +379,67 @@ def _get_comment_prefixes(file_path: str) -> list[str]:
     return _COMMENT_PREFIXES.get(ext, ["#", "//"])
 
 
-def _extract_comment_text(line: str, prefixes: list[str]) -> str | None:
-    """Extract text from the comment portion of a line. Returns None if no comment."""
-    for prefix in prefixes:
-        if prefix == "<!--":
-            start = line.find("<!--")
-            if start != -1:
-                end = line.find("-->", start + 4)
-                if end != -1:
-                    return line[start + 4 : end].strip()
-        elif prefix == "/*":
-            start = line.find("/*")
-            if start != -1:
-                end = line.find("*/", start + 2)
-                if end != -1:
-                    return line[start + 2 : end].strip()
-        else:
-            idx = line.find(prefix)
-            if idx != -1:
-                return line[idx + len(prefix) :].strip()
+def _find_comment_start(line: str, prefixes: list[str]) -> tuple[int, str] | None:
+    """Index + prefix of the first comment marker that is OUTSIDE a string literal.
+
+    Single left-to-right scan tracking ', ", and ` quote state with backslash
+    escapes. Returns None when every comment marker sits inside a string (or
+    there is none).
+
+    String-awareness is the FAIL-SAFE direction for a suppression parser: a
+    marker smuggled into a string literal (e.g. ``q = "... #armis:ignore" + x``)
+    must not start a directive, so the finding on that line stays ACTIVE rather
+    than being silently suppressed. This is a heuristic, not a full per-language
+    tokenizer; any ambiguity it can't resolve leaves the finding active.
+    """
+    quote: str | None = None
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if quote is not None:
+            # Inside a string literal: only a backslash-escape or the matching
+            # closing quote matters; comment markers here are just data.
+            if ch == "\\":
+                i += 2  # skip the escaped character
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            i += 1
+            continue
+        for prefix in prefixes:
+            if line.startswith(prefix, i):
+                return i, prefix
+        i += 1
     return None
+
+
+def _extract_comment_text(line: str, prefixes: list[str]) -> str | None:
+    """Extract text from the comment portion of a line. Returns None if no comment.
+
+    String-literal aware (see ``_find_comment_start``): a comment marker inside a
+    quoted string does not start a comment, so a directive hidden in a string
+    literal cannot suppress a finding.
+    """
+    found = _find_comment_start(line, prefixes)
+    if found is None:
+        return None
+    idx, prefix = found
+    if prefix == "<!--":
+        end = line.find("-->", idx + 4)
+        if end != -1:
+            return line[idx + 4 : end].strip()
+        return None
+    if prefix == "/*":
+        end = line.find("*/", idx + 2)
+        if end != -1:
+            return line[idx + 2 : end].strip()
+        return None
+    return line[idx + len(prefix) :].strip()
 
 
 def _parse_inline_directive(text: str) -> InlineDirective | None:
@@ -510,3 +551,79 @@ def apply_inline_suppressions(
             active.append(finding)
 
     return active, suppressed
+
+
+def apply_inline_suppressions_to_diff(
+    findings: list[dict],
+    diff_text: str,
+    line_map: dict[int, tuple[str, int]],
+) -> tuple[list[dict], list[dict]]:
+    """Apply inline armis:ignore comments to diff-scan findings.
+
+    Findings carry ``line`` = 1-based BLOB line number (the line within
+    ``diff_text``), NOT a source-file line. We match directives against the diff
+    blob directly, which is correct even when the working tree differs from what
+    was scanned (staged / ref scans).
+
+    ``line_map`` (from ``scanner_core.build_diff_line_map``) maps blob line ->
+    (file_path, source_line). We REUSE it as the authoritative "is this a content
+    line" classifier instead of re-parsing the diff: only added (``+``) and
+    context (`` ``) lines are keys, so metadata and removed (``-``) lines are
+    excluded automatically. The "line above" check uses source coordinates -- the
+    blob line for the SAME file's previous source line -- so it can never bridge a
+    hunk gap or a file boundary and falsely suppress a finding.
+
+    Returns (active, suppressed). Fail-open: any error leaves all findings active.
+    """
+    if not findings:
+        return findings, []
+
+    try:
+        raw_lines = diff_text.splitlines()
+        # Reverse index (file, source_line) -> blob_line, built once.
+        src_to_blob: dict[tuple[str, int], int] = {
+            (mfile, sline): blob for blob, (mfile, sline) in line_map.items()
+        }
+
+        active: list[dict] = []
+        suppressed: list[dict] = []
+
+        for finding in findings:
+            blob = finding.get("line")
+            # Non-int line, or a blob line that is not added/context content
+            # (metadata or removed line) -> never suppressible inline.
+            if not isinstance(blob, int) or blob not in line_map:
+                active.append(finding)
+                continue
+
+            mapped_file, src_line = line_map[blob]
+            prefixes = _get_comment_prefixes(mapped_file)
+
+            # The finding's own blob line, then the blob line for the same file's
+            # previous source line (the "line above" in source coordinates).
+            candidate_blobs = [blob]
+            above = src_to_blob.get((mapped_file, src_line - 1))
+            if above is not None:
+                candidate_blobs.append(above)
+
+            matched = False
+            for cb in candidate_blobs:
+                # Every mapped line starts with '+' or ' '; strip the diff marker.
+                line_text = raw_lines[cb - 1][1:]
+                comment_text = _extract_comment_text(line_text, prefixes)
+                if comment_text and _ARMIS_IGNORE_RE.search(comment_text):
+                    directive = _parse_inline_directive(comment_text)
+                    if directive and _finding_matches_inline(finding, directive):
+                        finding["_suppression_source"] = "inline"
+                        finding["_suppressed_by"] = comment_text.strip()
+                        suppressed.append(finding)
+                        matched = True
+                        break
+
+            if not matched:
+                active.append(finding)
+
+        return active, suppressed
+    except Exception:
+        # Fail-open: never lose findings due to a diff-parse error.
+        return findings, []

@@ -26,6 +26,22 @@ When the user asks to "scan", "security check", or "check for vulnerabilities":
 | Pasted code snippet | `scan_code` | `code="..."`, optional `filename` |
 | Check scanner config | `debug_config` | (none) |
 
+## Suppressing False Positives
+
+Two ways to suppress a finding the team has reviewed and accepted. Both are deterministic
+(no AI judgment) and apply to `scan_diff`, `scan_file`, and the git commit hook:
+
+1. **Inline comment** — add `armis:ignore` in a comment on the finding's line (or the line
+   above). Narrow it with `cwe:`, `severity:`, or `category:` (combined with AND logic), e.g.
+   `password = os.environ["PW"]  # armis:ignore cwe:798 reason: loaded from env`. A bare
+   `armis:ignore` suppresses any finding on that line.
+2. **`.armisignore` file** at the repo root — `cwe:`, `severity:`, `category:` directives and
+   path patterns, applied repo-wide.
+
+Suppressed **CRITICAL** findings still block the commit and require `approve_findings`; suppressed
+HIGH and below do not. Suggest suppression only for genuine false positives — never to bypass a
+real vulnerability.
+
 ## Important Rules
 
 - NEVER call `approve_findings` without explicit user consent

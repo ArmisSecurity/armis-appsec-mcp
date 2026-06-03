@@ -5,5 +5,9 @@ alwaysApply: true
 
 Before running git commit, git push, or creating a PR, call the armis-scanner
 MCP tool `scan_diff` with `staged=true`. If HIGH/CRITICAL findings exist,
-fix them or ask the user for approval before proceeding. See AGENTS.md for
+fix them or ask the user for approval before proceeding.
+
+To suppress a reviewed false positive, add an `armis:ignore` comment on the
+finding's line (optionally `armis:ignore cwe:798`) or list it in `.armisignore`
+at the repo root. Suppressed CRITICAL still requires approval. See AGENTS.md for
 full instructions.

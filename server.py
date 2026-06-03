@@ -52,6 +52,7 @@ from scanner_core import (
 from suppression import (
     ArmisIgnoreConfig,
     apply_inline_suppressions,
+    apply_inline_suppressions_to_diff,
     apply_suppressions,
     filter_diff_excluded_paths,
     find_git_root,
@@ -89,14 +90,10 @@ async def _run_scan(
         config = load_armisignore(git_root)
     active, suppressed, suppression_summary = apply_suppressions(findings, config)
 
-    # Apply inline armis:ignore suppression (scan_file only)
+    # Apply inline armis:ignore suppression (scan_file only -- it has on-disk source)
     if file_path:
         active, inline_suppressed = apply_inline_suppressions(active, file_path, source_lines)
-        if inline_suppressed:
-            suppression_summary["suppressed"] += len(inline_suppressed)
-            suppression_summary["active"] -= len(inline_suppressed)
-            suppression_summary["by_inline"] = len(inline_suppressed)
-            suppressed = suppressed + inline_suppressed
+        suppressed = _merge_inline_suppressions(suppression_summary, suppressed, inline_suppressed)
 
     # Warn on suppressed CRITICAL findings (from any source)
     if suppressed:
@@ -127,12 +124,48 @@ async def _run_scan(
     return report
 
 
+def _merge_inline_suppressions(
+    suppression_summary: dict,
+    suppressed: list[dict],
+    inline_suppressed: list[dict],
+) -> list[dict]:
+    """Fold inline-suppressed findings into the summary + suppressed list.
+
+    Shared by _run_scan (file-based) and scan_diff (diff-based) so the
+    bookkeeping stays identical across both scan paths. Returns the updated
+    suppressed list (the summary dict is mutated in place).
+    """
+    if inline_suppressed:
+        suppression_summary["suppressed"] += len(inline_suppressed)
+        suppression_summary["active"] -= len(inline_suppressed)
+        suppression_summary["by_inline"] = len(inline_suppressed)
+        suppressed = suppressed + inline_suppressed
+    return suppressed
+
+
+_SUPPRESSION_SOURCE_LABELS = {
+    "armisignore": ".armisignore",
+    "inline": "armis:ignore inline",
+}
+
+
 def _format_critical_warning(suppressed_critical: list[dict]) -> str:
-    """Format a warning message for suppressed CRITICAL findings."""
+    """Format a warning message for suppressed CRITICAL findings.
+
+    The findings may have been suppressed by ``.armisignore``, an inline
+    ``armis:ignore`` directive, or a mix of both, so the source is derived
+    per-finding from ``_suppression_source`` rather than hard-coded.
+    """
     cwes = [f"CWE-{f.get('cwe', '?')}" for f in suppressed_critical]
+    # Preserve first-seen order of sources for a stable message.
+    sources: list[str] = []
+    for f in suppressed_critical:
+        label = _SUPPRESSION_SOURCE_LABELS.get(f.get("_suppression_source", ""), ".armisignore")
+        if label not in sources:
+            sources.append(label)
     return (
         f"WARNING: {len(suppressed_critical)} CRITICAL finding(s) suppressed by "
-        f".armisignore ({', '.join(cwes)}). approve_findings is still required."
+        f"{' / '.join(sources)} ({', '.join(cwes)}). approve_findings is still required."
     )
 
 
@@ -477,6 +510,12 @@ async def scan_diff(
 
     # Apply .armisignore suppression
     active, suppressed, suppression_summary = apply_suppressions(findings, config)
+
+    # Apply inline armis:ignore suppression against the diff blob (matches the
+    # finding's own line or the same file's preceding source line). line_map was
+    # built above from the same diff_text the API scanned.
+    active, inline_suppressed = apply_inline_suppressions_to_diff(active, diff_text, line_map)
+    suppressed = _merge_inline_suppressions(suppression_summary, suppressed, inline_suppressed)
 
     # Warn on suppressed CRITICAL findings
     if suppressed:
