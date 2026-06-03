@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from hash_utils import (  # noqa: E402
     SCAN_PASS_BASENAME,
     cleanup_legacy_scan_pass,
+    compute_staged_hash,
     resolve_scan_pass_path,
 )
 
@@ -178,6 +179,66 @@ class TestWorktree:
             assert os.path.isfile(result)
         finally:
             _git(["worktree", "remove", "--force", str(worktree)], git_repo)
+
+
+class TestComputeStagedHashNonUtf8:
+    """Regression for bug-hunt finding #1: a staged file with non-UTF-8 bytes
+    used to make compute_staged_hash() (text=True + .encode()) raise
+    UnicodeDecodeError, which escaped the gate reader's `except OSError` and
+    reached the hooks' outer fail-open catch-all → commit ALLOWED despite a
+    stale/forged/absent pass. The hash now covers raw bytes and fails *closed*.
+    """
+
+    # The exact payload from .context/bughunt/repro/bughunt_utf8.sh.
+    _BAD_BYTES = b"first line\nx\xe9\xff bytes here\nlast\n"
+
+    def test_hash_non_utf8_staged_diff_does_not_raise(self, git_repo):
+        """compute_staged_hash returns a 64-char hex digest, not "" and no raise."""
+        (git_repo / "weird.txt").write_bytes(self._BAD_BYTES)
+        _git(["add", "weird.txt"], git_repo)
+
+        digest = compute_staged_hash()
+        assert isinstance(digest, str)
+        assert len(digest) == 64
+        int(digest, 16)  # valid hex
+
+    def test_gate_denies_with_stale_pass_on_non_utf8(self, git_repo, monkeypatch):
+        """A stale (non-matching) scan-pass must DENY (fail closed), not fail open."""
+        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+        (git_repo / "weird.txt").write_bytes(self._BAD_BYTES)
+        _git(["add", "weird.txt"], git_repo)
+
+        # Place a non-matching (stale/forged) scan-pass.
+        scan_pass = resolve_scan_pass_path()
+        with open(scan_pass, "w") as f:
+            f.write("deadbeef" * 8)
+
+        hooks_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "hooks",
+        )
+        if hooks_dir not in sys.path:
+            sys.path.insert(0, hooks_dir)
+        import hook_core
+
+        # Must return False (deny) — never raise into the fail-open catch-all.
+        assert hook_core._has_matching_scan_pass() is False
+
+    def test_scan_staged_hash_matches_compute_staged_hash(self, git_repo):
+        """The portable git-hook writer and the gate reader must agree on the
+        byte-hash (INVARIANTS #4), including for non-UTF-8 content."""
+        import hashlib
+
+        (git_repo / "weird.txt").write_bytes(self._BAD_BYTES)
+        _git(["add", "weird.txt"], git_repo)
+
+        raw = subprocess.run(
+            ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
+            cwd=str(git_repo),
+            capture_output=True,
+        ).stdout
+        # This is exactly what git-hooks/scan-staged.py now hashes.
+        assert hashlib.sha256(raw).hexdigest() == compute_staged_hash()
 
 
 class TestCleanupLegacyScanPass:

@@ -285,8 +285,15 @@ def read_and_validate_file(file_path: str) -> tuple[str, str, str]:
     return code, os.path.basename(file_path), resolved
 
 
-def run_git_diff(repo_path: str = "", ref: str = "", staged: bool = False) -> str:
-    """Run git diff and return the diff text. Raises ToolError on failure."""
+def run_git_diff(repo_path: str = "", ref: str = "", staged: bool = False) -> tuple[str, bool]:
+    """Run git diff and return ``(diff_text, truncated)``. Raises ToolError on failure.
+
+    ``truncated`` is True when the diff exceeded ``_MAX_CODE_CHARS`` and was
+    clipped. Callers that gate shipping (scan_diff) MUST NOT write a scan-pass
+    when truncated — the scanner only saw the first ``_MAX_CODE_CHARS`` but the
+    staged hash covers the full diff, so a vuln past the cut would ship under a
+    "clean" pass (bug-hunt #6).
+    """
     if ref and not _VALID_GIT_REF.match(ref):
         raise ToolError(
             f"Invalid git ref: '{ref}'. Use branch names, tags, SHAs, or relative refs like HEAD~3."
@@ -311,29 +318,38 @@ def run_git_diff(repo_path: str = "", ref: str = "", staged: bool = False) -> st
     logger.info("Running: %s in %s", " ".join(cmd), cwd)
 
     try:
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=30)
     except subprocess.TimeoutExpired as e:
         raise ToolError(
             "git diff timed out after 30 seconds. Try a narrower ref or smaller repo."
         ) from e
 
     if result.returncode != 0:
-        raise ToolError(f"git diff failed: {result.stderr.strip()}")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        raise ToolError(f"git diff failed: {stderr.strip()}")
 
-    diff_text = result.stdout.strip()
-    if len(diff_text) > _MAX_CODE_CHARS:
+    # Decode the captured bytes with errors="replace" so a non-UTF-8 staged/ref
+    # diff (Shift-JIS/Latin-1 source, force-added binary) can't raise
+    # UnicodeDecodeError out of the scan path. Capturing bytes (no text=True)
+    # also avoids universal-newline translation.
+    diff_text = result.stdout.decode("utf-8", errors="replace").strip()
+    truncated = len(diff_text) > _MAX_CODE_CHARS
+    if truncated:
         diff_text = diff_text[:_MAX_CODE_CHARS]
         logger.warning("Truncated diff to %d chars", _MAX_CODE_CHARS)
 
-    return diff_text
+    return diff_text, truncated
 
 
 def get_debug_config() -> str:
     """Return masked configuration string for debugging."""
     api_url = os.environ.get("APPSEC_API_URL", "default")
     env = os.environ.get("APPSEC_ENV", "prod")
-    raw_id = os.environ.get("ARMIS_CLIENT_ID", "")
-    client_id = f"{raw_id[:4]}***" if len(raw_id) > 4 else (raw_id or "not set")
+    # CWE-522: report only presence of the client ID, never any of its bytes.
+    # The old `raw_id[:4]***` mask still leaked the first 4 chars of a
+    # credential into debug output/logs; mirror the secret's presence-only
+    # reporting instead (which the scanner correctly does not flag).
+    has_client_id = "set" if os.environ.get("ARMIS_CLIENT_ID") else "not set"
     has_secret = "set" if os.environ.get("ARMIS_CLIENT_SECRET") else "not set"
 
     # CWE-522: get_auth_status() returns only human-readable status labels
@@ -357,7 +373,7 @@ def get_debug_config() -> str:
         f"Auth: {auth_status}",
         f"API URL: {api_url}",
         f"Env: {env}",
-        f"Client ID: {client_id}",
+        f"Client ID: {has_client_id}",
         f"Client Secret: {has_secret}",
         f"Plugin version: {version}",
         f"Plugin root: {plugin_root}",
@@ -461,7 +477,7 @@ async def scan_diff(
     Returns:
         A formatted report of vulnerabilities found in the changed code.
     """
-    diff_text = run_git_diff(repo_path, ref, staged)
+    diff_text, truncated = run_git_diff(repo_path, ref, staged)
     if not diff_text:
         return "No changes to scan."
 
@@ -479,7 +495,9 @@ async def scan_diff(
 
     # Treat both staged and ref-based scans as shipping-eligible so they
     # can write .scan-pass (fixes push/PR gate loop — comments #8+#9).
-    is_shipping_scan = bool(ref) or staged
+    # BUT: a truncated diff means the scanner saw less than the scan-pass hash
+    # vouches for, so it is NOT shipping-eligible — refuse to gate it (#6).
+    is_shipping_scan = (bool(ref) or staged) and not truncated
     scan_hash = ""
     if is_shipping_scan:
         if staged:
@@ -558,6 +576,21 @@ async def scan_diff(
         elapsed = time.monotonic() - t0
         await ctx.info(f"Scan complete: {len(active)} finding(s) in {elapsed:.1f}s")
 
+    # A truncated diff was scanned only up to _MAX_CODE_CHARS, so it cannot
+    # gate a commit — tell the user to split it (bug-hunt #6). No scan-pass was
+    # written above because is_shipping_scan was forced False on truncation.
+    if truncated and (bool(ref) or staged):
+        warning = (
+            f"WARNING: diff exceeded {_MAX_CODE_CHARS} chars and was truncated; "
+            "only the first part was scanned. This scan CANNOT authorize a commit "
+            "(no scan-pass written). Split your changes into smaller commits and "
+            "re-scan each."
+        )
+        logger.warning(warning)
+        if ctx:
+            await ctx.info(warning)
+        report = f"{warning}\n\n{report}"
+
     return report
 
 
@@ -634,14 +667,17 @@ def do_approve_findings(reason: str) -> str:
     # the server's CWD is a sibling of the worktree being committed).
     repo_path = _last_scan.get("repo_path") or None
 
-    # Approval must be tied to the *exact content that was scanned*, not to the
-    # current index. Preferring a fresh compute_staged_hash() here would let a
-    # post-scan change to the staged index slip through: approve_findings would
-    # write a pass for unscanned content and the commit gate (comparing that
-    # same new hash) would allow it. So bind to the recorded scan_hash, and for
-    # staged scans refuse if the index drifted since the scan.
+    # Approve ONLY what was actually scanned (bug-hunt #7 / PPSC-913). Preferring
+    # a fresh compute_staged_hash() would let a post-scan change to the staged
+    # index slip through: approve_findings would write a pass for unscanned
+    # content and the commit gate (comparing that same new hash) would allow it.
+    # So bind to the recorded scan_hash, and for staged scans refuse if the
+    # index drifted since the scan.
     scanned_hash = _last_scan.get("scan_hash", "")
     if _last_scan.get("staged"):
+        # Staged scan: the commit gate matches a staged-diff hash, so the
+        # currently-staged content MUST still equal what was scanned. If the
+        # index changed since the scan, the approval is stale — re-scan.
         current_hash = compute_staged_hash(repo_path)
         if scanned_hash and current_hash and current_hash != scanned_hash:
             return (
@@ -653,8 +689,10 @@ def do_approve_findings(reason: str) -> str:
         # cache); never when it would mask a drift detected above.
         approval_hash = scanned_hash or current_hash
     else:
-        # ref-based scan: the scanned diff hash is authoritative (there is no
-        # live staged index to compare against, and the gate checks presence).
+        # Ref-based scan: scan_hash is sha256(diff_text), NOT a staged-diff hash.
+        # Writing it would NOT satisfy the staged commit gate (the hashes differ
+        # by construction), so it only authorizes the push/PR file-presence path
+        # — exactly the intended scope. Never substitute the live staged hash.
         approval_hash = scanned_hash
     if not approval_hash:
         return "ERROR: No changes found to approve. Run scan_diff first."

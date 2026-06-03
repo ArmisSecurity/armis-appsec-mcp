@@ -35,24 +35,82 @@ class GateResult(NamedTuple):
 # ---------------------------------------------------------------------------
 # Shipping command patterns
 # ---------------------------------------------------------------------------
+#
+# A shipping subcommand (commit / push / pr create) can be preceded by shell
+# noise that the old anchor set ((?:^|&&|\|\||;)) ignored, so it shipped
+# unscanned code. Each fragment below closes one bypass class (bug-hunt #2):
+#
+#   _CMD_SEP      — command separators: start, &&, ||, ;, &, |, newline, CR,
+#                   or an opening paren (subshell / $( … ) command subst).
+#   _CMD_WRAP     — command wrappers that exec their argument as a new command:
+#                   sudo/command/exec/eval/builtin/nice/time/xargs/… git …
+#   _ENV_PREFIX   — env-assignment / `env` prefixes: FOO=bar git …, env git …
+#   _PATH_PREFIX  — a path prefix on the binary: /usr/bin/git, ./git
+#   _GIT_GLOBAL_OPTS — git global options before the subcommand: -C <dir>,
+#                   -c k=v, --no-pager, --git-dir=…  (a short option may take a
+#                   separate-token argument, e.g. `-C /repo`).
+# A leading `\` (escaped binary, suppresses alias expansion) and an opening
+# quote (`eval 'git commit'`) are also tolerated right before the binary name.
+# NOTE: this is a regex over shell text, which is fundamentally leaky — wrapper
+# enumeration is itself a blocklist. The durable fix is a tokenizing parser or
+# an unforgeable scan-pass token (HMAC); see the deferred bug-hunt backlog.
+_CMD_SEP = r"(?:^|&&|\|\||[;&|\n\r(])"
+_CMD_WRAP = (
+    r"(?:(?:sudo|command|exec|eval|builtin|nice|time|xargs|stdbuf|nohup|setsid|doas)"
+    r"\s+(?:-\S+\s+)*)*"
+)
+_ENV_PREFIX = r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|env)\s+)*"
+_PATH_PREFIX = r"(?:\S*/)?"
+_GIT_GLOBAL_OPTS = r"(?:(?:-[A-Za-z]\s+\S+|-[A-Za-z]\S*|--\S+)\s+)*"
+
+_GIT_PREFIX = (
+    rf"{_CMD_SEP}\s*{_CMD_WRAP}{_ENV_PREFIX}{_PATH_PREFIX}['\"]?\\?git\s+{_GIT_GLOBAL_OPTS}"
+)
+_GH_PREFIX = rf"{_CMD_SEP}\s*{_CMD_WRAP}{_ENV_PREFIX}{_PATH_PREFIX}['\"]?\\?gh\s+"
+
+# `commit(?![-\w])` / `push(?![-\w])` exclude hyphenated plumbing subcommands
+# (git commit-tree, commit-graph, push-cert) that are NOT shipping commands.
 GIT_SHIPPING_PATTERNS = [
-    re.compile(r"(?:^|&&|\|\||;)\s*git\s+commit\b"),
-    re.compile(r"(?:^|&&|\|\||;)\s*git\s+push\b"),
-    re.compile(r"(?:^|&&|\|\||;)\s*gh\s+pr\s+create\b"),
+    re.compile(rf"{_GIT_PREFIX}commit(?![-\w])"),
+    re.compile(rf"{_GIT_PREFIX}push(?![-\w])"),
+    re.compile(rf"{_GH_PREFIX}pr\s+create(?![-\w])"),
 ]
 
 _PUSH_PR_PATTERNS = [
-    re.compile(r"(?:^|&&|\|\||;)\s*git\s+push\b"),
-    re.compile(r"(?:^|&&|\|\||;)\s*gh\s+pr\s+create\b"),
+    re.compile(rf"{_GIT_PREFIX}push(?![-\w])"),
+    re.compile(rf"{_GH_PREFIX}pr\s+create(?![-\w])"),
 ]
 
-_COMMIT_ALL_FLAG = re.compile(r"\bgit\s+commit\b.*(?:\s-a\b|\s--all\b)")
+_COMMIT_ALL_FLAG = re.compile(rf"{_GIT_PREFIX}commit(?![-\w]).*(?:\s-a\b|\s--all\b)")
 
 # Matches both the current "armis-scan-pass" and the legacy ".scan-pass".
 _SCAN_PASS_NAMES = r"(?:\.scan-pass|armis-scan-pass)"  # noqa: S105 — filenames, not a secret
+# Anti-forgery (bug-hunt #5): the scan-pass content is just
+# SHA-256(git diff --cached), which an agent can compute with read-only
+# commands the gate allows — so the file must be unforgeable via shell. We deny
+# WRITE *contexts* that target the basename, not any mention of it. Denying mere
+# mentions blocked legitimate commands that name the file (commit messages like
+# `git commit -m "fix armis-scan-pass"`, plus grep/cat/rm/pytest — this repo's
+# own history references it), and surfaced the wrong "forgery" message because
+# check_gate runs this check first. Write contexts: a redirect target, a
+# file-writing command (tee/cp/mv/dd/sed -i/install/ln/truncate/editors/
+# interpreters), or assigning the path to a shell variable. This is a blocklist
+# of write verbs (inherently leaky); the hash match plus protect_scan_pass.py's
+# Write/Edit guard backstop forgery, and an unforgeable HMAC token is the
+# durable follow-up.
+_SP_WRITE_VERBS = (
+    r"(?:tee|cp|mv|dd|install|ln|truncate|sed|ex|vi|vim|nano|emacs"
+    r"|python[0-9.]*|perl|ruby|node|awk)"
+)
+# The name as a bounded token (path component, quoted arg, or assignment value).
+_SP_TOKEN = rf"(?:^|[\s/'\"=(]){_SCAN_PASS_NAMES}\b"
 _SCAN_PASS_WRITE_PATTERN = re.compile(
-    rf"[>|][^;&|]*(?:^|/|\s){_SCAN_PASS_NAMES}\b"
-    rf"|(?:tee|cp|mv)\s+[^;&|]*(?:^|/|\s){_SCAN_PASS_NAMES}\b"
+    # 1. redirect (truncate/append) targeting the file
+    rf">>?\s*(?:[^\s;&|>]*?/)?{_SCAN_PASS_NAMES}\b"
+    # 2. a write-capable command naming the file in its arguments
+    rf"|\b{_SP_WRITE_VERBS}\b[^\n;&|]*{_SP_TOKEN}"
+    # 3. assigning the file's path to a shell variable (laundering setup)
+    rf"|[A-Za-z_]\w*=(?:[^\s;&|]*?/)?{_SCAN_PASS_NAMES}\b"
 )
 
 
@@ -118,7 +176,10 @@ def _has_matching_scan_pass() -> bool:
         if not current_hash:
             return False
         return stored_hash == current_hash
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError (incl. UnicodeDecodeError) must NOT escape to the hooks'
+        # outer fail-open catch-all — fail *closed* (deny) on any recoverable
+        # read/decode error so a non-UTF-8 staged diff can't bypass the gate.
         return False
 
 

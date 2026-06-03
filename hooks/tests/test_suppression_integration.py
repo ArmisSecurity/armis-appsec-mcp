@@ -537,7 +537,7 @@ class TestScanDiffInlineSuppression:
     async def test_scan_diff_suppresses_inline(self):
         """REGRESSION (#11): scan_diff applies inline armis:ignore (it did not before)."""
         raw = _findings_json([self._finding("password")])
-        with patch("server.run_git_diff", return_value=self._DIFF):
+        with patch("server.run_git_diff", return_value=(self._DIFF, False)):
             with patch("server.find_git_root", return_value=None):
                 with patch("server.load_armisignore", return_value=ArmisIgnoreConfig()):
                     with patch("server.call_appsec_api", return_value=raw):
@@ -552,7 +552,7 @@ class TestScanDiffInlineSuppression:
         raw = _findings_json(
             [self._finding("password", cwe=89, explanation="sqli", has_secret=False)]
         )
-        with patch("server.run_git_diff", return_value=self._DIFF):
+        with patch("server.run_git_diff", return_value=(self._DIFF, False)):
             with patch("server.find_git_root", return_value=None):
                 with patch("server.load_armisignore", return_value=ArmisIgnoreConfig()):
                     with patch("server.call_appsec_api", return_value=raw):
@@ -566,7 +566,7 @@ class TestScanDiffInlineSuppression:
         raw = _findings_json(
             [self._finding("password", severity="CRITICAL", explanation="critical secret")]
         )
-        with patch("server.run_git_diff", return_value=self._DIFF):
+        with patch("server.run_git_diff", return_value=(self._DIFF, False)):
             with patch("server.find_git_root", return_value=None):
                 with patch("server.load_armisignore", return_value=ArmisIgnoreConfig()):
                     with patch("server.call_appsec_api", return_value=raw):
@@ -579,7 +579,7 @@ class TestScanDiffInlineSuppression:
     async def test_inline_high_does_not_block_scan_pass(self, isolated_server_scan_pass):
         """Inline-suppressed HIGH (no other findings) writes .scan-pass."""
         raw = _findings_json([self._finding("password", severity="HIGH")])
-        with patch("server.run_git_diff", return_value=self._DIFF):
+        with patch("server.run_git_diff", return_value=(self._DIFF, False)):
             with patch("server.find_git_root", return_value=None):
                 with patch("server.load_armisignore", return_value=ArmisIgnoreConfig()):
                     with patch("server.call_appsec_api", return_value=raw):
@@ -600,7 +600,7 @@ class TestScanDiffInlineSuppression:
             ]
         )
         config = ArmisIgnoreConfig(cwes=[89])
-        with patch("server.run_git_diff", return_value=self._DIFF):
+        with patch("server.run_git_diff", return_value=(self._DIFF, False)):
             with patch("server.find_git_root", return_value="/x"):
                 with patch("server.load_armisignore", return_value=config):
                     with patch("server.call_appsec_api", return_value=raw):

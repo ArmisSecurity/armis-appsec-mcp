@@ -35,6 +35,55 @@ class TestIsShippingCommand:
     def test_non_shipping_commands(self, cmd):
         assert not hook_core._is_shipping_command(cmd)
 
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # Bug-hunt #2: bypass family that the old anchor set let through.
+            "echo hi\ngit commit -m x",  # newline-separated 2nd line
+            "sleep 0 & git commit -m x",  # single-& separator
+            "true | git commit -m x",  # pipe separator
+            "git -C /repo commit -m x",  # -C global option (idiomatic in worktrees)
+            "git -c user.name=x commit -m x",  # -c k=v global option
+            "git --no-pager commit -m x",  # --no-pager global option
+            "git --git-dir=/r/.git commit -m x",  # --git-dir global option
+            "(git commit -m x)",  # subshell
+            "$(git commit -m x)",  # command substitution
+            "/usr/bin/git commit -m x",  # absolute path to binary
+            "./git commit -m x",  # relative path to binary
+            "env git commit -m x",  # env prefix
+            "GIT_AUTHOR_DATE=x git commit -m x",  # env-assignment prefix
+            "git -C /repo push",  # global option before push
+            "env gh pr create",  # env prefix before gh pr create
+            # C2: command-wrapper prefixes that exec a real shipping command.
+            "command git commit -m x",  # `command` builtin
+            "sudo git commit -m x",  # sudo
+            "xargs git commit",  # xargs
+            "eval 'git commit -m x'",  # eval with quoted command
+            "nice git commit -m x",  # nice
+            "time git push",  # time
+            "nohup git push",  # nohup
+            "\\git commit -m x",  # escaped binary (suppresses alias)
+            "command gh pr create",  # wrapper before gh pr create
+        ],
+    )
+    def test_shipping_bypass_family_now_caught(self, cmd):
+        assert hook_core._is_shipping_command(cmd)
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "echo 'I will commit later'",  # "commit" inside unrelated text
+            "git describe",
+            # Plumbing subcommands that share a prefix but are NOT shipping —
+            # commit(?![-\w]) / push(?![-\w]) must not match at the hyphen.
+            "git commit-tree HEAD^{tree}",
+            "git commit-graph write",
+            "git push-cert",
+        ],
+    )
+    def test_commit_in_message_text_is_not_shipping(self, cmd):
+        assert not hook_core._is_shipping_command(cmd)
+
 
 class TestIsPushOrPr:
     def test_push(self):
@@ -57,6 +106,80 @@ class TestHasAllFlag:
 
     def test_no_flag(self):
         assert not hook_core._has_all_flag("git commit -m 'msg'")
+
+    def test_all_flag_with_global_opts(self):
+        # Bug-hunt #2: -a/--all must still be detected behind git global options
+        # so build_system_message recommends scan_diff() (unstaged) correctly.
+        assert hook_core._has_all_flag("git -C /repo commit -a -m 'msg'")
+        assert hook_core._has_all_flag("git -c k=v commit --all")
+
+
+class TestScanPassWriteForgery:
+    """Bug-hunt #5: the scan-pass must be unforgeable via shell. The pattern
+    denies WRITE *contexts* (redirect target, write-capable command naming the
+    file, or assigning its path to a variable) — NOT mere mentions, which would
+    block legitimate commands that only name the file (commit messages,
+    grep/cat/rm/pytest). The hash match and protect_scan_pass.py's Write/Edit
+    guard provide defense-in-depth; an HMAC token is the durable follow-up."""
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "echo h > .git/armis-scan-pass",  # redirect
+            "echo h >> .git/armis-scan-pass",  # append redirect
+            "echo h > .scan-pass",  # legacy name
+            "echo h | tee .git/armis-scan-pass",  # tee
+            "cp /tmp/x .git/armis-scan-pass",  # cp
+            "mv /tmp/x .git/armis-scan-pass",  # mv
+            "dd of=.git/armis-scan-pass",  # dd (previously evaded)
+            "sed -i s/a/b/ .git/armis-scan-pass",  # sed -i (previously evaded)
+            "truncate -s0 .git/armis-scan-pass",  # truncate (previously evaded)
+            "install /tmp/x .git/armis-scan-pass",  # install (previously evaded)
+            "ln -s /tmp/x .git/armis-scan-pass",  # ln (previously evaded)
+            "ex .git/armis-scan-pass",  # ex editor (previously evaded)
+            "vim .git/armis-scan-pass",  # bare-arg editor (previously evaded)
+            "python -c \"open('.git/armis-scan-pass','w').write('x')\"",  # python (evaded)
+            "F=.git/armis-scan-pass; cat $F",  # assignment target (evaded)
+        ],
+    )
+    def test_forgery_vectors_denied(self, cmd):
+        assert hook_core._is_scan_pass_write_bash(cmd)
+        assert hook_core.check_gate(cmd).decision == "deny"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "echo 'scan-passed the test'",  # substring, not the basename
+            "cat my-armis-scan-passport",  # word boundary: 'passport' != basename
+            "echo h > out.txt",  # unrelated redirect
+            "git status",  # unrelated command
+            # C1 regression: legitimate commands that only NAME the file must
+            # NOT be flagged as forgery (they aren't writes).
+            "git commit -m 'fix armis-scan-pass path'",  # commit-message mention
+            'gh pr create --title "harden armis-scan-pass"',  # PR-title mention
+            "grep armis-scan-pass hooks/hook_core.py",  # search the codebase
+            "cat .git/armis-scan-pass",  # read-only inspection
+            "rm .git/armis-scan-pass",  # delete to force a re-scan (not a forgery)
+            "pytest -k armis-scan-pass",  # test selector
+        ],
+    )
+    def test_no_false_positives(self, cmd):
+        assert not hook_core._is_scan_pass_write_bash(cmd)
+
+    def test_commit_message_mention_reaches_shipping_gate_not_forgery(self, tmp_path):
+        # C1: a real `git commit` whose message names the file must hit the
+        # SHIPPING gate (scan-required message), not the forgery deny — the
+        # forgery check runs first, so an over-broad pattern would shadow it.
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+        old_cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            result = hook_core.check_gate("git commit -m 'fix armis-scan-pass path'")
+            assert result.decision == "deny"
+            assert "Security scan required" in result.system_message
+            assert "BLOCKED" not in result.system_message
+        finally:
+            os.chdir(old_cwd)
 
 
 class TestIsScanPassFile:

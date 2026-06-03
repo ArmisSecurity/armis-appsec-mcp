@@ -36,18 +36,28 @@ def main():
 
         tool_name = hook_input.get("tool_name", "")
 
-        # Shell tool: check commit gate
-        if tool_name in ("terminal", "shell", "bash", "Shell", "Bash"):
+        # Cursor's beforeShellExecution payload is FLAT — {command, cwd, ...}
+        # with no tool_name/tool_input wrapper (bug-hunt #4). The preToolUse
+        # write-guard path uses the wrapped {tool_name, tool_input} shape. Read
+        # the command from either location so the gate fires on every shell
+        # command regardless of which event invoked us. (The shell matcher in
+        # cursor.hooks.json is ".*" so this adapter sees ALL shell commands; if
+        # we gated on tool_name the forgery guard in check_gate would never run
+        # for a bare `echo h > .git/armis-scan-pass`.)
+        cmd = hook_input.get("command", "")
+        if not isinstance(cmd, str) or not cmd.strip():
             cmd = tool_input.get("command", "")
-            if not isinstance(cmd, str) or not cmd.strip():
-                print(_ALLOW)
-                sys.exit(0)
+
+        # Shell command present (flat beforeShellExecution, or a wrapped shell
+        # tool): run the full gate, which covers both the shipping check and the
+        # scan-pass anti-forgery check.
+        if isinstance(cmd, str) and cmd.strip():
             result = check_gate(cmd)
             if result.decision == "deny":
                 print(json.dumps({"permission": "deny", "agent_message": result.system_message}))
                 sys.exit(0)
 
-        # Write tool: check anti-forgery
+        # Write tool: check anti-forgery (preToolUse with a file-edit tool name)
         elif tool_name in ("Write", "Edit", "write_file", "edit_file"):
             file_path = tool_input.get("file_path", tool_input.get("path", ""))
             if is_scan_pass_file(file_path):

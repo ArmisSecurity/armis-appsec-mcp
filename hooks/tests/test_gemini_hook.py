@@ -96,6 +96,26 @@ class TestShippingCommandsDeny:
         assert "systemMessage" in data
 
 
+class TestWhitespaceVariantBypass:
+    """Bug-hunt #3: the old _FAST_SHIP_KEYWORDS substring prefilter used
+    single-space literals ("git commit"), so whitespace variants the shell
+    collapses to a real commit ("git  commit", "git\\tcommit") slipped past the
+    gate entirely. The prefilter is gone; check_gate's \\s+ regex catches them."""
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "git  commit -m 'x'",  # two spaces
+            "git\tcommit -m 'x'",  # tab
+            "git -C /repo commit -m 'x'",  # global option (also #2)
+        ],
+    )
+    def test_whitespace_variants_now_deny(self, run_gemini_hook, cmd):
+        result = run_gemini_hook(tool_name="run_shell_command", command=cmd)
+        assert result.returncode == 2
+        assert "Security scan required" in result.stderr
+
+
 class TestNonShippingAllow:
     @pytest.mark.parametrize(
         "cmd",
