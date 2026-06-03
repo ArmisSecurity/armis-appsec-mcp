@@ -143,12 +143,29 @@ def _merge_inline_suppressions(
     return suppressed
 
 
+_SUPPRESSION_SOURCE_LABELS = {
+    "armisignore": ".armisignore",
+    "inline": "armis:ignore inline",
+}
+
+
 def _format_critical_warning(suppressed_critical: list[dict]) -> str:
-    """Format a warning message for suppressed CRITICAL findings."""
+    """Format a warning message for suppressed CRITICAL findings.
+
+    The findings may have been suppressed by ``.armisignore``, an inline
+    ``armis:ignore`` directive, or a mix of both, so the source is derived
+    per-finding from ``_suppression_source`` rather than hard-coded.
+    """
     cwes = [f"CWE-{f.get('cwe', '?')}" for f in suppressed_critical]
+    # Preserve first-seen order of sources for a stable message.
+    sources: list[str] = []
+    for f in suppressed_critical:
+        label = _SUPPRESSION_SOURCE_LABELS.get(f.get("_suppression_source", ""), ".armisignore")
+        if label not in sources:
+            sources.append(label)
     return (
         f"WARNING: {len(suppressed_critical)} CRITICAL finding(s) suppressed by "
-        f".armisignore ({', '.join(cwes)}). approve_findings is still required."
+        f"{' / '.join(sources)} ({', '.join(cwes)}). approve_findings is still required."
     )
 
 

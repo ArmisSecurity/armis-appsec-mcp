@@ -631,3 +631,42 @@ class TestMergeInlineSuppressions:
         assert summary == {"total": 1, "active": 1, "suppressed": 0, "by_directive": {}}
         assert "by_inline" not in summary
         assert result == existing
+
+
+class TestFormatCriticalWarning:
+    """_format_critical_warning must name the actual suppression source(s).
+
+    After _merge_inline_suppressions, the suppressed list can mix .armisignore
+    and inline armis:ignore findings; the warning was hard-coded to ".armisignore"
+    (PR #20 review). The source is derived per-finding from _suppression_source.
+    """
+
+    def test_armisignore_source(self):
+        warning = server._format_critical_warning(
+            [{"cwe": 798, "_suppression_source": "armisignore"}]
+        )
+        assert "suppressed by .armisignore" in warning
+        assert "armis:ignore inline" not in warning
+        assert "CWE-798" in warning
+        assert "approve_findings is still required" in warning
+
+    def test_inline_source(self):
+        warning = server._format_critical_warning([{"cwe": 78, "_suppression_source": "inline"}])
+        assert "suppressed by armis:ignore inline" in warning
+        assert ".armisignore" not in warning
+
+    def test_mixed_sources(self):
+        warning = server._format_critical_warning(
+            [
+                {"cwe": 798, "_suppression_source": "armisignore"},
+                {"cwe": 78, "_suppression_source": "inline"},
+            ]
+        )
+        assert ".armisignore / armis:ignore inline" in warning
+        assert "2 CRITICAL finding(s)" in warning
+        assert "CWE-798" in warning and "CWE-78" in warning
+
+    def test_missing_source_defaults_to_armisignore(self):
+        """A finding with no _suppression_source falls back to .armisignore."""
+        warning = server._format_critical_warning([{"cwe": 89}])
+        assert "suppressed by .armisignore" in warning
