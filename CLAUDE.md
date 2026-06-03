@@ -49,7 +49,7 @@ python server.py
 - `scanner_core.parse_findings()` → extracts the JSON block from the LLM response; findings with `cwe in (None, 0)` are filtered out to match the production pipeline.
 - `scanner_core.format_findings()` → compact, no-markdown plain text (optimized for LLM token cost, not human readability).
 - `auth.JWTAuth` → OAuth2 client-credentials against `/auth/token`. Token cached in memory, re-exchanged when within 5 minutes of `exp`. `_parse_jwt_exp` bounds-checks `exp` (must be future, ≤24h out).
-- `suppression` → `.armisignore` at git root. Supports `cwe:`, `severity:`, `category:`, `rule:` directives and path patterns (basename, glob, or `dir/` prefix). Fail-open on any parse/IO error.
+- `suppression` → two mechanisms, both deterministic local matching (no LLM involvement): (1) **`.armisignore`** at git root — `cwe:`, `severity:`, `category:`, `rule:` directives and path patterns (basename, glob, or `dir/` prefix); (2) **inline `armis:ignore`** source comments — `apply_inline_suppressions` (file scans, by source line) and `apply_inline_suppressions_to_diff` (diff scans, by blob line via `build_diff_line_map`). Fail-open on any parse/IO error.
 - `hash_utils.compute_staged_hash()` → SHA-256 of `git diff --cached --no-color --no-ext-diff`; used by both server and hook to agree on "same staged diff."
 
 ## The `.scan-pass` commit gate (critical invariant)
@@ -78,6 +78,30 @@ Don't "simplify" any of this without reading `.context/0008-*.md` — the guard 
 - **Suppressed HIGH** does **not** block. A team's presence of `severity:HIGH` in `.armisignore` is treated as an already-made risk decision, so no per-commit approval is needed. See the comment in `server._cache_scan()`.
 - `scan_file` also short-circuits *before* the API call if the file path is excluded by `.armisignore` — avoids paying API cost on ignored files.
 - Category is derived, not declared: `has_secret: true` → `"secrets"`, else `"sast"`.
+
+### Inline `armis:ignore` comments
+
+A finding can also be suppressed by a comment **in the source itself**, on the finding's own
+line or the line directly above it. This works for `scan_file`, `scan_diff`, and the portable
+`git-hooks/scan-staged.py` (all three apply it; `scan_code` does not — it has no file/diff to
+anchor on). Syntax:
+
+- Marker `armis:ignore` (case-insensitive), inside a comment in any supported language
+  (`#`, `//`, `--`, `<!-- -->`, `/* */`, …). Comment detection (`_extract_comment_text`) is
+  **string-literal aware**: a marker inside a quoted string (e.g. `q = "... #armis:ignore"`)
+  does **not** start a directive, so it can't suppress the finding on that line. This is the
+  fail-safe direction — when in doubt the finding stays active.
+- Bare `armis:ignore` suppresses **any** finding on that line.
+- Optional params narrow the match with **AND** logic (opposite of `.armisignore`'s OR):
+  `cwe:798`, `severity:HIGH`, `category:secrets`, and a free-text `reason: ...`.
+- `rule:` is recognized but a `rule:`-only directive matches **nothing** (the fast-scan model
+  has no rule IDs) — it is *not* treated as bare. Combine it with `cwe:`/etc. to take effect.
+- **Diff scans match the diff blob, not files on disk** (`apply_inline_suppressions_to_diff`):
+  correct for `staged`/`ref` scans where the working tree may differ. The "line above" is the
+  same file's previous *source* line, so a directive can never cross a hunk gap or file
+  boundary, and a directive on a removed (`-`) line never suppresses.
+- Inline-suppressed **CRITICAL** still blocks `.scan-pass` (requires `approve_findings`); inline
+  HIGH/other does not — same gate semantics as `.armisignore`.
 
 ## Fail-open vs fail-closed
 

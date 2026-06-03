@@ -63,6 +63,23 @@ Follow this logic to pick the right tool:
    - If result is "No changes to scan.": Call `mcp__scanner__scan_diff` with `staged=false` (unstaged changes).
    - If still no changes: Tell the user there are no changes to scan.
 
+## Suppressing Findings
+
+If a finding is a reviewed false positive, the user can suppress it. Both mechanisms are
+deterministic local matching and apply to `scan_file`, `scan_diff`, and the git commit hook:
+
+- **Inline comment** -- `armis:ignore` in a comment on the finding's line or the line directly
+  above it. Narrow with `cwe:`, `severity:`, or `category:` (AND logic), plus an optional free-text
+  `reason:`. Example: `query = build(sql)  # armis:ignore cwe:89 reason: parameterized below`. A
+  bare `armis:ignore` suppresses any finding on that line. (`rule:`-only matches nothing -- combine
+  it with `cwe:`/etc.)
+- **`.armisignore` file** at the repo root -- `cwe:`, `severity:`, `category:` directives and path
+  patterns, applied repo-wide.
+
+Inline-suppressed/`.armisignore`-suppressed **CRITICAL** still blocks the commit and requires
+`approve_findings`; HIGH and below do not. Only suggest suppression for genuine false positives,
+never to bypass a real vulnerability.
+
 ## Output Formatting
 
 Present findings to the user as follows:
