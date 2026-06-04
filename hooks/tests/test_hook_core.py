@@ -190,6 +190,20 @@ class TestBuildSystemMessage:
         ).stdout.strip()
         assert f"repo_path='{expected}'" in msg
 
+    def test_repo_path_with_single_quote_is_escaped(self):
+        """A path containing a single quote must produce a syntactically valid
+        Python string literal (the agent reproduces the call verbatim), not a
+        broken one like repo_path='/a'b'. repr() handles the escaping."""
+        weird = "/tmp/it's a repo"
+        msg = hook_core.build_system_message("git commit -m 'x'", repo_path=weird)
+        # The injected literal must round-trip back to the original path.
+        assert f"repo_path={weird!r}" in msg
+        # And it must be parseable as a real Python string literal.
+        import ast
+
+        literal = msg.split("repo_path=", 1)[1].split(")", 1)[0]
+        assert ast.literal_eval(literal) == weird
+
 
 class TestCrossAdapterInterop:
     """Verify .scan-pass written once is accepted by all adapter scripts."""

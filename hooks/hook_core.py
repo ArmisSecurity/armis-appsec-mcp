@@ -154,8 +154,10 @@ def _scan_call(cmd: str, repo_path: str | None) -> str:
         args = ["staged=True"]
 
     if repo_path:
-        # Single-quote the path; the agent reproduces this call verbatim.
-        args.append(f"repo_path='{repo_path}'")
+        # repr() produces a valid, properly-escaped Python string literal so the
+        # call stays syntactically valid even if the path contains a single
+        # quote or backslash (the agent reproduces this call verbatim).
+        args.append(f"repo_path={repo_path!r}")
     return f"scan_diff({', '.join(args)})"
 
 

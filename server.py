@@ -501,6 +501,7 @@ async def scan_diff(
                 is_staged_scan=is_shipping_scan,
                 scan_hash=scan_hash,
                 repo_path=scan_repo,
+                staged=staged,
             )
             return report
 
@@ -550,6 +551,7 @@ async def scan_diff(
         suppressed=suppressed,
         suppression_summary=suppression_summary,
         repo_path=scan_repo,
+        staged=staged,
     )
 
     if ctx:
@@ -581,6 +583,10 @@ _last_scan: dict = {
     "filename": "",
     "timestamp": None,
     "is_staged_scan": False,
+    # True only for a real staged-index scan (staged=True), as opposed to a
+    # ref-based shipping scan. do_approve_findings uses this to decide whether
+    # to guard against the staged index drifting since the scan.
+    "staged": False,
     "scan_hash": "",
     "repo_path": "",
 }
@@ -628,8 +634,28 @@ def do_approve_findings(reason: str) -> str:
     # the server's CWD is a sibling of the worktree being committed).
     repo_path = _last_scan.get("repo_path") or None
 
-    # Use staged hash if available, otherwise use the cached scan hash
-    approval_hash = compute_staged_hash(repo_path) or _last_scan.get("scan_hash", "")
+    # Approval must be tied to the *exact content that was scanned*, not to the
+    # current index. Preferring a fresh compute_staged_hash() here would let a
+    # post-scan change to the staged index slip through: approve_findings would
+    # write a pass for unscanned content and the commit gate (comparing that
+    # same new hash) would allow it. So bind to the recorded scan_hash, and for
+    # staged scans refuse if the index drifted since the scan.
+    scanned_hash = _last_scan.get("scan_hash", "")
+    if _last_scan.get("staged"):
+        current_hash = compute_staged_hash(repo_path)
+        if scanned_hash and current_hash and current_hash != scanned_hash:
+            return (
+                "ERROR: Staged changes differ from the last scan, so this "
+                "approval would cover unscanned code. Re-run "
+                "scan_diff(staged=True, repo_path=...) and approve again."
+            )
+        # Fall back to the live hash only when the scan recorded none (older
+        # cache); never when it would mask a drift detected above.
+        approval_hash = scanned_hash or current_hash
+    else:
+        # ref-based scan: the scanned diff hash is authoritative (there is no
+        # live staged index to compare against, and the gate checks presence).
+        approval_hash = scanned_hash
     if not approval_hash:
         return "ERROR: No changes found to approve. Run scan_diff first."
 
@@ -681,6 +707,7 @@ def _cache_scan(
     suppressed: list[dict] | None = None,
     suppression_summary: dict | None = None,
     repo_path: str | None = None,
+    staged: bool = False,
 ):
     """Update the last scan cache and write .scan-pass if clean.
 
@@ -697,6 +724,8 @@ def _cache_scan(
             resolver and hash fallback so both land in the scanned repo's git
             dir — critical when the server's CWD is a sibling of the worktree
             being committed (see resolve_scan_pass_path).
+        staged: True only for a real staged-index scan (vs a ref scan). Cached
+            so do_approve_findings can detect the index drifting after the scan.
     """
     _last_scan.update(
         {
@@ -707,6 +736,7 @@ def _cache_scan(
             "filename": filename,
             "timestamp": time.time(),
             "is_staged_scan": is_staged_scan,
+            "staged": staged,
             "scan_hash": scan_hash,
             "repo_path": repo_path or "",
         }

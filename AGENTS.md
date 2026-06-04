@@ -7,7 +7,7 @@ when connected to the `armis-scanner` MCP server.
 
 Before running `git commit`, `git push`, or creating a pull request:
 
-1. Call `scan_diff` with `staged=true` **and `repo_path` set to your repo's absolute path** to scan staged changes. Always pass `repo_path`: the MCP server is a long-lived process whose own working directory may be a different checkout than yours (in a git worktree it is often the main repo), so without `repo_path` the scan and its `.scan-pass` land in the wrong git dir and the commit gate never sees them.
+1. Call `scan_diff` with `staged=true` **and `repo_path` set to your repo's absolute work-tree root** (the value of `git rev-parse --show-toplevel`, not just your current dir) to scan staged changes. Always pass `repo_path`: the MCP server is a long-lived process whose own working directory may be a different checkout than yours (in a git worktree it is often the main repo), so without `repo_path` the scan and its `.scan-pass` land in the wrong git dir and the commit gate never sees them.
 2. If HIGH or CRITICAL findings are reported:
    - Attempt to fix them (move secrets to env vars, use parameterized queries, etc.)
    - Re-stage fixes and re-scan

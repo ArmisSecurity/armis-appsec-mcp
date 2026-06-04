@@ -28,7 +28,7 @@ The MCP server is named `scanner`. All tools are prefixed `mcp__scanner__`.
 ### Tool Parameters
 
 **`mcp__scanner__scan_diff`**
-- `repo_path` (string, optional): Path to git repo. **Always set this to the absolute path of the repository you are working in** (your current working directory). The MCP server is a long-lived process whose own working directory may be a *different* checkout than yours — in a git worktree (e.g. a Conductor workspace) it is often the main repo, not your worktree. Passing `repo_path` pins the scan, the staged-diff hash, and the `.scan-pass` write to *your* repo so the commit gate sees them. Omitting it falls back to the server's working directory, which is wrong outside that one checkout.
+- `repo_path` (string, optional): Path to git repo. **Always set this to the absolute work-tree root of the repository you are working in** — the value of `git rev-parse --show-toplevel`, not just your current working directory (which may be a subdirectory and would resolve the hash/scan-pass against the wrong root). The MCP server is a long-lived process whose own working directory may be a *different* checkout than yours — in a git worktree (e.g. a Conductor workspace) it is often the main repo, not your worktree. Passing `repo_path` pins the scan, the staged-diff hash, and the `.scan-pass` write to *your* repo so the commit gate sees them. Omitting it falls back to the server's working directory, which is wrong outside that one checkout.
 - `ref` (string, optional): Git ref to diff against (branch name, tag, SHA, `HEAD~3`). If empty, scans unstaged or staged changes.
 - `staged` (bool, optional): If true, scan only staged changes (`git diff --cached`). Ignored when `ref` is provided.
 
