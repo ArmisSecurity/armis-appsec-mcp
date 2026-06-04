@@ -83,6 +83,51 @@ class TestResolveScanPassPath:
         plugin_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         assert result == os.path.join(plugin_dir, SCAN_PASS_BASENAME)
 
+    def test_repo_path_overrides_cwd(self, git_repo, monkeypatch, tmp_path):
+        """resolve_scan_pass_path(repo_path) resolves against the *passed* repo,
+        not the process CWD. This is the crux of the worktree handshake: the
+        long-lived MCP server is pinned to a launch CWD that may be a sibling
+        of the repo being committed, so it must resolve from the scanned
+        repo_path. CWD points at git_repo; we resolve a *second* repo and
+        expect the second repo's git dir to win."""
+        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+        other = tmp_path.parent / "other_repo"
+        other.mkdir(exist_ok=True)
+        _git(["init"], other)
+
+        # CWD is git_repo, but we pass `other` — `other` must win.
+        result = resolve_scan_pass_path(str(other))
+        assert result == os.path.join(_expected_git_dir(other), SCAN_PASS_BASENAME)
+        # And it must NOT be git_repo's path (the CWD repo).
+        assert result != os.path.join(_expected_git_dir(git_repo), SCAN_PASS_BASENAME)
+
+    def test_server_with_repo_path_matches_hook_in_worktree(self, git_repo, monkeypatch, tmp_path):
+        """The end-to-end regression: a server pinned to the main repo, given
+        repo_path=<worktree>, resolves the SAME scan-pass the hook resolves
+        from inside that worktree. Before the fix the server used its own CWD
+        and the two diverged, so the gate denied forever."""
+        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+        (git_repo / "seed.txt").write_text("seed")
+        _git(["add", "seed.txt"], git_repo)
+        _git(["commit", "-m", "seed"], git_repo)
+
+        worktree = tmp_path.parent / "wt2"
+        _git(["worktree", "add", str(worktree)], git_repo)
+        try:
+            # Server's CWD stays at the main repo (git_repo) — it is pinned.
+            monkeypatch.chdir(git_repo)
+            server_view = resolve_scan_pass_path(str(worktree))
+
+            # Hook runs *inside* the worktree, resolving from CWD (no repo_path).
+            monkeypatch.chdir(worktree)
+            hook_view = resolve_scan_pass_path()
+
+            assert server_view == hook_view
+            assert "worktrees" in server_view  # the per-worktree git dir
+        finally:
+            monkeypatch.chdir(git_repo)
+            _git(["worktree", "remove", "--force", str(worktree)], git_repo)
+
     def test_server_and_hook_resolve_same_path(self, git_repo, monkeypatch):
         """Regression: the gate reader (hook_core) and the writer (hash_utils)
         must resolve the SAME path. They previously diverged in worktrees."""

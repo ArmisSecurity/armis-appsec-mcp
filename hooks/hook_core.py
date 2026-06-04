@@ -16,7 +16,11 @@ _plugin_root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _plugin_root_dir not in sys.path:
     sys.path.insert(0, _plugin_root_dir)
 
-from hash_utils import compute_staged_hash, resolve_scan_pass_path  # noqa: E402
+from hash_utils import (  # noqa: E402
+    compute_staged_hash,
+    resolve_repo_toplevel,
+    resolve_scan_pass_path,
+)
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -132,14 +136,42 @@ def _has_scan_pass_for_push() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def build_system_message(cmd: str) -> str:
-    """Build the scan instruction based on command type."""
+def _scan_call(cmd: str, repo_path: str | None) -> str:
+    """Build the ``scan_diff(...)`` call string for the given command.
+
+    ``repo_path`` (the hook's own work-tree root) is injected so the MCP
+    server scans — and writes the scan-pass into — the *same* repo the commit
+    will happen in. The server is long-lived and pinned to its launch CWD,
+    which in a Conductor setup is often the main checkout, not this worktree;
+    without this argument the server would write the scan-pass into the wrong
+    git dir and the gate (reading from here) would never see it.
+    """
     if _is_push_or_pr(cmd):
-        scan_instruction = "scan_diff(ref='origin/HEAD')"
+        args = ["ref='origin/HEAD'"]
     elif _has_all_flag(cmd):
-        scan_instruction = "scan_diff()"
+        args = []
     else:
-        scan_instruction = "scan_diff(staged=True)"
+        args = ["staged=True"]
+
+    if repo_path:
+        # repr() produces a valid, properly-escaped Python string literal so the
+        # call stays syntactically valid even if the path contains a single
+        # quote or backslash (the agent reproduces this call verbatim).
+        args.append(f"repo_path={repo_path!r}")
+    return f"scan_diff({', '.join(args)})"
+
+
+def build_system_message(cmd: str, repo_path: str | None = None) -> str:
+    """Build the scan instruction based on command type.
+
+    ``repo_path`` defaults to the hook's resolved work-tree root; tests pass it
+    explicitly. It is woven into the recommended ``scan_diff`` call so the
+    scan-pass is written where this gate will read it.
+    """
+    if repo_path is None:
+        repo_path = resolve_repo_toplevel()
+
+    scan_instruction = _scan_call(cmd, repo_path)
 
     return (
         f"Security scan required before shipping. "

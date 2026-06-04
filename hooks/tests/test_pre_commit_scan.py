@@ -214,45 +214,52 @@ class TestScanPass:
 # Command-specific systemMessage
 # ---------------------------------------------------------------------------
 class TestCommandSpecificMessages:
-    """Different commands should get different scan instructions."""
+    """Different commands should get different scan instructions.
+
+    The hook runs in a real git repo (run_hook does `git init` in tmp_path),
+    so it injects ``repo_path='<work-tree>'`` into every scan_diff call. That
+    is the worktree fix: the recommended call pins the server's scan — and its
+    scan-pass write — to the repo the commit happens in, not the server's
+    launch CWD.
+    """
 
     def test_commit_gets_staged_scan(self, run_hook):
         stdout, stderr, rc = run_hook("git commit -m 'msg'")
         assert rc == 2
         data = json.loads(stderr)
-        assert "scan_diff(staged=True)" in data["systemMessage"]
+        assert "scan_diff(staged=True, repo_path=" in data["systemMessage"]
 
     def test_commit_a_gets_unstaged_scan(self, run_hook):
         stdout, stderr, rc = run_hook("git commit -a -m 'msg'")
         assert rc == 2
         data = json.loads(stderr)
-        assert "scan_diff()" in data["systemMessage"]
+        assert "scan_diff(repo_path=" in data["systemMessage"]
         assert "staged=True" not in data["systemMessage"]
 
     def test_commit_all_flag_gets_unstaged_scan(self, run_hook):
         stdout, stderr, rc = run_hook("git commit --all -m 'msg'")
         assert rc == 2
         data = json.loads(stderr)
-        assert "scan_diff()" in data["systemMessage"]
+        assert "scan_diff(repo_path=" in data["systemMessage"]
         assert "staged=True" not in data["systemMessage"]
 
     def test_push_gets_ref_scan(self, run_hook):
         stdout, stderr, rc = run_hook("git push")
         assert rc == 2
         data = json.loads(stderr)
-        assert "scan_diff(ref='origin/HEAD')" in data["systemMessage"]
+        assert "scan_diff(ref='origin/HEAD', repo_path=" in data["systemMessage"]
 
     def test_push_origin_main_gets_ref_scan(self, run_hook):
         stdout, stderr, rc = run_hook("git push origin main")
         assert rc == 2
         data = json.loads(stderr)
-        assert "scan_diff(ref='origin/HEAD')" in data["systemMessage"]
+        assert "scan_diff(ref='origin/HEAD', repo_path=" in data["systemMessage"]
 
     def test_pr_create_gets_ref_scan(self, run_hook):
         stdout, stderr, rc = run_hook("gh pr create --title 'PR'")
         assert rc == 2
         data = json.loads(stderr)
-        assert "scan_diff(ref='origin/HEAD')" in data["systemMessage"]
+        assert "scan_diff(ref='origin/HEAD', repo_path=" in data["systemMessage"]
 
     def test_system_message_has_calm_language(self, run_hook):
         stdout, stderr, rc = run_hook("git commit -m 'msg'")

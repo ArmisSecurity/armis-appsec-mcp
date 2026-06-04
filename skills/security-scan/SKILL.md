@@ -28,7 +28,7 @@ The MCP server is named `scanner`. All tools are prefixed `mcp__scanner__`.
 ### Tool Parameters
 
 **`mcp__scanner__scan_diff`**
-- `repo_path` (string, optional): Path to git repo. Defaults to current directory.
+- `repo_path` (string, optional): Path to git repo. **Always set this to the absolute work-tree root of the repository you are working in** — the value of `git rev-parse --show-toplevel`, not just your current working directory (which may be a subdirectory and would resolve the hash/scan-pass against the wrong root). The MCP server is a long-lived process whose own working directory may be a *different* checkout than yours — in a git worktree (e.g. a Conductor workspace) it is often the main repo, not your worktree. Passing `repo_path` pins the scan, the staged-diff hash, and the `.scan-pass` write to *your* repo so the commit gate sees them. Omitting it falls back to the server's working directory, which is wrong outside that one checkout.
 - `ref` (string, optional): Git ref to diff against (branch name, tag, SHA, `HEAD~3`). If empty, scans unstaged or staged changes.
 - `staged` (bool, optional): If true, scan only staged changes (`git diff --cached`). Ignored when `ref` is provided.
 
@@ -47,7 +47,7 @@ Note: `scan_file` and `scan_code` both silently truncate input at 90,000 charact
 
 ## Decision Tree
 
-Follow this logic to pick the right tool:
+Follow this logic to pick the right tool. **For every `scan_diff` call, pass `repo_path` set to the absolute path of the repo you're working in** (see Tool Parameters for why — it is required for the commit gate to work inside git worktrees).
 
 1. **User provided a file path as argument?**
    Yes: Call `mcp__scanner__scan_file` with that path.
@@ -56,10 +56,10 @@ Follow this logic to pick the right tool:
    Yes: Call `mcp__scanner__scan_code` with the code. Set `filename` if the language or origin is known.
 
 3. **User specified a ref (branch, tag, SHA) to diff against?**
-   Yes: Call `mcp__scanner__scan_diff` with `ref` set to that value.
+   Yes: Call `mcp__scanner__scan_diff` with `ref` set to that value (and `repo_path`).
 
 4. **Default (no arguments, or just `/security-scan`):**
-   - First: Call `mcp__scanner__scan_diff` with `staged=true`.
+   - First: Call `mcp__scanner__scan_diff` with `staged=true` and `repo_path`.
    - If result is "No changes to scan.": Call `mcp__scanner__scan_diff` with `staged=false` (unstaged changes).
    - If still no changes: Tell the user there are no changes to scan.
 

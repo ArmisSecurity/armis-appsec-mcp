@@ -60,8 +60,11 @@ def plugin_root(tmp_path, monkeypatch):
     """
     import server
 
-    monkeypatch.setattr(server, "_scan_pass_path", lambda: str(tmp_path / "armis-scan-pass"))
-    monkeypatch.setattr(server, "cleanup_legacy_scan_pass", lambda: None)
+    # Absorb the optional repo_path arg the production code now threads through.
+    monkeypatch.setattr(
+        server, "_scan_pass_path", lambda *a, **k: str(tmp_path / "armis-scan-pass")
+    )
+    monkeypatch.setattr(server, "cleanup_legacy_scan_pass", lambda *a, **k: None)
     return tmp_path
 
 
@@ -214,12 +217,16 @@ class TestApproveFindings:
         original_cwd = os.getcwd()
         try:
             os.chdir(str(tmp_path))
-            # Simulate a scan that found HIGH findings (deletes .scan-pass)
+            # Simulate a scan that found HIGH findings (deletes .scan-pass).
+            # Mirror production scan_diff: a staged scan records staged=True and
+            # the scanned hash, which approve_findings binds to.
             server._cache_scan(
                 "findings report",
                 _HIGH_FINDINGS,
                 "staged changes",
                 is_staged_scan=True,
+                scan_hash=staged_hash,
+                staged=True,
             )
             assert not (plugin_root / "armis-scan-pass").exists()
 
@@ -232,6 +239,37 @@ class TestApproveFindings:
         scan_pass = plugin_root / "armis-scan-pass"
         assert scan_pass.exists()
         assert scan_pass.read_text().strip() == staged_hash
+
+    def test_rejects_approval_when_index_drifted_since_scan(self, plugin_root, tmp_path):
+        """If the staged index changes after the HIGH/CRITICAL scan, approval
+        must refuse rather than write a pass for unscanned content (TOCTOU)."""
+        _init_git_repo(tmp_path)
+
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(str(tmp_path))
+            # Scan recorded the hash of the index *as it was then*.
+            server._cache_scan(
+                "findings report",
+                _HIGH_FINDINGS,
+                "staged changes",
+                is_staged_scan=True,
+                scan_hash="stale-scanned-hash-deadbeef",
+                staged=True,
+            )
+
+            # Developer stages MORE code after the scan -> live hash now differs.
+            (tmp_path / "sneaky.py").write_text("danger = eval(input())\n")
+            subprocess.run(["git", "add", "sneaky.py"], cwd=str(tmp_path), capture_output=True)
+
+            result = server.do_approve_findings(reason="looks fine to me")
+        finally:
+            os.chdir(original_cwd)
+
+        assert "ERROR" in result
+        assert "differ from the last scan" in result
+        # And crucially, no pass was written for the unscanned content.
+        assert not (plugin_root / "armis-scan-pass").exists()
 
     def test_without_prior_scan_fails(self):
         """do_approve_findings with no prior scan returns error."""
