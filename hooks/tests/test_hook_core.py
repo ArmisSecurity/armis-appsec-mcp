@@ -64,10 +64,57 @@ class TestIsShippingCommand:
             "nohup git push",  # nohup
             "\\git commit -m x",  # escaped binary (suppresses alias)
             "command gh pr create",  # wrapper before gh pr create
+            # gh global options before the subcommand (deep-review #5): gh got no
+            # _GH_GLOBAL_OPTS analogue when git did, so `gh --repo` slipped past.
+            "gh --repo o/r pr create",  # gh --repo global option
+            "gh -R o/r pr create",  # gh -R short form
+            "gh --repo=o/r pr create",  # gh --repo=value form
+            # Wrappers whose option takes a separate-token value, and `timeout`'s
+            # leading duration positional (deep-review #8): the old _CMD_WRAP only
+            # ate contiguous dash-tokens, so a separate value broke the chain.
+            "sudo -u root git commit -m x",  # sudo -u <user>
+            "nice -n 10 git commit -m x",  # nice -n <prio>
+            "xargs -n 1 git commit",  # xargs -n <max-args>
+            "timeout 5 git commit -m x",  # timeout <dur> (bare positional)
+            "timeout 5s git push",  # timeout <dur+unit>
+            'GIT_COMMITTER_NAME="John Doe" git commit -m x',  # quoted env value w/ space
+            # git/gh long global options whose VALUE is a separate token (PR #19
+            # review): the regex must consume both `--opt` and its argument or
+            # _GIT_PREFIX fails at the value and the subcommand bypasses the gate.
+            "git --git-dir /r/.git commit -m x",  # --git-dir <dir>
+            "git --work-tree /repo push",  # --work-tree <dir>
+            "git --git-dir /r/.git --work-tree /r push",  # two separate-token opts
+            # `env` with flags before git/gh (PR #19 review): _ENV_PREFIX used to
+            # match only a bare `env`, so `env -i`/`env -u FOO` bypassed the gate.
+            "env -i git commit -m x",  # env -i (clean environment)
+            "env -u FOO git push",  # env -u <name> (separate-token value)
+            "env -i -u FOO git commit -m x",  # multiple env flags
+            "env --ignore-environment git push",  # long env flag
+            "env -i gh pr create",  # env flag before gh pr create
+            "sudo env -i git commit -m x",  # wrapper + env flags chained
+            "env -i GIT_AUTHOR_DATE=x git commit -m x",  # env flag then assignment
         ],
     )
     def test_shipping_bypass_family_now_caught(self, cmd):
         assert hook_core._is_shipping_command(cmd)
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # gh global options must NOT make a non-shipping gh command match
+            # (the global-opts segment is shared with git, so guard against it
+            # swallowing the subcommand for a non-create gh invocation).
+            "gh --repo o/r issue list",
+            "gh --repo o/r pr view",
+            "gh repo view",
+            # `env` with flags must not make a non-git command match: the env-flag
+            # run is greedy, so guard it doesn't swallow a non-shipping binary.
+            "env -i ./configure",
+            "env -u FOO make build",
+        ],
+    )
+    def test_gh_global_opts_do_not_overmatch(self, cmd):
+        assert not hook_core._is_shipping_command(cmd)
 
     @pytest.mark.parametrize(
         "cmd",
@@ -140,6 +187,14 @@ class TestScanPassWriteForgery:
             "vim .git/armis-scan-pass",  # bare-arg editor (previously evaded)
             "python -c \"open('.git/armis-scan-pass','w').write('x')\"",  # python (evaded)
             "F=.git/armis-scan-pass; cat $F",  # assignment target (evaded)
+            # deep-review #3 REGRESSION: the older `[>|][^;&|]*name` pattern caught
+            # these, but the verb-enumeration rewrite dropped them. Restore them.
+            "echo h >| .git/armis-scan-pass",  # noclobber-override redirect
+            "echo h >|.git/armis-scan-pass",  # >| with no space
+            "echo h 1>| .git/armis-scan-pass",  # fd-prefixed clobber redirect
+            "echo x | sponge .git/armis-scan-pass",  # sponge (moreutils)
+            "gawk 'BEGIN{print}' .git/armis-scan-pass",  # gawk
+            "php -r x .git/armis-scan-pass",  # php interpreter
         ],
     )
     def test_forgery_vectors_denied(self, cmd):
@@ -180,6 +235,61 @@ class TestScanPassWriteForgery:
             assert "BLOCKED" not in result.system_message
         finally:
             os.chdir(old_cwd)
+
+
+class TestRegexComplexity:
+    """deep-review #4: the shipping/forgery grammar uses nested quantified
+    alternations. An earlier `_GIT_GLOBAL_OPTS` form (`-[A-Za-z]\\s+\\S+|…`)
+    backtracked catastrophically on `git ` + a long all-dash run (no subcommand),
+    and the forgery arm-3 (`[A-Za-z_]\\w*=…`, unanchored) was quadratic on a long
+    word-char token. Either could push `check_gate` past the PreToolUse hook's
+    10s timeout — and a timed-out gate fails open (unscanned commit ships). These
+    patterns run on EVERY shell command, so they MUST be linear. This test feeds
+    adversarial inputs and asserts each detector returns well within budget; it
+    is the guard that would have caught the original ReDoS.
+    """
+
+    # Generous ceiling: the real risk is multi-second (10s hook timeout). A
+    # correct (linear) matcher finishes a 20k-char adversarial input in single-
+    # digit milliseconds; 1s leaves huge headroom while still catching a
+    # super-linear regression long before it reaches the hook timeout.
+    _BUDGET_S = 1.0
+
+    @pytest.mark.parametrize(
+        "make_input",
+        [
+            lambda: "git " + "-x " * 4000,  # all-dash global-opt run (the original ReDoS)
+            lambda: "git " + "-a b " * 4000,  # flag + separate value run
+            lambda: "git " + "--opt " * 4000,  # long-opt run
+            lambda: "gh " + "-x " * 4000,  # gh now shares the global-opts segment
+            lambda: "sudo " * 8000,  # wrapper-keyword spam
+            lambda: "sudo " + "-u x " * 4000,  # wrapper + separate-value spam
+            lambda: "timeout " + "5 " * 4000,  # timeout duration spam
+            lambda: "env " + 'A="x y" ' * 4000,  # quoted env-assignment spam
+            lambda: "env " + "-u x " * 4000,  # env-flag + separate-value spam
+            lambda: "env " + "-i " * 8000,  # env-flag (no value) spam
+            lambda: "a" * 40000,  # long word-char token (forgery arm-3)
+            lambda: "tee " + "a" * 40000,  # write verb + long token (forgery arm-2)
+            lambda: "git " + "-x " * 4000 + "&& git commit -m x",  # opt-spam then real commit
+        ],
+    )
+    def test_detectors_are_linear_on_adversarial_input(self, make_input):
+        import time
+
+        cmd = make_input()
+        for detector in (
+            hook_core._is_scan_pass_write_bash,
+            hook_core._is_shipping_command,
+            hook_core._is_push_or_pr,
+            hook_core._has_all_flag,
+        ):
+            t0 = time.perf_counter()
+            detector(cmd)
+            elapsed = time.perf_counter() - t0
+            assert elapsed < self._BUDGET_S, (
+                f"{detector.__name__} took {elapsed:.2f}s on a "
+                f"{len(cmd)}-char adversarial input (possible ReDoS regression)"
+            )
 
 
 class TestIsScanPassFile:

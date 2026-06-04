@@ -41,9 +41,13 @@ def main():
         # write-guard path uses the wrapped {tool_name, tool_input} shape. Read
         # the command from either location so the gate fires on every shell
         # command regardless of which event invoked us. (The shell matcher in
-        # cursor.hooks.json is ".*" so this adapter sees ALL shell commands; if
-        # we gated on tool_name the forgery guard in check_gate would never run
-        # for a bare `echo h > .git/armis-scan-pass`.)
+        # cursor.hooks.json — a `contains`-semantics regex over the command
+        # string — is a deliberate SUPERSET of every command check_gate denies:
+        # `\bgit\b|\bgh\b|scan-pass`. Shipping commands always contain git/gh and
+        # forgery targets always contain "scan-pass", so this fires whenever the
+        # gate would deny while skipping ls/npm/cat/etc. If we instead gated on
+        # tool_name the forgery guard in check_gate would never run for a bare
+        # `echo h > .git/armis-scan-pass`.)
         cmd = hook_input.get("command", "")
         if not isinstance(cmd, str) or not cmd.strip():
             cmd = tool_input.get("command", "")

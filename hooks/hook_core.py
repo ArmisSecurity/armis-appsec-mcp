@@ -43,30 +43,59 @@ class GateResult(NamedTuple):
 #   _CMD_SEP      — command separators: start, &&, ||, ;, &, |, newline, CR,
 #                   or an opening paren (subshell / $( … ) command subst).
 #   _CMD_WRAP     — command wrappers that exec their argument as a new command:
-#                   sudo/command/exec/eval/builtin/nice/time/xargs/… git …
+#                   sudo/command/exec/eval/builtin/nice/time/timeout/xargs/…
+#                   git …  Each wrapper may carry options, including a
+#                   separate-token value (`sudo -u root git …`, `nice -n 10 …`)
+#                   and `timeout`'s leading duration positional (`timeout 5 …`,
+#                   `timeout 5s …`).
 #   _ENV_PREFIX   — env-assignment / `env` prefixes: FOO=bar git …, env git …
+#                   The value may be single/double quoted so a space inside it
+#                   (`GIT_COMMITTER_NAME="John Doe" git commit`) is consumed.
+#                   `env` may itself carry flags, including a separate-token
+#                   value (`env -i git …`, `env -u FOO git …`), matched with the
+#                   same non-dash-value rule as _CMD_WRAP so the run stays linear.
 #   _PATH_PREFIX  — a path prefix on the binary: /usr/bin/git, ./git
-#   _GIT_GLOBAL_OPTS — git global options before the subcommand: -C <dir>,
-#                   -c k=v, --no-pager, --git-dir=…  (a short option may take a
-#                   separate-token argument, e.g. `-C /repo`).
+#   _GIT_GLOBAL_OPTS — git/gh global options before the subcommand: -C <dir>,
+#                   -c k=v, --no-pager, --git-dir=…, gh --repo <slug>.  A flag
+#                   may take a separate-token value, but that value is matched as
+#                   NON-dash (`[^-\s]\S*`): this removes the parse ambiguity that
+#                   let an all-dash run (`git -x -x … -x`) be partitioned in
+#                   exponentially many ways (catastrophic backtracking / ReDoS —
+#                   `check_gate` could blow past the hook's 10s timeout, and a
+#                   timed-out gate fails open → unscanned commit). With non-dash
+#                   values each token has exactly one parse, so matching is
+#                   linear while real `-C /repo` / `--git-dir /d` still match.
 # A leading `\` (escaped binary, suppresses alias expansion) and an opening
 # quote (`eval 'git commit'`) are also tolerated right before the binary name.
 # NOTE: this is a regex over shell text, which is fundamentally leaky — wrapper
 # enumeration is itself a blocklist. The durable fix is a tokenizing parser or
 # an unforgeable scan-pass token (HMAC); see the deferred bug-hunt backlog.
 _CMD_SEP = r"(?:^|&&|\|\||[;&|\n\r(])"
+# armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
 _CMD_WRAP = (
-    r"(?:(?:sudo|command|exec|eval|builtin|nice|time|xargs|stdbuf|nohup|setsid|doas)"
-    r"\s+(?:-\S+\s+)*)*"
+    # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
+    r"(?:(?:sudo|command|exec|eval|builtin|nice|time|timeout|xargs|stdbuf|nohup|setsid|doas)"
+    r"\s+(?:[0-9]+[smhd]?\s+)?(?:-\S+\s+(?:[^-\s]\S*\s+)?)*)*"
 )
-_ENV_PREFIX = r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|env)\s+)*"
+# armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
+_ENV_PREFIX = (
+    # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
+    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S*)"
+    r"|env(?:\s+-\S+(?:\s+[^-\s]\S*)?)*)\s+)*"
+)
 _PATH_PREFIX = r"(?:\S*/)?"
-_GIT_GLOBAL_OPTS = r"(?:(?:-[A-Za-z]\s+\S+|-[A-Za-z]\S*|--\S+)\s+)*"
+# armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
+_GIT_GLOBAL_OPTS = (
+    # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
+    r"(?:(?:--\S+\s+[^-\s]\S*|--\S+|-[A-Za-z]\s+[^-\s]\S*|-[A-Za-z]\S*)\s+)*"
+)
 
 _GIT_PREFIX = (
     rf"{_CMD_SEP}\s*{_CMD_WRAP}{_ENV_PREFIX}{_PATH_PREFIX}['\"]?\\?git\s+{_GIT_GLOBAL_OPTS}"
 )
-_GH_PREFIX = rf"{_CMD_SEP}\s*{_CMD_WRAP}{_ENV_PREFIX}{_PATH_PREFIX}['\"]?\\?gh\s+"
+# gh gets the same global-options segment as git, so `gh --repo o/r pr create`
+# (and `gh -R o/r pr create`) is gated, not just a bare `gh pr create`.
+_GH_PREFIX = rf"{_CMD_SEP}\s*{_CMD_WRAP}{_ENV_PREFIX}{_PATH_PREFIX}['\"]?\\?gh\s+{_GIT_GLOBAL_OPTS}"
 
 # `commit(?![-\w])` / `push(?![-\w])` exclude hyphenated plumbing subcommands
 # (git commit-tree, commit-graph, push-cert) that are NOT shipping commands.
@@ -93,24 +122,42 @@ _SCAN_PASS_NAMES = r"(?:\.scan-pass|armis-scan-pass)"  # noqa: S105 — filename
 # `git commit -m "fix armis-scan-pass"`, plus grep/cat/rm/pytest — this repo's
 # own history references it), and surfaced the wrong "forgery" message because
 # check_gate runs this check first. Write contexts: a redirect target, a
-# file-writing command (tee/cp/mv/dd/sed -i/install/ln/truncate/editors/
+# file-writing command (tee/cp/mv/dd/sed -i/install/ln/truncate/sponge/editors/
 # interpreters), or assigning the path to a shell variable. This is a blocklist
 # of write verbs (inherently leaky); the hash match plus protect_scan_pass.py's
 # Write/Edit guard backstop forgery, and an unforgeable HMAC token is the
 # durable follow-up.
+#
+# Arm 3 (variable assignment) is a SAME-COMMAND-LINE tripwire only: it catches
+# `F=<scan-pass>; … > $F` when assignment and use share one command string, but
+# a bare `> $F` whose assignment happened in a *separate* tool call slips through
+# (the gate sees one command at a time and the name isn't visible). That residual
+# vector is intentionally out of scope here — it is backstopped by the hash match
+# and protect_scan_pass.py, and closed for good by the deferred HMAC token. Don't
+# mistake arm 3 for a complete defense against variable laundering.
+# armis:ignore cwe:400 reason: provably linear (bounded alternation); see TestRegexComplexity
 _SP_WRITE_VERBS = (
-    r"(?:tee|cp|mv|dd|install|ln|truncate|sed|ex|vi|vim|nano|emacs"
-    r"|python[0-9.]*|perl|ruby|node|awk)"
+    # armis:ignore cwe:400 reason: provably linear (bounded alternation); see TestRegexComplexity
+    r"(?:tee|cp|mv|dd|install|ln|truncate|sed|ex|vi|vim|nano|emacs|sponge"
+    r"|python[0-9.]*|perl|ruby|node|awk|gawk|mawk|php)"
 )
 # The name as a bounded token (path component, quoted arg, or assignment value).
 _SP_TOKEN = rf"(?:^|[\s/'\"=(]){_SCAN_PASS_NAMES}\b"
+# armis:ignore cwe:400 reason: provably linear (anchored); see TestRegexComplexity
 _SCAN_PASS_WRITE_PATTERN = re.compile(
-    # 1. redirect (truncate/append) targeting the file
-    rf">>?\s*(?:[^\s;&|>]*?/)?{_SCAN_PASS_NAMES}\b"
+    # 1. redirect (truncate/append) targeting the file. `\d*` allows an fd prefix
+    #    (`1>`), `\|?` allows bash's noclobber-override `>|` (and `1>|`) — both
+    #    were missed by the older `>>?` form and let `echo h >| <pass>` forge.
+    # armis:ignore cwe:400 reason: provably linear (anchored); see TestRegexComplexity
+    rf"\d*>>?\|?\s*(?:[^\s;&|>]*?/)?{_SCAN_PASS_NAMES}\b"
     # 2. a write-capable command naming the file in its arguments
     rf"|\b{_SP_WRITE_VERBS}\b[^\n;&|]*{_SP_TOKEN}"
-    # 3. assigning the file's path to a shell variable (laundering setup)
-    rf"|[A-Za-z_]\w*=(?:[^\s;&|]*?/)?{_SCAN_PASS_NAMES}\b"
+    # 3. assigning the file's path to a shell variable (laundering setup).
+    #    Anchor the assignment start (`(?:^|[\s;&|(])`) so `\w*` cannot begin at
+    #    every interior word-char — an unanchored `[A-Za-z_]\w*=` backtracks
+    #    quadratically on a long word-char token (a benign 60K-char arg blew the
+    #    hook's 10s timeout); anchoring keeps it linear with identical matches.
+    rf"|(?:^|[\s;&|(])[A-Za-z_]\w*=(?:[^\s;&|]*?/)?{_SCAN_PASS_NAMES}\b"
 )
 
 

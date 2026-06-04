@@ -63,7 +63,7 @@ This is the trickiest cross-file interaction. The commit gate works like a hands
 
 **Forgery protection:**
 - `hooks/protect_scan_pass.py` denies any `Write`/`Edit` whose basename is `armis-scan-pass` (or the legacy `.scan-pass`) — see `hook_core.is_scan_pass_file`.
-- `hooks/pre_commit_scan.py` denies any Bash command matching `_SCAN_PASS_WRITE_PATTERN` (redirects, `tee`, `cp`, `mv` targeting `armis-scan-pass` / `.scan-pass`).
+- `hooks/pre_commit_scan.py` denies any Bash command matching `_SCAN_PASS_WRITE_PATTERN` — a *write context* targeting `armis-scan-pass` / `.scan-pass`: a redirect (`>`, `>>`, `>|`, fd-prefixed), a write-capable command naming the file (`tee`/`cp`/`mv`/`dd`/`sed -i`/`install`/`ln`/`truncate`/`sponge`/editors/interpreters like `python`/`perl`/`awk`/`gawk`/`php`), or assigning the path to a shell variable. It deliberately does **not** match mere mentions (commit messages, `grep`/`cat`/`rm`/`pytest`). The verb list is a blocklist (inherently leaky) — the hash match and `protect_scan_pass.py`'s Write/Edit guard are the backstops, and an unforgeable HMAC token is the durable follow-up.
 - The scan-pass path is computed by `git` itself (`git rev-parse --absolute-git-dir`), not from an env var, so there is no externally-controlled path to traverse (the old `CLAUDE_PLUGIN_ROOT`-based resolution and its CWE-73 mitigation are gone).
 
 **Reader/writer must agree (the worktree bug, part 1 — *same resolver*):** the gate reader (`hook_core`) and the scanner writer (`server`, `git-hooks`) **both** call `hash_utils.resolve_scan_pass_path()`. They previously used two private `_find_git_root` walkers that disagreed on a worktree's `.git` *file* (`os.path.isdir` vs `os.path.exists`), so the gate denied forever in every Conductor workspace. Never reintroduce a second resolver.
@@ -121,7 +121,7 @@ When you edit either hook, preserve the outer `try: ... except Exception: print(
 
 - `_validate_file_path` enforces an **allowlist** ($HOME, `/tmp`, `/private/tmp`, system temp) and a **blocklist** (`/etc/`, `/proc/`, `/sys/`, `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gcloud`). Both apply — allowlist first, then defense-in-depth blocklist.
 - `_VALID_GIT_REF` rejects refs with shell-unsafe characters or leading `-`.
-- `_MAX_CODE_CHARS = 90_000` — code/diff inputs are **silently** truncated past this (a warning is logged). Keep this in mind when writing tests that assemble large inputs.
+- `_MAX_CODE_CHARS = 90_000` — `scan_code`/`scan_file` inputs are **silently** truncated past this (a warning is logged). For `scan_diff` (the shipping path), `run_git_diff` returns `(diff_text, truncated)`; a **truncated** staged/ref diff is **not** shipping-eligible — `scan_diff` writes no scan-pass and surfaces a "too large to gate — split your commit" warning (the scanner only saw the first 90K but the staged hash covers the full diff, so a vuln past the cut would otherwise ship under a clean pass). Keep this in mind when writing tests that assemble large inputs.
 - `_MAX_FILE_BYTES = 10 MB`, binary-detection sniffs the first 8 KiB for null bytes.
 
 ## Ruff and mypy quirks
