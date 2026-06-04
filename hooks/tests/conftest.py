@@ -37,8 +37,9 @@ def isolated_server_scan_pass(tmp_path, monkeypatch):
     import server
 
     sp = tmp_path / "armis-scan-pass"
-    monkeypatch.setattr(server, "_scan_pass_path", lambda: str(sp))
-    monkeypatch.setattr(server, "cleanup_legacy_scan_pass", lambda: None)
+    # Absorb the optional repo_path arg the production code now threads through.
+    monkeypatch.setattr(server, "_scan_pass_path", lambda *a, **k: str(sp))
+    monkeypatch.setattr(server, "cleanup_legacy_scan_pass", lambda *a, **k: None)
     return sp
 
 

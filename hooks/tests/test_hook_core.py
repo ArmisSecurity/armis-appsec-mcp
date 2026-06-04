@@ -149,17 +149,46 @@ class TestCheckGate:
 
 
 class TestBuildSystemMessage:
+    """build_system_message weaves the hook's work-tree root into the
+    recommended scan_diff call (repo_path=...), so the MCP server scans — and
+    writes the scan-pass into — the same repo the commit happens in, even when
+    the long-lived server is pinned to a sibling checkout. Passing repo_path
+    explicitly here keeps the assertions independent of the test's real CWD."""
+
     def test_commit_gets_staged(self):
-        msg = hook_core.build_system_message("git commit -m 'x'")
-        assert "scan_diff(staged=True)" in msg
+        msg = hook_core.build_system_message("git commit -m 'x'", repo_path="/wt")
+        assert "scan_diff(staged=True, repo_path='/wt')" in msg
 
     def test_commit_a_gets_unstaged(self):
-        msg = hook_core.build_system_message("git commit -a -m 'x'")
-        assert "scan_diff()" in msg
+        msg = hook_core.build_system_message("git commit -a -m 'x'", repo_path="/wt")
+        assert "scan_diff(repo_path='/wt')" in msg
 
     def test_push_gets_ref(self):
-        msg = hook_core.build_system_message("git push")
-        assert "scan_diff(ref='origin/HEAD')" in msg
+        msg = hook_core.build_system_message("git push", repo_path="/wt")
+        assert "scan_diff(ref='origin/HEAD', repo_path='/wt')" in msg
+
+    def test_no_repo_path_omits_arg(self):
+        """Outside a git repo (repo_path resolves to None), fall back to the
+        bare call — no repo_path argument to inject."""
+        msg = hook_core.build_system_message("git commit -m 'x'", repo_path="")
+        assert "scan_diff(staged=True)" in msg
+        assert "repo_path" not in msg
+
+    def test_default_resolves_worktree_root(self, tmp_path, monkeypatch):
+        """With no explicit repo_path, it resolves the hook's CWD work-tree
+        root and injects it — this is the production path."""
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
+        monkeypatch.chdir(tmp_path)
+        msg = hook_core.build_system_message("git commit -m 'x'")
+        # git's --show-toplevel is symlink-resolved; compare against the same.
+        expected = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert f"repo_path='{expected}'" in msg
 
 
 class TestCrossAdapterInterop:

@@ -7,7 +7,7 @@ when connected to the `armis-scanner` MCP server.
 
 Before running `git commit`, `git push`, or creating a pull request:
 
-1. Call `scan_diff` with `staged=true` to scan staged changes
+1. Call `scan_diff` with `staged=true` **and `repo_path` set to your repo's absolute path** to scan staged changes. Always pass `repo_path`: the MCP server is a long-lived process whose own working directory may be a different checkout than yours (in a git worktree it is often the main repo), so without `repo_path` the scan and its `.scan-pass` land in the wrong git dir and the commit gate never sees them.
 2. If HIGH or CRITICAL findings are reported:
    - Attempt to fix them (move secrets to env vars, use parameterized queries, etc.)
    - Re-stage fixes and re-scan
@@ -21,7 +21,7 @@ When the user asks to "scan", "security check", or "check for vulnerabilities":
 
 | Scenario | Tool | Parameters |
 |----------|------|------------|
-| Staged/unstaged changes | `scan_diff` | `staged=true` or `ref=main` |
+| Staged/unstaged changes | `scan_diff` | `staged=true` or `ref=main`, plus `repo_path=/absolute/repo/path` |
 | A specific file | `scan_file` | `file_path=/absolute/path` |
 | Pasted code snippet | `scan_code` | `code="..."`, optional `filename` |
 | Check scanner config | `debug_config` | (none) |

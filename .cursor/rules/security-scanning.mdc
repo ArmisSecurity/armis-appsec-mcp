@@ -4,8 +4,12 @@ alwaysApply: true
 ---
 
 Before running git commit, git push, or creating a PR, call the armis-scanner
-MCP tool `scan_diff` with `staged=true`. If HIGH/CRITICAL findings exist,
-fix them or ask the user for approval before proceeding.
+MCP tool `scan_diff` with `staged=true` and `repo_path` set to your repo's
+absolute path. Always pass `repo_path`: the MCP server's own working directory
+may be a different checkout than yours (in a git worktree it is often the main
+repo), so without it the scan and its `.scan-pass` land in the wrong git dir and
+the commit gate never sees them. If HIGH/CRITICAL findings exist, fix them or
+ask the user for approval before proceeding.
 
 To suppress a reviewed false positive, add an `armis:ignore` comment on the
 finding's line (optionally `armis:ignore cwe:798`) or list it in `.armisignore`
