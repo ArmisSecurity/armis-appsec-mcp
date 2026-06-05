@@ -195,7 +195,7 @@ class TestRunGitDiff:
                 server.run_git_diff()
 
     def test_large_diff_is_flagged_truncated(self, tmp_path):
-        """Bug-hunt #6: a diff over _MAX_CODE_CHARS is truncated AND reports
+        """A diff over _MAX_CODE_CHARS is truncated AND reports
         truncated=True so the caller refuses to write a gating scan-pass."""
         subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
         subprocess.run(

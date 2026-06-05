@@ -87,7 +87,7 @@ def main():
             sys.exit(0)
 
         # Run the shared gate on EVERY shell command. A substring prefilter
-        # used to short-circuit here (bug-hunt #3), but its single-space
+        # used to short-circuit here, but its single-space
         # literals ("git commit") missed "git  commit" / "git\tcommit", which
         # the shell collapses — so unscanned commits slipped through. check_gate
         # uses the canonical \s+ regexes and only runs git for real shipping

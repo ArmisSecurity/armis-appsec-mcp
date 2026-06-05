@@ -74,7 +74,7 @@ def run_cursor_hook_raw(tmp_path):
 
 
 class TestBeforeShellExecutionFlatPayload:
-    """Bug-hunt #4: Cursor's beforeShellExecution payload is FLAT
+    """Cursor's beforeShellExecution payload is FLAT
     ({command, cwd, sandbox, hook_event_name}), with no tool_name/tool_input.
     The adapter previously only ran the gate when tool_name was a shell name,
     so the real payload fell through to ALLOW for every shell command."""

@@ -182,14 +182,14 @@ class TestWorktree:
 
 
 class TestComputeStagedHashNonUtf8:
-    """Regression for bug-hunt finding #1: a staged file with non-UTF-8 bytes
+    """Regression: a staged file with non-UTF-8 bytes
     used to make compute_staged_hash() (text=True + .encode()) raise
     UnicodeDecodeError, which escaped the gate reader's `except OSError` and
     reached the hooks' outer fail-open catch-all → commit ALLOWED despite a
     stale/forged/absent pass. The hash now covers raw bytes and fails *closed*.
     """
 
-    # The exact payload from .context/bughunt/repro/bughunt_utf8.sh.
+    # A staged diff containing invalid UTF-8 bytes (\xe9\xff).
     _BAD_BYTES = b"first line\nx\xe9\xff bytes here\nlast\n"
 
     def test_hash_non_utf8_staged_diff_does_not_raise(self, git_repo):

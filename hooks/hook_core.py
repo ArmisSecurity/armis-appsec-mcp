@@ -38,7 +38,7 @@ class GateResult(NamedTuple):
 #
 # A shipping subcommand (commit / push / pr create) can be preceded by shell
 # noise that the old anchor set ((?:^|&&|\|\||;)) ignored, so it shipped
-# unscanned code. Each fragment below closes one bypass class (bug-hunt #2):
+# unscanned code. Each fragment below closes one bypass class:
 #
 #   _CMD_SEP      — command separators: start, &&, ||, ;, &, |, newline, CR,
 #                   or an opening paren (subshell / $( … ) command subst).
@@ -69,7 +69,7 @@ class GateResult(NamedTuple):
 # quote (`eval 'git commit'`) are also tolerated right before the binary name.
 # NOTE: this is a regex over shell text, which is fundamentally leaky — wrapper
 # enumeration is itself a blocklist. The durable fix is a tokenizing parser or
-# an unforgeable scan-pass token (HMAC); see the deferred bug-hunt backlog.
+# an unforgeable scan-pass token (HMAC), tracked as a deferred follow-up.
 _CMD_SEP = r"(?:^|&&|\|\||[;&|\n\r(])"
 # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
 _CMD_WRAP = (
@@ -114,7 +114,7 @@ _COMMIT_ALL_FLAG = re.compile(rf"{_GIT_PREFIX}commit(?![-\w]).*(?:\s-a\b|\s--all
 
 # Matches both the current "armis-scan-pass" and the legacy ".scan-pass".
 _SCAN_PASS_NAMES = r"(?:\.scan-pass|armis-scan-pass)"  # noqa: S105 — filenames, not a secret
-# Anti-forgery (bug-hunt #5): the scan-pass content is just
+# Anti-forgery: the scan-pass content is just
 # SHA-256(git diff --cached), which an agent can compute with read-only
 # commands the gate allows — so the file must be unforgeable via shell. We deny
 # WRITE *contexts* that target the basename, not any mention of it. Denying mere

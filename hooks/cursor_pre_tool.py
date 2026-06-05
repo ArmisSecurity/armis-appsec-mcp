@@ -37,7 +37,7 @@ def main():
         tool_name = hook_input.get("tool_name", "")
 
         # Cursor's beforeShellExecution payload is FLAT — {command, cwd, ...}
-        # with no tool_name/tool_input wrapper (bug-hunt #4). The preToolUse
+        # with no tool_name/tool_input wrapper. The preToolUse
         # write-guard path uses the wrapped {tool_name, tool_input} shape. Read
         # the command from either location so the gate fires on every shell
         # command regardless of which event invoked us. (The shell matcher in

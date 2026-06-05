@@ -97,7 +97,7 @@ class TestShippingCommandsDeny:
 
 
 class TestWhitespaceVariantBypass:
-    """Bug-hunt #3: the old _FAST_SHIP_KEYWORDS substring prefilter used
+    """The old _FAST_SHIP_KEYWORDS substring prefilter used
     single-space literals ("git commit"), so whitespace variants the shell
     collapses to a real commit ("git  commit", "git\\tcommit") slipped past the
     gate entirely. The prefilter is gone; check_gate's \\s+ regex catches them."""

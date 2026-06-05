@@ -38,7 +38,7 @@ class TestIsShippingCommand:
     @pytest.mark.parametrize(
         "cmd",
         [
-            # Bug-hunt #2: bypass family that the old anchor set let through.
+            # Bypass family that the old anchor set let through.
             "echo hi\ngit commit -m x",  # newline-separated 2nd line
             "sleep 0 & git commit -m x",  # single-& separator
             "true | git commit -m x",  # pipe separator
@@ -155,14 +155,14 @@ class TestHasAllFlag:
         assert not hook_core._has_all_flag("git commit -m 'msg'")
 
     def test_all_flag_with_global_opts(self):
-        # Bug-hunt #2: -a/--all must still be detected behind git global options
+        # -a/--all must still be detected behind git global options
         # so build_system_message recommends scan_diff() (unstaged) correctly.
         assert hook_core._has_all_flag("git -C /repo commit -a -m 'msg'")
         assert hook_core._has_all_flag("git -c k=v commit --all")
 
 
 class TestScanPassWriteForgery:
-    """Bug-hunt #5: the scan-pass must be unforgeable via shell. The pattern
+    """The scan-pass must be unforgeable via shell. The pattern
     denies WRITE *contexts* (redirect target, write-capable command naming the
     file, or assigning its path to a variable) — NOT mere mentions, which would
     block legitimate commands that only name the file (commit messages,

@@ -292,7 +292,7 @@ def run_git_diff(repo_path: str = "", ref: str = "", staged: bool = False) -> tu
     clipped. Callers that gate shipping (scan_diff) MUST NOT write a scan-pass
     when truncated — the scanner only saw the first ``_MAX_CODE_CHARS`` but the
     staged hash covers the full diff, so a vuln past the cut would ship under a
-    "clean" pass (bug-hunt #6).
+    "clean" pass.
     """
     if ref and not _VALID_GIT_REF.match(ref):
         raise ToolError(
@@ -577,7 +577,7 @@ async def scan_diff(
         await ctx.info(f"Scan complete: {len(active)} finding(s) in {elapsed:.1f}s")
 
     # A truncated diff was scanned only up to _MAX_CODE_CHARS, so it cannot
-    # gate a commit — tell the user to split it (bug-hunt #6). No scan-pass was
+    # gate a commit — tell the user to split it. No scan-pass was
     # written above because is_shipping_scan was forced False on truncation.
     if truncated and (bool(ref) or staged):
         warning = (
@@ -667,7 +667,7 @@ def do_approve_findings(reason: str) -> str:
     # the server's CWD is a sibling of the worktree being committed).
     repo_path = _last_scan.get("repo_path") or None
 
-    # Approve ONLY what was actually scanned (bug-hunt #7 / PPSC-913). Preferring
+    # Approve ONLY what was actually scanned (PPSC-913). Preferring
     # a fresh compute_staged_hash() would let a post-scan change to the staged
     # index slip through: approve_findings would write a pass for unscanned
     # content and the commit gate (comparing that same new hash) would allow it.

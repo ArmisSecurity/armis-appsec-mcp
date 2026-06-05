@@ -315,7 +315,7 @@ class TestApproveFindings:
 
 
 class TestApproveFindingsMatchesScannedContent:
-    """Bug-hunt #7: approve_findings must bless ONLY what was scanned, not
+    """approve_findings must bless ONLY what was scanned, not
     whatever happens to be staged at approval time."""
 
     def test_staged_index_changed_since_scan_is_rejected(self, isolated_server_scan_pass, tmp_path):
