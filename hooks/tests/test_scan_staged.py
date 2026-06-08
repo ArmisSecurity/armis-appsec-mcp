@@ -41,9 +41,9 @@ def _init_git_repo(path, staged_content="print('hello')\n"):
         ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
         cwd=str(path),
         capture_output=True,
-        text=True,
     )
-    return hashlib.sha256(result.stdout.encode()).hexdigest()
+    # Hash raw bytes — must match hash_utils.compute_staged_hash and scan-staged.py.
+    return hashlib.sha256(result.stdout).hexdigest()
 
 
 def _run_scan_staged(tmp_path, mock_response=None, mock_auth_error=None, env_override=None):

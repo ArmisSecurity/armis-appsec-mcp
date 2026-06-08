@@ -22,9 +22,6 @@ _WRITE_TOOLS = {"write_file", "replace", "create_file"}
 
 _COMMAND_FIELDS = ("command", "cmd")
 
-# "scan-pass" (no leading dot) matches both ".scan-pass" (legacy) and
-# "armis-scan-pass" (current) as substrings.
-_FAST_SHIP_KEYWORDS = ("git commit", "git push", "gh pr create", "scan-pass")
 _SCAN_PASS_NAMES = ("armis-scan-pass", ".scan-pass")  # noqa: S105
 
 _DEBUG = bool(os.environ.get("APPSEC_DEBUG"))
@@ -82,7 +79,6 @@ def main():
             print(_ALLOW)
             sys.exit(0)
 
-        # Fast path: extract command and skip non-shipping commands immediately
         cmd = _extract_command(tool_input)
         _debug(f"shell-tool check: tool={tool_name}, cmd={cmd!r:.200}")
         if not cmd:
@@ -90,12 +86,12 @@ def main():
             print(_ALLOW)
             sys.exit(0)
 
-        if not any(kw in cmd for kw in _FAST_SHIP_KEYWORDS):
-            _debug("fast-path: not a shipping command, allowing")
-            print(_ALLOW)
-            sys.exit(0)
-
-        # Slow path: shipping command detected, import gate logic (runs git subprocess)
+        # Run the shared gate on EVERY shell command. A substring prefilter
+        # used to short-circuit here, but its single-space
+        # literals ("git commit") missed "git  commit" / "git\tcommit", which
+        # the shell collapses — so unscanned commits slipped through. check_gate
+        # uses the canonical \s+ regexes and only runs git for real shipping
+        # commands, so the prefilter saved nothing but an import.
         from hook_core import check_gate  # noqa: E402
 
         result = check_gate(cmd)

@@ -173,21 +173,24 @@ class TestScanPassForgeryPrevention:
 # get_debug_config
 # ---------------------------------------------------------------------------
 class TestGetDebugConfig:
-    def test_masks_long_client_id(self, monkeypatch):
+    def test_long_client_id_reports_presence_only(self, monkeypatch):
+        # CWE-522: never echo any bytes of the client ID, only its presence.
         monkeypatch.setenv("ARMIS_CLIENT_ID", "test1234")
         monkeypatch.setenv("ARMIS_CLIENT_SECRET", "secret-value")
         with patch("server.get_auth_status", return_value="valid"):
             result = server.get_debug_config()
-        assert "test***" in result
+        assert "Client ID: set" in result
+        assert "test" not in result
         assert "test1234" not in result
         assert "Client Secret: set" in result
 
-    def test_shows_short_client_id_unmasked(self, monkeypatch):
+    def test_short_client_id_reports_presence_only(self, monkeypatch):
         monkeypatch.setenv("ARMIS_CLIENT_ID", "ab")
         monkeypatch.delenv("ARMIS_CLIENT_SECRET", raising=False)
         with patch("server.get_auth_status", return_value="not initialized"):
             result = server.get_debug_config()
-        assert "Client ID: ab" in result
+        assert "Client ID: set" in result
+        assert "Client ID: ab" not in result
         assert "Client Secret: not set" in result
 
     def test_missing_credentials(self, monkeypatch):
@@ -219,7 +222,8 @@ class TestApproveFindings:
             os.chdir(str(tmp_path))
             # Simulate a scan that found HIGH findings (deletes .scan-pass).
             # Mirror production scan_diff: a staged scan records staged=True and
-            # the scanned hash, which approve_findings binds to.
+            # the scanned hash, which approve_findings binds to (and verifies the
+            # index hasn't drifted since).
             server._cache_scan(
                 "findings report",
                 _HIGH_FINDINGS,
@@ -230,7 +234,7 @@ class TestApproveFindings:
             )
             assert not (plugin_root / "armis-scan-pass").exists()
 
-            # Now approve
+            # Now approve — staged content still matches what was scanned.
             result = server.do_approve_findings(reason="false positives on deleted code")
         finally:
             os.chdir(original_cwd)
@@ -310,6 +314,74 @@ class TestApproveFindings:
         assert "not a shipping scan" in result
 
 
+class TestApproveFindingsMatchesScannedContent:
+    """approve_findings must bless ONLY what was scanned, not
+    whatever happens to be staged at approval time."""
+
+    def test_staged_index_changed_since_scan_is_rejected(self, isolated_server_scan_pass, tmp_path):
+        """If the staged content changed after the scan, approval must error and
+        write no scan-pass (defeats the staleness laundering vector)."""
+        # A staged scan found HIGH findings against hash "scanned-aaa".
+        server._last_scan.update(
+            {
+                "findings": _HIGH_FINDINGS,
+                "suppressed": [],
+                "is_staged_scan": True,
+                "scan_hash": "scanned-aaa",
+                "staged": True,
+                "repo_path": "",
+            }
+        )
+        # But the live staged index now hashes to something different.
+        with patch("server.compute_staged_hash", return_value="different-bbb"):
+            result = server.do_approve_findings(reason="user accepts risk")
+
+        assert "ERROR" in result
+        assert "differ from the last scan" in result
+        assert not isolated_server_scan_pass.exists()
+
+    def test_staged_approval_writes_scanned_hash_not_live_hash(self, isolated_server_scan_pass):
+        """When staged content still matches, the scan-pass holds the SCANNED
+        hash (not a freshly recomputed one)."""
+        server._last_scan.update(
+            {
+                "findings": _HIGH_FINDINGS,
+                "suppressed": [],
+                "is_staged_scan": True,
+                "scan_hash": "scanned-aaa",
+                "staged": True,
+                "repo_path": "",
+            }
+        )
+        with patch("server.compute_staged_hash", return_value="scanned-aaa"):
+            result = server.do_approve_findings(reason="false positive")
+
+        assert "Approved" in result
+        assert isolated_server_scan_pass.read_text() == "scanned-aaa"
+
+    def test_ref_scan_approval_writes_ref_hash_only(self, isolated_server_scan_pass):
+        """A ref-based scan's approval writes the ref diff hash (sha256(diff_text)),
+        NOT a live staged hash — so it can't satisfy the staged commit gate even
+        if unrelated code is staged."""
+        server._last_scan.update(
+            {
+                "findings": _HIGH_FINDINGS,
+                "suppressed": [],
+                "is_staged_scan": True,  # shipping-eligible
+                "scan_hash": "ref-diff-hash",
+                "staged": False,  # ref scan, not staged
+                "repo_path": "",
+            }
+        )
+        # Even though unrelated code is staged (compute_staged_hash would return
+        # something), the ref approval must ignore it and write the ref hash.
+        with patch("server.compute_staged_hash", return_value="unrelated-staged"):
+            result = server.do_approve_findings(reason="ref findings accepted")
+
+        assert "Approved" in result
+        assert isolated_server_scan_pass.read_text() == "ref-diff-hash"
+
+
 class TestReadAndValidateFileIntegration:
     def test_reads_real_file(self, tmp_path):
         f = tmp_path / "test.py"
@@ -324,6 +396,7 @@ class TestRunGitDiffIntegration:
     def test_returns_diff_from_real_repo(self, tmp_path):
         _init_git_repo(tmp_path)
         # Run with staged=True to get the staged diff
-        diff = server.run_git_diff(repo_path=str(tmp_path), staged=True)
+        diff, truncated = server.run_git_diff(repo_path=str(tmp_path), staged=True)
         assert "new.py" in diff
         assert "print('hello')" in diff
+        assert truncated is False

@@ -113,25 +113,36 @@ def cleanup_legacy_scan_pass(repo_path: str | None = None) -> None:
 
 
 def compute_staged_hash(repo_path: str | None = None) -> str:
-    """Compute SHA-256 hash of the staged diff.
+    """Compute SHA-256 hash of the current staged diff.
 
     ``repo_path`` selects the repository (``None`` → process CWD). The MCP
     server passes the scanned repo so its hash matches what the commit-gate
     hook — running in that same repo's CWD — recomputes; otherwise a server
     pinned to a sibling checkout would hash the wrong (often empty) index.
+
+    Hashes the *raw bytes* of ``git diff --cached`` (no ``text=True``). A staged
+    file with non-UTF-8 bytes (Shift-JIS/Latin-1 source, force-added binary)
+    would make text-mode decoding raise ``UnicodeDecodeError`` (a ``ValueError``
+    subclass) — which would otherwise escape the gate and reach the hooks'
+    outer fail-open catch-all, allowing the commit despite a stale/forged/absent
+    pass. Hashing bytes sidesteps decoding entirely and is byte-exact. The
+    ``ValueError`` in the except is belt-and-suspenders so any residual decode
+    error fails *closed* (returns "" → the reader denies).
+
+    ``git-hooks/scan-staged.py`` runs the identical git command and hashes the
+    same raw bytes, so the two writers and the gate reader all agree.
     """
     try:
         result = subprocess.run(
             ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
             cwd=repo_path,
             capture_output=True,
-            text=True,
             timeout=10,
         )
         if result.returncode != 0 or not result.stdout:
             return ""
         if len(result.stdout) > _MAX_DIFF_BYTES:
             return ""  # Too large to hash safely
-        return hashlib.sha256(result.stdout.encode()).hexdigest()
-    except (subprocess.TimeoutExpired, OSError):
+        return hashlib.sha256(result.stdout).hexdigest()
+    except (subprocess.TimeoutExpired, OSError, ValueError):
         return ""

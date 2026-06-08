@@ -4,7 +4,7 @@
     "beforeShellExecution": [
       {
         "command": "python3 /absolute/path/to/armis-appsec-mcp/hooks/cursor_pre_tool.py",
-        "matcher": "git\\s+(commit|push)|gh\\s+pr\\s+create",
+        "matcher": "\\bgit\\b|\\bgh\\b|scan-pass",
         "timeout": 10
       }
     ],

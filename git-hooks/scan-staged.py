@@ -44,14 +44,18 @@ def main() -> None:
     result = subprocess.run(
         ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
         capture_output=True,
-        text=True,
         timeout=10,
     )
     if not result.stdout.strip():
         print("appsec: no staged changes to scan", file=sys.stderr)
         sys.exit(0)
 
-    response = call_appsec_api(result.stdout)
+    # Hash the raw bytes (matches hash_utils.compute_staged_hash so the gate
+    # reader agrees), but decode a text copy for the API. errors="replace"
+    # keeps non-UTF-8 staged content from raising UnicodeDecodeError → the
+    # fail-open catch-all, which would silently allow an unscanned commit.
+    diff_text = result.stdout.decode("utf-8", errors="replace")
+    response = call_appsec_api(diff_text)
     findings = parse_findings(response)
 
     git_root = find_git_root()
@@ -60,8 +64,11 @@ def main() -> None:
 
     # Apply inline armis:ignore suppression against the staged diff blob. Keeps the
     # git hook interchangeable with the MCP scan_diff flow (same scan-pass behavior).
-    line_map, _changed = build_diff_line_map(result.stdout)
-    active, inline_suppressed = apply_inline_suppressions_to_diff(active, result.stdout, line_map)
+    # Use the decoded text copy (same string the API scanned) for line mapping and
+    # inline suppression -- the raw result.stdout is bytes here (hashed below to match
+    # hash_utils.compute_staged_hash), but these helpers operate on str.
+    line_map, _changed = build_diff_line_map(diff_text)
+    active, inline_suppressed = apply_inline_suppressions_to_diff(active, diff_text, line_map)
 
     # Suppressed HIGH does not block (team already accepted risk via .armisignore /
     # an inline directive). Suppressed CRITICAL still blocks (requires approve_findings).
@@ -84,7 +91,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    staged_hash = hashlib.sha256(result.stdout.encode()).hexdigest()
+    staged_hash = hashlib.sha256(result.stdout).hexdigest()
     cleanup_legacy_scan_pass()  # remove any stale working-tree .scan-pass
     scan_pass_path = resolve_scan_pass_path()
     tmp_path_file = scan_pass_path + ".tmp"

@@ -36,18 +36,32 @@ def main():
 
         tool_name = hook_input.get("tool_name", "")
 
-        # Shell tool: check commit gate
-        if tool_name in ("terminal", "shell", "bash", "Shell", "Bash"):
+        # Cursor's beforeShellExecution payload is FLAT — {command, cwd, ...}
+        # with no tool_name/tool_input wrapper. The preToolUse
+        # write-guard path uses the wrapped {tool_name, tool_input} shape. Read
+        # the command from either location so the gate fires on every shell
+        # command regardless of which event invoked us. (The shell matcher in
+        # cursor.hooks.json — a `contains`-semantics regex over the command
+        # string — is a deliberate SUPERSET of every command check_gate denies:
+        # `\bgit\b|\bgh\b|scan-pass`. Shipping commands always contain git/gh and
+        # forgery targets always contain "scan-pass", so this fires whenever the
+        # gate would deny while skipping ls/npm/cat/etc. If we instead gated on
+        # tool_name the forgery guard in check_gate would never run for a bare
+        # `echo h > .git/armis-scan-pass`.)
+        cmd = hook_input.get("command", "")
+        if not isinstance(cmd, str) or not cmd.strip():
             cmd = tool_input.get("command", "")
-            if not isinstance(cmd, str) or not cmd.strip():
-                print(_ALLOW)
-                sys.exit(0)
+
+        # Shell command present (flat beforeShellExecution, or a wrapped shell
+        # tool): run the full gate, which covers both the shipping check and the
+        # scan-pass anti-forgery check.
+        if isinstance(cmd, str) and cmd.strip():
             result = check_gate(cmd)
             if result.decision == "deny":
                 print(json.dumps({"permission": "deny", "agent_message": result.system_message}))
                 sys.exit(0)
 
-        # Write tool: check anti-forgery
+        # Write tool: check anti-forgery (preToolUse with a file-edit tool name)
         elif tool_name in ("Write", "Edit", "write_file", "edit_file"):
             file_path = tool_input.get("file_path", tool_input.get("path", ""))
             if is_scan_pass_file(file_path):

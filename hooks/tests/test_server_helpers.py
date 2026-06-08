@@ -130,8 +130,9 @@ class TestRunGitDiff:
             cwd=str(tmp_path),
             capture_output=True,
         )
-        result = server.run_git_diff(repo_path=str(tmp_path))
+        result, truncated = server.run_git_diff(repo_path=str(tmp_path))
         assert result == ""
+        assert truncated is False
 
     def test_excludes_deleted_files_from_staged_diff(self, tmp_path):
         # Set up repo with a committed file, then stage its deletion
@@ -154,7 +155,7 @@ class TestRunGitDiff:
             capture_output=True,
         )
         subprocess.run(["git", "rm", "to_delete.py"], cwd=str(tmp_path), capture_output=True)
-        result = server.run_git_diff(repo_path=str(tmp_path), staged=True)
+        result, _ = server.run_git_diff(repo_path=str(tmp_path), staged=True)
         assert "to_delete.py" not in result
         assert "SECRET" not in result
 
@@ -183,7 +184,7 @@ class TestRunGitDiff:
         (tmp_path / "keep.py").write_text("x = 42\n")
         subprocess.run(["git", "rm", "remove.py"], cwd=str(tmp_path), capture_output=True)
         subprocess.run(["git", "add", "keep.py"], cwd=str(tmp_path), capture_output=True)
-        result = server.run_git_diff(repo_path=str(tmp_path), staged=True)
+        result, _ = server.run_git_diff(repo_path=str(tmp_path), staged=True)
         assert "keep.py" in result
         assert "x = 42" in result
         assert "remove.py" not in result
@@ -193,12 +194,31 @@ class TestRunGitDiff:
             with pytest.raises(Exception, match="timed out"):
                 server.run_git_diff()
 
+    def test_large_diff_is_flagged_truncated(self, tmp_path):
+        """A diff over _MAX_CODE_CHARS is truncated AND reports
+        truncated=True so the caller refuses to write a gating scan-pass."""
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@t.com"], cwd=str(tmp_path), capture_output=True
+        )
+        subprocess.run(["git", "config", "user.name", "T"], cwd=str(tmp_path), capture_output=True)
+        # Build a staged file whose diff comfortably exceeds _MAX_CODE_CHARS.
+        big = "\n".join(f"x{i} = {i}" for i in range(server._MAX_CODE_CHARS // 5))
+        (tmp_path / "big.py").write_text(big)
+        subprocess.run(["git", "add", "big.py"], cwd=str(tmp_path), capture_output=True)
+
+        diff_text, truncated = server.run_git_diff(repo_path=str(tmp_path), staged=True)
+        assert truncated is True
+        assert len(diff_text) == server._MAX_CODE_CHARS
+
 
 # ---------------------------------------------------------------------------
 # get_debug_config
 # ---------------------------------------------------------------------------
 class TestGetDebugConfig:
-    def test_masks_credentials(self, monkeypatch):
+    def test_reports_presence_without_leaking_id(self, monkeypatch):
+        # CWE-522: debug output must report only that the ID is set, never any
+        # of its bytes (the old `abcd***` mask leaked the first 4 chars).
         monkeypatch.setenv("ARMIS_CLIENT_ID", "abcdefgh")
         monkeypatch.setenv("ARMIS_CLIENT_SECRET", "secret-value")
         monkeypatch.setenv("APPSEC_ENV", "prod")
@@ -206,20 +226,22 @@ class TestGetDebugConfig:
         with patch("server.get_auth_status", return_value="not yet exchanged"):
             result = server.get_debug_config()
 
-        assert "abcd***" in result
+        assert "Client ID: set" in result
+        assert "abcd" not in result
         assert "abcdefgh" not in result
         assert "secret-value" not in result
         assert "Client Secret: set" in result
 
-    def test_short_client_id(self, monkeypatch):
+    def test_short_client_id_reports_set_not_value(self, monkeypatch):
+        # Even a short ID is reported as presence-only — no length-based unmask.
         monkeypatch.setenv("ARMIS_CLIENT_ID", "ab")
         monkeypatch.delenv("ARMIS_CLIENT_SECRET", raising=False)
 
         with patch("server.get_auth_status", return_value="not initialized"):
             result = server.get_debug_config()
 
-        assert "Client ID: ab" in result
-        assert "***" not in result
+        assert "Client ID: set" in result
+        assert "Client ID: ab" not in result
         assert "Client Secret: not set" in result
 
 
@@ -243,7 +265,7 @@ class TestComputeStagedHash:
 
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = ""
+        mock_result.stdout = b""  # bytes mode (text=True dropped for non-UTF-8 safety)
         with patch("hash_utils.subprocess.run", return_value=mock_result):
             assert compute_staged_hash() == ""
 
@@ -255,7 +277,7 @@ class TestComputeStagedHash:
 
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = "diff content here"
+        mock_result.stdout = b"diff content here"  # bytes mode
         with patch("hash_utils.subprocess.run", return_value=mock_result):
             result = compute_staged_hash()
             expected = hashlib.sha256(b"diff content here").hexdigest()
