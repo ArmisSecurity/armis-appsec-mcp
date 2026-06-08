@@ -94,8 +94,17 @@ anchor on). Syntax:
   does **not** start a directive, so it can't suppress the finding on that line. This is the
   fail-safe direction — when in doubt the finding stays active.
 - Bare `armis:ignore` suppresses **any** finding on that line.
-- Optional params narrow the match with **AND** logic (opposite of `.armisignore`'s OR):
-  `cwe:798`, `severity:HIGH`, `category:secrets`, and a free-text `reason: ...`.
+- Optional params narrow the match: `cwe:798`, `severity:HIGH`, `category:secrets`, and a
+  free-text `reason: ...`. Logic is **AND across param *types*** (a `cwe:` and a `severity:`
+  in the same directive must both hold) but **OR *within* repeated `cwe:` tokens** —
+  `cwe:78 cwe:77` suppresses a finding reported as *either* CWE. The OR-over-CWEs accumulates
+  into `InlineDirective.cwes` (a tuple), matching `.armisignore`'s `cwes` list and production
+  `inline.go`. This matters because the fast-scan model is non-deterministic about which CWE
+  it assigns to a sink (command injection rotates 78/77, the path-read family rotates
+  22/23/73/770), so a directive must be able to name every CWE the finding may surface as.
+  **List CWEs generously.** (Before the PPSC-920 fix, multiple `cwe:` tokens collapsed
+  last-wins — `cwe:78 cwe:77` silently became `cwe:77` only — so a CWE-78 finding stayed
+  active with no error. Don't reintroduce single-value `cwe` parsing.)
 - `rule:` is recognized but a `rule:`-only directive matches **nothing** (the fast-scan model
   has no rule IDs) — it is *not* treated as bare. Combine it with `cwe:`/etc. to take effect.
 - **Diff scans match the diff blob, not files on disk** (`apply_inline_suppressions_to_diff`):

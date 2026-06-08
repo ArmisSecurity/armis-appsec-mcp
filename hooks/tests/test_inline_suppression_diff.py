@@ -421,3 +421,42 @@ class TestStringLiteralBypass:
         line = _blob_line(diff, "const s")
         _a, s = _run(diff, [{"cwe": 79, "severity": "HIGH", "line": line}])
         assert s and _a == []
+
+
+# ---------------------------------------------------------------------------
+# Multi-CWE directives on the diff path (regression for PPSC-920: a
+# `// armis:ignore cwe:78 cwe:77` directive above a Go sink line failed to clear
+# a CWE-78 finding because the parser kept only the last CWE).
+# ---------------------------------------------------------------------------
+class TestMultiCweInDiff:
+    def _go_diff(self):
+        # Mirrors supply_chain_init.go:461 — directive on the line ABOVE a Go sink.
+        return textwrap.dedent("""\
+            diff --git a/internal/cmd/init.go b/internal/cmd/init.go
+            +++ b/internal/cmd/init.go
+            @@ -0,0 +1,2 @@
+            +\t// armis:ignore cwe:78 cwe:77 reason:pms flows through sanitizePMNames
+            +\tw := supplychain.GenerateWrapper(sh.Name, pms)
+            """)
+
+    def test_multi_cwe_suppresses_first_listed(self):
+        diff = self._go_diff()
+        line = _blob_line(diff, "GenerateWrapper")
+        # Scanner reports CWE-78 (the first listed) -> suppressed via OR-match.
+        active, suppressed = _run(diff, [{"cwe": 78, "severity": "HIGH", "line": line}])
+        assert suppressed and active == []
+        assert suppressed[0]["_suppression_source"] == "inline"
+
+    def test_multi_cwe_suppresses_second_listed(self):
+        diff = self._go_diff()
+        line = _blob_line(diff, "GenerateWrapper")
+        # Same directive, a run where the model reported CWE-77 instead -> also clears.
+        active, suppressed = _run(diff, [{"cwe": 77, "severity": "HIGH", "line": line}])
+        assert suppressed and active == []
+
+    def test_multi_cwe_unlisted_stays_active(self):
+        diff = self._go_diff()
+        line = _blob_line(diff, "GenerateWrapper")
+        # A CWE not in the list is NOT suppressed (no over-broad matching).
+        active, suppressed = _run(diff, [{"cwe": 89, "severity": "HIGH", "line": line}])
+        assert active and suppressed == []

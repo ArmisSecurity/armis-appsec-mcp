@@ -363,11 +363,23 @@ _COMMENT_PREFIXES: dict[str, list[str]] = {
 
 _ARMIS_IGNORE_RE = re.compile(r"armis:ignore", re.IGNORECASE)
 
+# Bound the CWEs accumulated from a single inline directive. A real directive
+# lists a handful (the path-read CWE family is the widest at 4: 22/23/73/770),
+# so this is generous; it just stops a pathological comment line with thousands
+# of `cwe:` tokens from growing an unbounded list. Mirrors _MAX_ARMISIGNORE_LINES.
+_MAX_INLINE_CWES = 64
+
 
 @dataclass(frozen=True)
 class InlineDirective:
     category: str | None = None
-    cwe: int | None = None
+    # Multiple cwe: tokens accumulate and match with OR logic (any listed CWE
+    # suppresses), mirroring .armisignore's `cwes` list and production inline.go.
+    # The fast-scan model is non-deterministic about which CWE it assigns to a
+    # given sink (e.g. command injection rotates between CWE-78 and CWE-77), so a
+    # single directive must be able to name every CWE the finding may surface as.
+    # A tuple (not list) keeps this frozen dataclass immutable and hashable.
+    cwes: tuple[int, ...] = ()
     severity: str | None = None
     reason: str | None = None
     is_bare: bool = False
@@ -453,7 +465,7 @@ def _parse_inline_directive(text: str) -> InlineDirective | None:
         return InlineDirective(is_bare=True)
 
     category = None
-    cwe = None
+    cwes: list[int] = []
     severity = None
     reason = None
     has_rule_only = False
@@ -471,29 +483,41 @@ def _parse_inline_directive(text: str) -> InlineDirective | None:
             try:
                 cwe = int(token[4:])
             except ValueError:
-                pass
+                continue
+            # Accumulate (OR-match), preserving order and dropping duplicates so
+            # `cwe:78 cwe:77` suppresses a finding reported as EITHER CWE. Bounded
+            # by _MAX_INLINE_CWES so a pathological line can't grow the list without
+            # limit (CWE-770).
+            if cwe not in cwes and len(cwes) < _MAX_INLINE_CWES:
+                cwes.append(cwe)
         elif lower.startswith("severity:"):
             severity = token[9:]
         elif lower.startswith("rule:"):
             has_rule_only = True
 
-    if not any([category, cwe, severity]):
+    if not any([category, cwes, severity]):
         if has_rule_only:
             return InlineDirective(reason=reason)
         return InlineDirective(is_bare=True, reason=reason)
 
-    return InlineDirective(category=category, cwe=cwe, severity=severity, reason=reason)
+    return InlineDirective(category=category, cwes=tuple(cwes), severity=severity, reason=reason)
 
 
 def _finding_matches_inline(finding: dict, directive: InlineDirective) -> bool:
-    """Check if a finding matches an inline directive (AND logic for specified params)."""
+    """Check if a finding matches an inline directive.
+
+    AND logic *across* param types (cwe / severity / category all specified must
+    all hold), but OR logic *within* the cwe list — a finding matches if its CWE
+    is any one of the listed CWEs. This mirrors .armisignore and production
+    inline.go, and is what makes `cwe:78 cwe:77` suppress an either-way finding.
+    """
     if directive.is_bare:
         return True
-    if not any([directive.category, directive.cwe, directive.severity]):
+    if not any([directive.category, directive.cwes, directive.severity]):
         return False
 
-    if directive.cwe is not None:
-        if finding.get("cwe") != directive.cwe:
+    if directive.cwes:
+        if finding.get("cwe") not in directive.cwes:
             return False
     if directive.severity is not None:
         if (finding.get("severity") or "").upper() != directive.severity.upper():

@@ -30,7 +30,7 @@ class TestParseInlineDirective:
     def test_cwe_only(self):
         d = _parse_inline_directive("armis:ignore cwe:798")
         assert d is not None
-        assert d.cwe == 798
+        assert d.cwes == (798,)
         assert d.is_bare is False
 
     def test_severity_only(self):
@@ -50,7 +50,7 @@ class TestParseInlineDirective:
         d = _parse_inline_directive("armis:ignore rule:CKV_AWS_18")
         assert d is not None
         assert d.is_bare is False
-        assert d.cwe is None
+        assert d.cwes == ()
         assert d.severity is None
         assert d.category is None
 
@@ -58,20 +58,20 @@ class TestParseInlineDirective:
         """rule: is consumed but ignored; cwe: is enforced (D1)."""
         d = _parse_inline_directive("armis:ignore rule:CKV_AWS_18 cwe:798")
         assert d is not None
-        assert d.cwe == 798
+        assert d.cwes == (798,)
         assert d.is_bare is False
 
     def test_multiple_params_any_order(self):
         d = _parse_inline_directive("armis:ignore cwe:79 category:sast severity:HIGH")
         assert d is not None
-        assert d.cwe == 79
+        assert d.cwes == (79,)
         assert d.category == "sast"
         assert d.severity == "HIGH"
 
     def test_reason_captures_rest(self):
         d = _parse_inline_directive("armis:ignore cwe:798 reason: Not hardcoded, env var")
         assert d is not None
-        assert d.cwe == 798
+        assert d.cwes == (798,)
         assert d.reason == "Not hardcoded, env var"
 
     def test_invalid_cwe_ignored(self):
@@ -79,13 +79,44 @@ class TestParseInlineDirective:
         d = _parse_inline_directive("armis:ignore cwe:abc")
         assert d is not None
         assert d.is_bare is True
-        assert d.cwe is None
+        assert d.cwes == ()
 
-    def test_duplicate_key_last_wins(self):
-        """Duplicate keys: last-wins behavior (D6)."""
-        d = _parse_inline_directive("armis:ignore cwe:79 cwe:89")
+    def test_multiple_cwes_accumulate(self):
+        """Multiple cwe: tokens accumulate into an OR-list (PPSC bug fix).
+
+        The fast-scan model rotates CWEs for the same sink (e.g. command
+        injection -> 78 or 77), so a directive must name every CWE the finding
+        may surface as. Order is preserved.
+        """
+        d = _parse_inline_directive("armis:ignore cwe:78 cwe:77")
         assert d is not None
-        assert d.cwe == 89
+        assert d.cwes == (78, 77)
+        assert d.is_bare is False
+
+    def test_duplicate_cwe_deduped(self):
+        """A repeated cwe: token collapses to a single entry (no last-wins loss)."""
+        d = _parse_inline_directive("armis:ignore cwe:79 cwe:89 cwe:79")
+        assert d is not None
+        assert d.cwes == (79, 89)
+
+    def test_multiple_cwes_with_reason(self):
+        """reason: is stripped before token parsing; multiple cwe: still accumulate."""
+        d = _parse_inline_directive("armis:ignore cwe:78 cwe:77 reason: sanitized upstream")
+        assert d is not None
+        assert d.cwes == (78, 77)
+        assert d.reason == "sanitized upstream"
+
+    def test_cwe_accumulation_is_bounded(self):
+        """A pathological line with many cwe: tokens is capped (CWE-770 guard)."""
+        from suppression import _MAX_INLINE_CWES
+
+        # 500 distinct CWEs -> list must not exceed the cap.
+        tokens = " ".join(f"cwe:{n}" for n in range(1000, 1500))
+        d = _parse_inline_directive(f"armis:ignore {tokens}")
+        assert d is not None
+        assert len(d.cwes) == _MAX_INLINE_CWES
+        # The earliest tokens are the ones kept (order preserved, later dropped).
+        assert d.cwes[0] == 1000
 
     def test_no_armis_ignore_returns_none(self):
         d = _parse_inline_directive("just some text")
@@ -187,13 +218,27 @@ class TestFindingMatchesInline:
 
     def test_cwe_match(self):
         finding = {"cwe": 798, "severity": "HIGH", "has_secret": True}
-        directive = InlineDirective(cwe=798)
+        directive = InlineDirective(cwes=(798,))
         assert _finding_matches_inline(finding, directive) is True
 
     def test_cwe_no_match(self):
         finding = {"cwe": 79, "severity": "HIGH", "has_secret": False}
-        directive = InlineDirective(cwe=798)
+        directive = InlineDirective(cwes=(798,))
         assert _finding_matches_inline(finding, directive) is False
+
+    def test_multi_cwe_or_match_first(self):
+        """OR within the cwe list: a finding matching ANY listed CWE is suppressed."""
+        directive = InlineDirective(cwes=(78, 77))
+        assert _finding_matches_inline({"cwe": 78, "severity": "HIGH"}, directive) is True
+
+    def test_multi_cwe_or_match_second(self):
+        directive = InlineDirective(cwes=(78, 77))
+        assert _finding_matches_inline({"cwe": 77, "severity": "HIGH"}, directive) is True
+
+    def test_multi_cwe_no_match_outside_list(self):
+        """A CWE not in the list stays active even with a multi-CWE directive."""
+        directive = InlineDirective(cwes=(78, 77))
+        assert _finding_matches_inline({"cwe": 89, "severity": "HIGH"}, directive) is False
 
     def test_severity_match_case_insensitive(self):
         finding = {"cwe": 79, "severity": "high", "has_secret": False}
@@ -217,14 +262,22 @@ class TestFindingMatchesInline:
 
     def test_and_logic_both_match(self):
         finding = {"cwe": 79, "severity": "HIGH", "has_secret": False}
-        directive = InlineDirective(category="sast", cwe=79)
+        directive = InlineDirective(category="sast", cwes=(79,))
         assert _finding_matches_inline(finding, directive) is True
 
     def test_and_logic_partial_no_match(self):
         """category matches but cwe doesn't → no match (AND logic)."""
         finding = {"cwe": 79, "severity": "HIGH", "has_secret": False}
-        directive = InlineDirective(category="sast", cwe=89)
+        directive = InlineDirective(category="sast", cwes=(89,))
         assert _finding_matches_inline(finding, directive) is False
+
+    def test_and_across_types_or_within_cwes(self):
+        """AND across param types, OR within the cwe list: cwe matches via OR but
+        severity must still hold."""
+        directive = InlineDirective(cwes=(78, 77), severity="HIGH")
+        assert _finding_matches_inline({"cwe": 77, "severity": "HIGH"}, directive) is True
+        # CWE matches the list, but severity disagrees -> stays active (AND).
+        assert _finding_matches_inline({"cwe": 77, "severity": "LOW"}, directive) is False
 
 
 # ---------------------------------------------------------------------------
