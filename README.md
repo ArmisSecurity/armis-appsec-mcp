@@ -1,6 +1,6 @@
 # Armis AppSec MCP Plugin
 
-AI-powered security scanning for [Claude Code](https://claude.ai/code), [Cursor](https://cursor.com), [VS Code](https://code.visualstudio.com) (GitHub Copilot), [Gemini CLI](https://github.com/google-gemini/gemini-cli), and [GitHub Copilot CLI](https://docs.github.com/en/copilot). Scans code, files, and git diffs for vulnerabilities in real-time using the Armis scanning API.
+AI-powered security scanning for [Claude Code](https://claude.ai/code), [Cursor](https://cursor.com), [VS Code](https://code.visualstudio.com) (GitHub Copilot), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot), [Codex CLI](https://github.com/openai/codex), and [Cline](https://github.com/cline/cline). Scans code, files, and git diffs for vulnerabilities in real-time using the Armis scanning API.
 
 ## Features
 
@@ -94,6 +94,26 @@ Run `make setup CLIENT=copilot` and copy the output to `.mcp.json` (workspace) o
 
 Copilot CLI requires both `command` and `args` fields. A config without `args` will be ignored.
 
+### Codex CLI
+
+Add the MCP server to your Codex CLI config per its documentation. Then wire in the commit gate hook:
+
+```bash
+make setup CLIENT=codex   # prints the hook config JSON
+```
+
+Merge the printed `hooks` block into your Codex CLI hooks config file (path varies by installation), replacing `/absolute/path/to/armis-appsec-mcp` with the actual clone path.
+
+### Cline
+
+Add the MCP server via Cline's MCP settings panel. Then wire in the commit gate hook:
+
+```bash
+make setup CLIENT=cline   # prints the hook config JSON
+```
+
+Merge the printed `hooks` block into your Cline `settings.json`, replacing `/absolute/path/to/armis-appsec-mcp` with the actual clone path.
+
 ### Claude Code (full integration)
 
 Install via the plugin marketplace for the complete experience (hooks + slash command):
@@ -116,12 +136,14 @@ chmod 600 "$PLUGIN_DIR/.env"
 
 ## Feature Comparison
 
-| Feature | Claude Code | Cursor | VS Code | Gemini | Copilot CLI |
-|---------|------------|--------|---------|--------|-------------|
-| MCP tools (all 5) | Yes | Yes | Yes | Yes | Yes |
-| Commit gate (hard) | Native hook | Git hook | Git hook | Git hook | Git hook |
-| Commit gate (soft) | Native hook | .cursor/rules | instructions | AGENTS.md | — |
-| /security-scan | Yes | — | — | — | — |
+| Feature | Claude Code | Cursor | VS Code | Gemini | Copilot CLI | Codex CLI | Cline |
+|---------|------------|--------|---------|--------|-------------|-----------|-------|
+| MCP tools (all 5) | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Commit gate (hard) | Native hook | Native hook | Git hook | Native hook | Native hook | Native hook | Native hook |
+| Commit gate (soft) | Native hook | .cursor/rules | instructions | AGENTS.md | — | AGENTS.md | — |
+| /security-scan | Yes | — | — | — | — | — | — |
+
+"Native hook" = PreToolUse hook wired into the client's tool pipeline (blocks the command before it runs, injects a scan instruction). "Git hook" = portable `pre-commit` script (installed via `make install-hooks`). VS Code is the only client without a native hook template.
 
 ## Optional: Git Pre-Commit Hook
 
