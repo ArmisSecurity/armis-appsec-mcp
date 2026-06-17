@@ -33,8 +33,8 @@ uninstall-hooks:
 	@echo "Pre-commit hook removed."
 
 setup:
-	@test -n "$(CLIENT)" || { echo "Usage: make setup CLIENT=cursor|vscode|gemini|copilot"; exit 1; }
-	@case "$(CLIENT)" in cursor|vscode|gemini|copilot) ;; *) echo "ERROR: Unknown CLIENT '$(CLIENT)'. Valid: cursor, vscode, gemini, copilot" >&2; exit 1;; esac
+	@test -n "$(CLIENT)" || { echo "Usage: make setup CLIENT=cursor|vscode|gemini|copilot|codex|cline"; exit 1; }
+	@case "$(CLIENT)" in cursor|vscode|gemini|copilot|codex|cline) ;; *) echo "ERROR: Unknown CLIENT '$(CLIENT)'. Valid: cursor, vscode, gemini, copilot, codex, cline" >&2; exit 1;; esac
 	@PLUGIN_DIR=$$(pwd) && \
 	TEMPLATE="config-templates/$(CLIENT).mcp.json" && \
 	[ ! -f "$$TEMPLATE" ] && TEMPLATE="config-templates/$(CLIENT)-cli.mcp.json"; \
