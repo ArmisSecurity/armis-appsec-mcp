@@ -11,7 +11,12 @@ _plugin_dir = os.path.join(os.path.dirname(__file__), "..", "..")
 if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
 
-from scanner_core import build_diff_line_map, format_findings, parse_findings
+from scanner_core import (
+    build_diff_line_map,
+    changed_lines_for_file,
+    format_findings,
+    parse_findings,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +350,93 @@ class TestBuildDiffLineMap:
         )
         _, changed_files = build_diff_line_map(diff)
         assert changed_files == ["z.py", "a.py"]  # order of appearance, not sorted
+
+
+# ---------------------------------------------------------------------------
+# changed_lines_for_file
+# ---------------------------------------------------------------------------
+class TestChangedLinesForFile:
+    def test_added_and_context_lines(self):
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " line1\n"
+            "+added\n"
+            " line3\n"
+            " line4\n"
+        )
+        # All four lines (context + added) are in scope: 1, 2, 3, 4
+        assert changed_lines_for_file(diff, "app.py") == {1, 2, 3, 4}
+
+    def test_only_deletions(self):
+        diff = (
+            "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,1 @@\n kept\n-removed\n"
+        )
+        # File is in the diff; the deleted line doesn't count, but the context
+        # line ("kept") at source line 1 is still in scope.
+        assert changed_lines_for_file(diff, "x.py") == {1}
+
+    def test_file_not_in_diff_returns_none(self):
+        diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n+x\n"
+        assert changed_lines_for_file(diff, "b.py") is None
+
+    def test_multi_file_only_requested_returned(self):
+        diff = (
+            "diff --git a/a.py b/a.py\n"
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " ctxA\n"
+            "+addedA\n"
+            " endA\n"
+            "diff --git a/b.py b/b.py\n"
+            "--- a/b.py\n"
+            "+++ b/b.py\n"
+            "@@ -10,2 +10,3 @@\n"
+            " ctxB\n"
+            "+addedB\n"
+            " endB\n"
+        )
+        assert changed_lines_for_file(diff, "a.py") == {1, 2, 3}
+        assert changed_lines_for_file(diff, "b.py") == {10, 11, 12}
+
+    def test_empty_diff_returns_none(self):
+        assert changed_lines_for_file("", "anything.py") is None
+
+
+# ---------------------------------------------------------------------------
+# format_findings: out_of_scope_count
+# ---------------------------------------------------------------------------
+class TestFormatFindingsOutOfScope:
+    def test_zero_out_of_scope_no_suffix(self):
+        result = format_findings([], "app.py", out_of_scope_count=0)
+        assert result == "SCAN app.py: clean, no findings."
+
+    def test_no_findings_with_out_of_scope(self):
+        result = format_findings([], "app.py", out_of_scope_count=3)
+        assert "SCAN app.py: 0 finding(s)" in result
+        assert "(3 outside diff scope)" in result
+
+    def test_findings_with_out_of_scope_in_header(self):
+        findings = [{"severity": "HIGH", "cwe": 89, "line": 5, "explanation": "x"}]
+        result = format_findings(findings, "app.py", out_of_scope_count=2)
+        # Header should show count of in-scope findings AND the out-of-scope tail
+        assert "1 finding(s)" in result.splitlines()[0]
+        assert "(2 outside diff scope)" in result.splitlines()[0]
+
+    def test_out_of_scope_with_suppression(self):
+        findings = [{"severity": "HIGH", "cwe": 89, "line": 5, "explanation": "x"}]
+        result = format_findings(
+            findings,
+            "app.py",
+            suppression_summary={"suppressed": 1, "by_directive": {"cwe:89": 1}, "by_inline": 0},
+            out_of_scope_count=4,
+        )
+        # Both the (active, suppressed) clause and the out-of-scope clause should appear
+        assert "1 active, 1 suppressed" in result
+        assert "(4 outside diff scope)" in result.splitlines()[0]
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ The MCP server is named `scanner`. All tools are prefixed `mcp__scanner__`.
 | Tool | When to Use |
 |------|-------------|
 | `mcp__scanner__scan_diff` | Default. Scan git changes (staged, unstaged, or vs a ref) |
-| `mcp__scanner__scan_file` | User provides a file path to scan |
+| `mcp__scanner__scan_file` | User provides a file path to scan. Auto-scopes findings to lines changed vs HEAD when run inside a git repo (falls open on a clean file or non-repo path) |
 | `mcp__scanner__scan_code` | User pastes code inline or asks about a snippet |
 
 ### Tool Parameters
@@ -34,6 +34,14 @@ The MCP server is named `scanner`. All tools are prefixed `mcp__scanner__`.
 
 **`mcp__scanner__scan_file`**
 - `file_path` (string, required): Absolute path to the file to scan.
+
+  When the file is inside a git repo, `scan_file` automatically computes
+  `git diff HEAD -- <file>` (staged + unstaged) and filters findings to lines
+  the user has actually changed -- so a pre-existing vuln on an untouched line
+  isn't reported as if the user introduced it. The output header shows e.g.
+  `(3 outside diff scope)` when this filter dropped findings. No parameter is
+  needed (and none is exposed) to control this -- the agent has no reliable way
+  to compute the diff itself, so the server does it.
 
 **`mcp__scanner__scan_code`**
 - `code` (string, required): The source code to scan. Truncated at 90,000 characters.
@@ -48,6 +56,8 @@ Note: `scan_file` and `scan_code` both silently truncate input at 90,000 charact
 ## Decision Tree
 
 Follow this logic to pick the right tool. **For every `scan_diff` call, pass `repo_path` set to the absolute path of the repo you're working in** (see Tool Parameters for why — it is required for the commit gate to work inside git worktrees).
+
+**0. Diff/PR context first.** If the user's intent is reviewing a PR, their "current changes", "what I just wrote", or "scan my work" — call `scan_diff` (with `repo_path`) even if a specific file is named. Use `scan_file` only when the user wants to review the *whole file* (e.g. "audit auth.py from scratch", "is this script secure"). When in doubt, `scan_diff` is the safer default. (`scan_file` does auto-scope to changed lines when run in a git repo, so it's safe when you do pick it — but `scan_diff` is the right tool for a PR/diff review.)
 
 1. **User provided a file path as argument?**
    Yes: Call `mcp__scanner__scan_file` with that path.

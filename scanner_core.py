@@ -85,6 +85,7 @@ def format_findings(
     line_map: dict[int, tuple[str, int]] | None = None,
     changed_files: list[str] | None = None,
     suppression_summary: dict | None = None,
+    out_of_scope_count: int = 0,
 ) -> str:
     """Format findings as compact plain text optimized for LLM consumption.
 
@@ -97,7 +98,13 @@ def format_findings(
     if changed_files is not None:
         header_suffix = f" ({len(changed_files)} file(s))"
 
+    out_of_scope_suffix = (
+        f" ({out_of_scope_count} outside diff scope)" if out_of_scope_count else ""
+    )
+
     if not findings and not suppressed_count:
+        if out_of_scope_count:
+            return f"SCAN {filename}{header_suffix}: 0 finding(s){out_of_scope_suffix}"
         return f"SCAN {filename}{header_suffix}: clean, no findings."
     if not findings and suppressed_count:
         by_inline = (suppression_summary or {}).get("by_inline", 0)
@@ -107,15 +114,18 @@ def format_findings(
                 f"SCAN {filename}{header_suffix}: 0 finding(s) "
                 f"({by_armisignore} suppressed by .armisignore, "
                 f"{by_inline} by armis:ignore inline)"
+                f"{out_of_scope_suffix}"
             )
         elif by_inline:
             return (
                 f"SCAN {filename}{header_suffix}: "
                 f"0 finding(s) ({by_inline} suppressed by armis:ignore inline)"
+                f"{out_of_scope_suffix}"
             )
         return (
             f"SCAN {filename}{header_suffix}: "
             f"0 finding(s) ({suppressed_count} suppressed by .armisignore)"
+            f"{out_of_scope_suffix}"
         )
 
     severity_rank = {s: i for i, s in enumerate(SEVERITY_ORDER)}
@@ -126,9 +136,10 @@ def format_findings(
         header = (
             f"SCAN {filename}{header_suffix}: {len(findings)} finding(s) "
             f"({len(findings)} active, {suppressed_count} suppressed)"
+            f"{out_of_scope_suffix}"
         )
     else:
-        header = f"SCAN {filename}{header_suffix}: {len(findings)} finding(s)"
+        header = f"SCAN {filename}{header_suffix}: {len(findings)} finding(s){out_of_scope_suffix}"
     lines = [header]
 
     source_line_to_files: dict[int, list[str]] = {}
@@ -230,3 +241,18 @@ def build_diff_line_map(
             pass  # removed lines: no mapping, no source line increment
 
     return line_map, changed_files
+
+
+def changed_lines_for_file(diff_text: str, file_path: str) -> set[int] | None:
+    """Return the set of source line numbers in ``file_path`` that were added
+    or are context inside the diff.
+
+    Returns ``None`` when ``file_path`` is not present in the diff at all —
+    callers (``scan_file``) treat that as "no change → don't filter, fail open".
+    Returns an empty set when the file is in the diff but had only deletions,
+    which means no in-scope lines exist.
+    """
+    line_map, changed_files = build_diff_line_map(diff_text)
+    if file_path not in changed_files:
+        return None
+    return {src_line for (mfile, src_line) in line_map.values() if mfile == file_path}

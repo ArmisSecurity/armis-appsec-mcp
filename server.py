@@ -46,6 +46,7 @@ from scanner_core import (
     APPSEC_API_URL,
     build_diff_line_map,
     call_appsec_api,
+    changed_lines_for_file,
     format_findings,
     parse_findings,
 )
@@ -72,8 +73,16 @@ async def _run_scan(
     config: ArmisIgnoreConfig | None = None,
     file_path: str | None = None,
     source_lines: list[str] | None = None,
+    diff_lines: set[int] | None = None,
 ) -> str:
-    """Shared scan pipeline: call API, parse, suppress, format, cache, report progress."""
+    """Shared scan pipeline: call API, parse, suppress, format, cache, report progress.
+
+    ``diff_lines`` (optional) scopes findings to source lines the user has
+    changed. When set, findings whose ``line`` is not in the set are dropped
+    (they are *out of scope*, not suppressed — different concept from
+    ``.armisignore``/inline). Findings with non-integer line numbers fall open
+    (kept) — same conservative posture as armis-cli's PR diff filter.
+    """
     t0 = time.monotonic()
     try:
         raw = await asyncio.to_thread(call_appsec_api, code)
@@ -90,12 +99,18 @@ async def _run_scan(
         config = load_armisignore(git_root)
     active, suppressed, suppression_summary = apply_suppressions(findings, config)
 
-    # Apply inline armis:ignore suppression (scan_file only -- it has on-disk source)
+    # Apply inline armis:ignore suppression (scan_file only -- it has on-disk source).
+    # Order matters: inline runs *before* the diff-scope filter so an inline
+    # directive on an out-of-scope line still books the finding into
+    # ``suppressed`` (and warns on suppressed CRITICAL) — keeps suppression
+    # bookkeeping consistent regardless of whether the line is in the diff.
     if file_path:
         active, inline_suppressed = apply_inline_suppressions(active, file_path, source_lines)
         suppressed = _merge_inline_suppressions(suppression_summary, suppressed, inline_suppressed)
 
-    # Warn on suppressed CRITICAL findings (from any source)
+    # Warn on suppressed CRITICAL findings (from any source). scan_file is not
+    # shipping-eligible (it never writes .scan-pass), so this is purely advisory
+    # — the gate behavior is unaffected by the diff-scope filter below.
     if suppressed:
         suppressed_critical = [f for f in suppressed if f.get("severity", "").upper() == "CRITICAL"]
         if suppressed_critical:
@@ -104,8 +119,27 @@ async def _run_scan(
             if ctx:
                 await ctx.info(msg)
 
+    out_of_scope_count = 0
+    if diff_lines is not None:
+        in_scope: list[dict] = []
+        for f in active:
+            try:
+                line_num = int(f.get("line", ""))
+            except (TypeError, ValueError):
+                in_scope.append(f)  # fail open on missing/non-integer lines
+                continue
+            if line_num in diff_lines:
+                in_scope.append(f)
+            else:
+                out_of_scope_count += 1
+        active = in_scope
+
     report = format_findings(
-        active, filename, file_path=file_path or "", suppression_summary=suppression_summary
+        active,
+        filename,
+        file_path=file_path or "",
+        suppression_summary=suppression_summary,
+        out_of_scope_count=out_of_scope_count,
     )
     _cache_scan(
         report,
@@ -285,7 +319,13 @@ def read_and_validate_file(file_path: str) -> tuple[str, str, str]:
     return code, os.path.basename(file_path), resolved
 
 
-def run_git_diff(repo_path: str = "", ref: str = "", staged: bool = False) -> tuple[str, bool]:
+def run_git_diff(
+    repo_path: str = "",
+    ref: str = "",
+    staged: bool = False,
+    paths: list[str] | None = None,
+    context_lines: int = 10,
+) -> tuple[str, bool]:
     """Run git diff and return ``(diff_text, truncated)``. Raises ToolError on failure.
 
     ``truncated`` is True when the diff exceeded ``_MAX_CODE_CHARS`` and was
@@ -293,6 +333,15 @@ def run_git_diff(repo_path: str = "", ref: str = "", staged: bool = False) -> tu
     when truncated — the scanner only saw the first ``_MAX_CODE_CHARS`` but the
     staged hash covers the full diff, so a vuln past the cut would ship under a
     "clean" pass.
+
+    ``paths`` (optional) restricts the diff to the given files (passed after
+    the ``--`` separator). Used by ``scan_file`` to fetch a single-file diff
+    for changed-line filtering.
+
+    ``context_lines`` controls ``-U`` (lines of context). Default 10 matches
+    the scan_diff path so the model sees surrounding code. ``scan_file`` uses
+    0 when computing the changed-line set so only user-touched (``+``) lines
+    are counted as in-scope — context lines aren't user changes.
     """
     if ref and not _VALID_GIT_REF.match(ref):
         raise ToolError(
@@ -300,6 +349,8 @@ def run_git_diff(repo_path: str = "", ref: str = "", staged: bool = False) -> tu
         )
     if ref and ref.startswith("-"):
         raise ToolError("Git ref cannot start with '-'.")
+    if context_lines < 0:
+        raise ToolError("context_lines must be >= 0.")
 
     if repo_path:
         cwd = _validate_file_path(repo_path)
@@ -313,7 +364,9 @@ def run_git_diff(repo_path: str = "", ref: str = "", staged: bool = False) -> tu
         cmd.append(ref)
     elif staged:
         cmd.append("--cached")
-    cmd.extend(["--diff-filter=d", "--no-ext-diff", "-U10", "--"])
+    cmd.extend(["--diff-filter=d", "--no-ext-diff", f"-U{context_lines}", "--"])
+    if paths:
+        cmd.extend(paths)
 
     logger.info("Running: %s in %s", " ".join(cmd), cwd)
 
@@ -418,6 +471,37 @@ async def scan_code(
     return await _run_scan(code, filename, ctx)
 
 
+def _compute_scan_file_diff_lines(git_root: str | None, resolved_path: str) -> set[int] | None:
+    """Compute the set of source lines in ``resolved_path`` that are part of the
+    user's working diff (staged + unstaged) vs HEAD.
+
+    Returns None on any failure path so the caller falls open (no filtering):
+    file isn't in a git repo, file has no diff vs HEAD, or git itself errored.
+    The fail-open posture mirrors armis-cli's PR-diff filter, which keeps
+    findings for files with no patch data — better to over-report than to
+    silently drop a real vulnerability because we couldn't compute scope.
+    """
+    if not git_root:
+        return None
+    try:
+        rel_path = os.path.relpath(resolved_path, git_root)
+    except ValueError:
+        return None  # different drives on Windows etc.
+    try:
+        # context_lines=0 so only user-touched (+) lines count as in-scope.
+        # The default U=10 would mark every neighbor line as "changed" and
+        # defeat the filter for small files.
+        diff_text, _truncated = run_git_diff(
+            repo_path=git_root, ref="HEAD", paths=[rel_path], context_lines=0
+        )
+    except ToolError as e:
+        logger.warning("scan_file: git diff failed for %s: %s", resolved_path, e)
+        return None
+    if not diff_text:
+        return None
+    return changed_lines_for_file(diff_text, rel_path)
+
+
 @mcp.tool()
 async def scan_file(
     file_path: str,
@@ -426,7 +510,11 @@ async def scan_file(
     """Scan a file on disk for security vulnerabilities.
 
     Use this tool to scan an existing source file. The file is read and
-    analyzed for vulnerabilities using AI-powered SAST.
+    analyzed for vulnerabilities using AI-powered SAST. When the file is
+    inside a git repository, findings are auto-scoped to the lines the user
+    has changed vs HEAD (staged + unstaged) so pre-existing vulnerabilities
+    on untouched lines aren't reported. Falls open (returns all findings) if
+    there is no diff or no git repo.
 
     Args:
         file_path: Absolute path to the file to scan.
@@ -449,9 +537,17 @@ async def scan_file(
         await ctx.info(f"Scanning {filename} ({len(code)} chars)")
     logger.info(f"Scanning file: {file_path} ({len(code)} chars)")
 
+    diff_lines = _compute_scan_file_diff_lines(git_root, resolved_path)
+
     source_lines = code.splitlines()
     return await _run_scan(
-        code, filename, ctx, config=config, file_path=resolved_path, source_lines=source_lines
+        code,
+        filename,
+        ctx,
+        config=config,
+        file_path=resolved_path,
+        source_lines=source_lines,
+        diff_lines=diff_lines,
     )
 
 

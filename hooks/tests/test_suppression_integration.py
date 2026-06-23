@@ -670,3 +670,205 @@ class TestFormatCriticalWarning:
         """A finding with no _suppression_source falls back to .armisignore."""
         warning = server._format_critical_warning([{"cwe": 89}])
         assert "suppressed by .armisignore" in warning
+
+
+# ---------------------------------------------------------------------------
+# PPSC-946: scan_file diff-scope filtering
+# ---------------------------------------------------------------------------
+class TestRunScanDiffLinesFilter:
+    """``_run_scan`` with ``diff_lines`` drops findings outside the changed
+    line set, mirroring armis-cli's PR-diff filter. Findings on changed lines
+    pass through; findings with non-integer/missing line numbers fall open."""
+
+    @pytest.mark.asyncio
+    async def test_keeps_in_scope_drops_out_of_scope(self):
+        raw_response = (
+            "```json\n["
+            '{"cwe": 89, "severity": "HIGH", "line": 5, "explanation": "in-scope"},'
+            '{"cwe": 798, "severity": "HIGH", "line": 99, "explanation": "out-of-scope"}'
+            "]\n```"
+        )
+        config = ArmisIgnoreConfig()
+        with patch("server.call_appsec_api", return_value=raw_response):
+            report = await server._run_scan("code", "app.py", config=config, diff_lines={5})
+        assert "in-scope" in report
+        assert "out-of-scope" not in report
+        assert "(1 outside diff scope)" in report
+
+    @pytest.mark.asyncio
+    async def test_no_filter_when_diff_lines_none(self):
+        """diff_lines=None preserves the previous behaviour (no filtering)."""
+        raw_response = (
+            "```json\n["
+            '{"cwe": 89, "severity": "HIGH", "line": 5, "explanation": "a"},'
+            '{"cwe": 798, "severity": "HIGH", "line": 99, "explanation": "b"}'
+            "]\n```"
+        )
+        config = ArmisIgnoreConfig()
+        with patch("server.call_appsec_api", return_value=raw_response):
+            report = await server._run_scan("code", "app.py", config=config, diff_lines=None)
+        assert "a" in report and "b" in report
+        assert "outside diff scope" not in report
+
+    @pytest.mark.asyncio
+    async def test_non_integer_line_falls_open(self):
+        """A finding with a missing/non-integer line number is kept (fail-open)."""
+        raw_response = (
+            "```json\n["
+            '{"cwe": 89, "severity": "HIGH", "line": "?", "explanation": "weird-line"}'
+            "]\n```"
+        )
+        config = ArmisIgnoreConfig()
+        with patch("server.call_appsec_api", return_value=raw_response):
+            report = await server._run_scan("code", "app.py", config=config, diff_lines={5})
+        # Kept because the line couldn't be parsed; out-of-scope counter unchanged
+        assert "weird-line" in report
+        assert "outside diff scope" not in report
+
+    @pytest.mark.asyncio
+    async def test_inline_runs_before_diff_scope_filter(self, tmp_path):
+        """An inline armis:ignore on a line *outside* the diff scope still books
+        the finding into 'suppressed'. Demonstrates that inline runs before the
+        diff-scope filter, so suppression bookkeeping is consistent regardless
+        of whether the line is in the diff."""
+        raw_response = (
+            "```json\n["
+            '{"cwe": 798, "severity": "HIGH", "line": 99, '
+            '"explanation": "old-secret", "has_secret": true, '
+            '"confidence": 0.9, "cwe_name": "Hardcoded", '
+            '"tainted_function_references": []}'
+            "]\n```"
+        )
+        config = ArmisIgnoreConfig()
+        # Build 99 lines; line 99 has the inline suppression directive
+        source_lines = ["x = 1"] * 98 + ["password = 'old'  # armis:ignore cwe:798"]
+        with patch("server.call_appsec_api", return_value=raw_response):
+            report = await server._run_scan(
+                "code",
+                "app.py",
+                config=config,
+                file_path=str(tmp_path / "app.py"),
+                source_lines=source_lines,
+                diff_lines={5},  # line 99 is out-of-scope
+            )
+        # The finding is suppressed by inline (not dropped by diff-scope) — the
+        # output reflects the suppression, not an out-of-scope count.
+        assert "old-secret" not in report
+        assert "armis:ignore inline" in report
+        # The finding never reached the diff-scope filter, so no out-of-scope tally
+        assert "outside diff scope" not in report
+
+
+class TestComputeScanFileDiffLines:
+    """``_compute_scan_file_diff_lines`` is the helper that runs ``git diff
+    HEAD`` for ``scan_file`` and returns the changed-line set. It must fail
+    open on every error path so a broken git invocation never silences a
+    real finding."""
+
+    def test_no_git_root_returns_none(self):
+        # File outside any git repo → fail open (no filtering)
+        assert server._compute_scan_file_diff_lines(None, "/some/path/app.py") is None
+
+    def test_empty_diff_returns_none(self, tmp_path):
+        with patch("server.run_git_diff", return_value=("", False)):
+            result = server._compute_scan_file_diff_lines(str(tmp_path), str(tmp_path / "app.py"))
+        assert result is None
+
+    def test_git_error_returns_none_and_warns(self, tmp_path):
+        with patch("server.run_git_diff", side_effect=_ToolError("git boom")):
+            with patch("server.logger") as mock_logger:
+                result = server._compute_scan_file_diff_lines(
+                    str(tmp_path), str(tmp_path / "app.py")
+                )
+        assert result is None
+        mock_logger.warning.assert_called_once()
+
+    def test_returns_changed_lines_for_file(self, tmp_path):
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " ctx\n"
+            "+added\n"
+            " end\n"
+        )
+        with patch("server.run_git_diff", return_value=(diff, False)):
+            result = server._compute_scan_file_diff_lines(str(tmp_path), str(tmp_path / "app.py"))
+        assert result == {1, 2, 3}
+
+
+class TestScanFileEndToEndDiffScope:
+    """End-to-end test of the ``scan_file`` MCP tool with a real git repo:
+    pre-existing finding on an untouched line is filtered out, finding on a
+    user-touched line is kept."""
+
+    @pytest.mark.asyncio
+    async def test_pre_existing_secret_dropped_when_only_other_lines_changed(self, tmp_path):
+        import subprocess as _sp
+
+        # Set up a real git repo with a file containing a hardcoded secret
+        # on line 1, commit it, then touch only line 3.
+        _sp.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
+        _sp.run(
+            ["git", "config", "user.email", "t@t.com"],
+            cwd=str(tmp_path),
+            capture_output=True,
+            check=True,
+        )
+        _sp.run(
+            ["git", "config", "user.name", "T"],
+            cwd=str(tmp_path),
+            capture_output=True,
+            check=True,
+        )
+        f = tmp_path / "app.py"
+        f.write_text("PASSWORD = 'baked-in'\n# stable\nimport os\n")
+        _sp.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True, check=True)
+        _sp.run(
+            ["git", "commit", "-m", "init"],
+            cwd=str(tmp_path),
+            capture_output=True,
+            check=True,
+        )
+        # User touches line 3 (the import) — still a one-line change
+        f.write_text("PASSWORD = 'baked-in'\n# stable\nimport os, sys\n")
+
+        # Model reports the line-1 secret AND something on line 3 (the touched line)
+        raw_response = (
+            "```json\n["
+            '{"cwe": 798, "severity": "HIGH", "line": 1, '
+            '"explanation": "old-baked-in-secret", "has_secret": true, '
+            '"confidence": 0.9, "cwe_name": "Hardcoded", '
+            '"tainted_function_references": []},'
+            '{"cwe": 89, "severity": "HIGH", "line": 3, '
+            '"explanation": "new-issue-on-touched-line", "has_secret": false, '
+            '"confidence": 0.9, "cwe_name": "X", '
+            '"tainted_function_references": []}'
+            "]\n```"
+        )
+        with patch("server.call_appsec_api", return_value=raw_response):
+            report = await server.scan_file(str(f))
+
+        assert "new-issue-on-touched-line" in report
+        assert "old-baked-in-secret" not in report
+        assert "outside diff scope" in report
+
+    @pytest.mark.asyncio
+    async def test_outside_git_repo_no_filtering(self, tmp_path):
+        """File in a non-git directory → all findings pass through (fail open)."""
+        f = tmp_path / "app.py"
+        f.write_text("PASSWORD = 'x'\n")
+        raw_response = (
+            "```json\n["
+            '{"cwe": 798, "severity": "HIGH", "line": 1, '
+            '"explanation": "secret-here", "has_secret": true, '
+            '"confidence": 0.9, "cwe_name": "Hardcoded", '
+            '"tainted_function_references": []}'
+            "]\n```"
+        )
+        with patch("server.call_appsec_api", return_value=raw_response):
+            report = await server.scan_file(str(f))
+
+        assert "secret-here" in report
+        assert "outside diff scope" not in report
