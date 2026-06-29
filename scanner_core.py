@@ -249,8 +249,8 @@ def changed_lines_for_file(diff_text: str, file_path: str) -> set[int] | None:
 
     Returns ``None`` when ``file_path`` is not present in the diff at all —
     callers (``scan_file``) treat that as "no change → don't filter, fail open".
-    Returns an empty set when the file is in the diff but had only deletions,
-    which means no in-scope lines exist.
+    Returns an empty set when the file appears in the diff but contains no
+    added or context lines (e.g. pure-deletion hunks under ``-U0``).
     """
     line_map, changed_files = build_diff_line_map(diff_text)
     if file_path not in changed_files:

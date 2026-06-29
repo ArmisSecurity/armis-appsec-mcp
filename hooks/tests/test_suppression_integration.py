@@ -797,6 +797,25 @@ class TestComputeScanFileDiffLines:
             result = server._compute_scan_file_diff_lines(str(tmp_path), str(tmp_path / "app.py"))
         assert result == {1, 2, 3}
 
+    def test_truncated_diff_returns_none_and_warns(self, tmp_path):
+        # A truncated diff would yield an incomplete in-scope line set and
+        # silently drop real findings — must fail open.
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " ctx\n"
+            "+added\n"
+        )
+        with patch("server.run_git_diff", return_value=(diff, True)):
+            with patch("server.logger") as mock_logger:
+                result = server._compute_scan_file_diff_lines(
+                    str(tmp_path), str(tmp_path / "app.py")
+                )
+        assert result is None
+        mock_logger.warning.assert_called_once()
+
 
 class TestScanFileEndToEndDiffScope:
     """End-to-end test of the ``scan_file`` MCP tool with a real git repo:

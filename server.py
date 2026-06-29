@@ -487,17 +487,29 @@ def _compute_scan_file_diff_lines(git_root: str | None, resolved_path: str) -> s
         rel_path = os.path.relpath(resolved_path, git_root)
     except ValueError:
         return None  # different drives on Windows etc.
+    # git diff emits paths with forward slashes regardless of platform, so
+    # normalize here for Windows where os.sep is '\\'. Same approach as
+    # suppression.is_path_excluded.
+    rel_path = rel_path.replace(os.sep, "/")
     try:
         # context_lines=0 so only user-touched (+) lines count as in-scope.
         # The default U=10 would mark every neighbor line as "changed" and
         # defeat the filter for small files.
-        diff_text, _truncated = run_git_diff(
+        diff_text, truncated = run_git_diff(
             repo_path=git_root, ref="HEAD", paths=[rel_path], context_lines=0
         )
     except ToolError as e:
         logger.warning("scan_file: git diff failed for %s: %s", resolved_path, e)
         return None
     if not diff_text:
+        return None
+    if truncated:
+        # An incomplete diff would yield an incomplete in-scope line set and
+        # silently drop real findings. Fail open instead.
+        logger.warning(
+            "scan_file: diff for %s exceeded size limit; falling open (no scoping)",
+            resolved_path,
+        )
         return None
     return changed_lines_for_file(diff_text, rel_path)
 
