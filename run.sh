@@ -22,7 +22,19 @@ elif [ -n "$REQS_HASH" ]; then
     fi
 fi
 
+# Also reinstall if the venv's Python is broken (e.g. pyenv version switch, Homebrew upgrade).
+# Running `python -c ""` is a cheap probe — it fails if the interpreter binary is gone/stale.
+if [ "$NEEDS_INSTALL" -eq 0 ] && [ -f "$VENV_DIR/bin/python" ]; then
+    if ! "$VENV_DIR/bin/python" -c "" >/dev/null 2>&1; then
+        NEEDS_INSTALL=1
+    fi
+fi
+
 if [ "$NEEDS_INSTALL" -eq 1 ]; then
+    # Remove existing venv entirely before recreating — re-running venv against an existing
+    # directory with a different Python grafts a second lib/pythonX.Y tree while leaving
+    # bin/python pointing at the original, causing ModuleNotFoundError at runtime.
+    rm -rf "$VENV_DIR"
     python3 -m venv "$VENV_DIR" || { echo "ERROR: python3 -m venv failed. Is python3 installed?" >&2; exit 1; }
     "$VENV_DIR/bin/pip" install -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
     if [ -n "$REQS_HASH" ]; then
