@@ -1,9 +1,21 @@
 """
-JWT authentication provider for the AppSec MCP plugin.
+Authentication provider for the AppSec MCP plugin.
 
-Exchanges ARMIS_CLIENT_ID / ARMIS_CLIENT_SECRET for a short-lived Bearer
-token via POST /api/v1/auth/token (same flow as armis-cli).  Token is cached
-in memory and refreshed automatically when within 5 minutes of expiry.
+Supports two credential paths, resolved in ``init_auth``:
+
+1. **Client credentials** (``JWTAuth``): exchange ARMIS_CLIENT_ID /
+   ARMIS_CLIENT_SECRET for a short-lived Bearer token via
+   POST /api/v1/auth/token (same flow as armis-cli). Token cached in memory,
+   refreshed within 5 minutes of expiry. This path is unchanged and takes
+   priority when both env vars are set (backward compatible).
+
+2. **Shared token cache + Device Auth** (``SharedCacheAuth``, defined in
+   ``shared_cache_auth.py``): when no client credentials are configured, reuse
+   the OAuth2 tokens armis-cli caches in ``~/.armis/.sessions`` (populated by
+   ``armis-cli auth login`` or by this plugin's own RFC 8628 device flow).
+   Access tokens are refreshed via the refresh-token grant; a fully-empty cache
+   triggers an interactive browser login (needs ARMIS_TENANT_ID). See
+   ``shared_cache_auth`` / ``token_cache`` / ``device_auth``.
 """
 
 import base64
@@ -14,6 +26,18 @@ import time
 import urllib.parse
 
 import httpx
+
+from shared_cache_auth import SharedCacheAuth
+from token_cache import issuer_from_api_url
+
+__all__ = [
+    "JWTAuth",
+    "SharedCacheAuth",
+    "init_auth",
+    "get_auth_header",
+    "get_auth_status",
+    "get_auth_method",
+]
 
 logger = logging.getLogger("appsec-mcp")
 
@@ -152,26 +176,35 @@ class JWTAuth:
 # Module-level singleton
 # ======================================================================
 
-_auth: JWTAuth | None = None
+_auth: JWTAuth | SharedCacheAuth | None = None
 
 
 def init_auth(api_url: str) -> None:
-    """Initialize JWT auth from environment variables.  Call once at startup."""
+    """Resolve the auth provider from the environment.  Call once at startup.
+
+    Priority (see module docstring):
+      * both ARMIS_CLIENT_ID + ARMIS_CLIENT_SECRET set -> client-credentials
+        (``JWTAuth``), unchanged and fully backward compatible;
+      * exactly one set -> a clear partial-configuration error;
+      * neither set -> shared token cache + Device Auth (``SharedCacheAuth``),
+        constructed lazily (no disk/network here -- the device flow only runs on
+        the first scan that needs it).
+    """
     global _auth
 
     client_id = os.environ.get("ARMIS_CLIENT_ID", "")
     client_secret = os.environ.get("ARMIS_CLIENT_SECRET", "")
 
-    if not client_id and not client_secret:
-        raise RuntimeError(
-            "No auth credentials configured. Set ARMIS_CLIENT_ID and ARMIS_CLIENT_SECRET."
-        )
-    if not client_id:
-        raise RuntimeError("ARMIS_CLIENT_ID is not set (ARMIS_CLIENT_SECRET is set).")
-    if not client_secret:
+    if client_id and client_secret:
+        _auth = JWTAuth(api_url, client_id)
+        return
+    if client_id and not client_secret:
         raise RuntimeError("ARMIS_CLIENT_SECRET is not set (ARMIS_CLIENT_ID is set).")
+    if client_secret and not client_id:
+        raise RuntimeError("ARMIS_CLIENT_ID is not set (ARMIS_CLIENT_SECRET is set).")
 
-    _auth = JWTAuth(api_url, client_id)
+    # No client credentials -> shared cache / Device Auth fallback.
+    _auth = SharedCacheAuth(issuer_from_api_url(api_url))
 
 
 def get_auth_header() -> str:
@@ -186,3 +219,12 @@ def get_auth_status() -> str:
     if _auth is None:
         return "not initialized"
     return _auth.status()
+
+
+def get_auth_method() -> str:
+    """Return the credential path in use, for debug_config."""
+    if _auth is None:
+        return "not initialized"
+    if isinstance(_auth, JWTAuth):
+        return "client-credentials"
+    return "shared-cache/SSO"

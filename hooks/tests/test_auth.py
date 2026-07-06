@@ -14,8 +14,18 @@ _plugin_dir = os.path.join(os.path.dirname(__file__), "..", "..")
 if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
 
+from datetime import UTC
+
 import auth
-from auth import JWTAuth, get_auth_header, get_auth_status, init_auth
+from auth import JWTAuth, SharedCacheAuth, get_auth_header, get_auth_status, init_auth
+from device_auth import DeviceAuthorization, OAuthError
+from token_cache import StoredToken, TokenStore
+
+
+def _future(seconds: int = 3600):
+    from datetime import datetime, timedelta
+
+    return datetime.now(UTC) + timedelta(seconds=seconds)
 
 
 def _make_jwt(exp: float = None, extra_claims: dict = None) -> str:
@@ -45,11 +55,21 @@ class TestInitAuth:
         init_auth("https://example.com/api/v1")
         assert auth._auth is not None
 
-    def test_error_when_nothing_set(self, monkeypatch):
+    def test_no_creds_builds_shared_cache_auth(self, monkeypatch):
+        # PPSC-1038: with no client credentials, init_auth now falls back to the
+        # shared token cache / Device Auth provider (lazy — no disk/network here).
         monkeypatch.delenv("ARMIS_CLIENT_ID", raising=False)
         monkeypatch.delenv("ARMIS_CLIENT_SECRET", raising=False)
-        with pytest.raises(RuntimeError, match="No auth credentials"):
-            init_auth("https://example.com/api/v1")
+        init_auth("https://example.com/api/v1")
+        assert isinstance(auth._auth, auth.SharedCacheAuth)
+        assert auth.get_auth_method() == "shared-cache/SSO"
+
+    def test_both_creds_uses_jwt_auth(self, monkeypatch):
+        monkeypatch.setenv("ARMIS_CLIENT_ID", "test-id")
+        monkeypatch.setenv("ARMIS_CLIENT_SECRET", "test-secret")
+        init_auth("https://example.com/api/v1")
+        assert isinstance(auth._auth, JWTAuth)
+        assert auth.get_auth_method() == "client-credentials"
 
     def test_error_when_only_client_id(self, monkeypatch):
         monkeypatch.setenv("ARMIS_CLIENT_ID", "test-id")
@@ -291,3 +311,134 @@ class TestExchangeNonJsonResponse:
         with patch("auth.httpx.post", return_value=mock_response):
             with pytest.raises(RuntimeError, match="invalid response"):
                 jwt_auth.exchange()
+
+
+# ---------------------------------------------------------------------------
+# SharedCacheAuth (PPSC-1038): shared token cache + Device Auth fallback
+# ---------------------------------------------------------------------------
+class TestSharedCacheAuth:
+    ISSUER = "https://moose.armis.com"
+
+    def _make(self, tmp_path):
+        """Build a SharedCacheAuth backed by an isolated store (never real ~/.armis)."""
+        store = TokenStore(dir=str(tmp_path))
+        return SharedCacheAuth(self.ISSUER, store=store), store
+
+    def test_valid_cached_token_used_without_network(self, tmp_path):
+        provider, store = self._make(tmp_path)
+        store.save(self.ISSUER, StoredToken(access_token="cached", expires_at=_future()))
+
+        with patch("device_auth.httpx.post") as mock_post:
+            header = provider.get_header()
+
+        assert header == "Bearer cached"
+        mock_post.assert_not_called()
+
+    def test_in_memory_token_reused(self, tmp_path):
+        provider, store = self._make(tmp_path)
+        store.save(self.ISSUER, StoredToken(access_token="cached", expires_at=_future()))
+        provider.get_header()  # loads into memory
+        # Remove from disk; the in-memory copy should still serve.
+        store.save(self.ISSUER, StoredToken(access_token="", refresh_token=""))
+        assert provider.get_header() == "Bearer cached"
+
+    def test_expired_token_with_refresh_refreshes_and_persists(self, tmp_path):
+        provider, store = self._make(tmp_path)
+        store.save(
+            self.ISSUER,
+            StoredToken(
+                access_token="old",
+                refresh_token="r1",
+                expires_at=_future(-100),  # expired
+                tenant_id="t",
+                client_id="armis-cli",
+            ),
+        )
+        rotated = StoredToken(access_token="new", refresh_token="r2", expires_at=_future())
+
+        with patch.object(provider._device, "refresh", return_value=rotated) as mock_refresh:
+            header = provider.get_header()
+
+        assert header == "Bearer new"
+        mock_refresh.assert_called_once_with("r1", "armis-cli")
+        # Rotated pair persisted to the shared cache.
+        persisted = store.load(self.ISSUER)
+        assert persisted.refresh_token == "r2"
+        # Identity carried forward when the refresh response omitted it.
+        assert persisted.tenant_id == "t"
+
+    def test_refresh_invalid_grant_falls_back_to_device_login(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        provider, store = self._make(tmp_path)
+        store.save(
+            self.ISSUER,
+            StoredToken(access_token="old", refresh_token="r1", expires_at=_future(-100)),
+        )
+        da = DeviceAuthorization("dc", "UC", "https://v", "https://v?c=UC", 600, 5)
+        fresh = StoredToken(access_token="fresh", refresh_token="rn", expires_at=_future())
+
+        with (
+            patch.object(provider._device, "refresh", side_effect=OAuthError("invalid_grant")),
+            patch.object(provider._device, "request_device_code", return_value=da),
+            patch.object(provider._device, "poll_token", return_value=fresh),
+            patch("shared_cache_auth.open_browser", return_value=False),
+        ):
+            header = provider.get_header()
+
+        assert header == "Bearer fresh"
+        assert store.load(self.ISSUER).access_token == "fresh"
+
+    def test_empty_cache_without_tenant_raises(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ARMIS_TENANT_ID", raising=False)
+        provider, _ = self._make(tmp_path)
+        with pytest.raises(RuntimeError, match="ARMIS_TENANT_ID"):
+            provider.get_header()
+
+    def test_empty_cache_with_tenant_runs_device_flow(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        provider, store = self._make(tmp_path)
+        da = DeviceAuthorization("dc", "UC", "https://v", "https://v?c=UC", 600, 5)
+        fresh = StoredToken(access_token="fresh", refresh_token="rn", expires_at=_future())
+
+        with (
+            patch.object(provider._device, "request_device_code", return_value=da) as mock_req,
+            patch.object(provider._device, "poll_token", return_value=fresh) as mock_poll,
+            patch("shared_cache_auth.open_browser", return_value=True),
+        ):
+            header = provider.get_header()
+
+        assert header == "Bearer fresh"
+        mock_req.assert_called_once()
+        mock_poll.assert_called_once()
+        assert store.load(self.ISSUER).access_token == "fresh"
+
+    def test_device_flow_uses_public_client_id(self, tmp_path, monkeypatch):
+        # The device flow is a public client (no secret); it identifies with the
+        # hardcoded public client_id armis-cli defaults to, not a per-install env var.
+        from device_auth import DEFAULT_DEVICE_CLIENT_ID
+
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        provider, _ = self._make(tmp_path)
+        da = DeviceAuthorization("dc", "UC", "https://v", "https://v?c=UC", 600, 5)
+        fresh = StoredToken(access_token="fresh", expires_at=_future())
+
+        with (
+            patch.object(provider._device, "request_device_code", return_value=da) as mock_req,
+            patch.object(provider._device, "poll_token", return_value=fresh),
+            patch("shared_cache_auth.open_browser", return_value=False),
+        ):
+            provider.get_header()
+
+        assert mock_req.call_args.args[0] == DEFAULT_DEVICE_CLIENT_ID
+
+    def test_status_labels_are_token_free(self, tmp_path):
+        provider, store = self._make(tmp_path)
+        assert provider.status() == "shared cache: not signed in"
+
+        store.save(
+            self.ISSUER, StoredToken(access_token="a-secret-token", expires_at=_future(1800))
+        )
+        provider._token = None  # force reload from disk
+        status = provider.status()
+        assert "valid" in status
+        assert "a-secret-token" not in status

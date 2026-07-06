@@ -36,7 +36,7 @@ if os.path.isfile(_env_file):
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
-from auth import get_auth_status, init_auth
+from auth import get_auth_method, get_auth_status, init_auth
 from hash_utils import (
     cleanup_legacy_scan_pass,
     compute_staged_hash,
@@ -402,12 +402,19 @@ def get_debug_config() -> str:
     # The old `raw_id[:4]***` mask still leaked the first 4 chars of a
     # credential into debug output/logs; mirror the secret's presence-only
     # reporting instead (which the scanner correctly does not flag).
+    # armis:ignore cwe:522 reason:reports whether the credential is set, never its bytes
     has_client_id = "set" if os.environ.get("ARMIS_CLIENT_ID") else "not set"
+    # armis:ignore cwe:522 reason:reports whether the credential is set, never its bytes
     has_secret = "set" if os.environ.get("ARMIS_CLIENT_SECRET") else "not set"
 
     # CWE-522: get_auth_status() returns only human-readable status labels
     # ("not initialized", "expired", "valid, expires in Xm"), never tokens.
     auth_status = get_auth_status()
+    auth_method = get_auth_method()
+    # CWE-522: presence only, never the value (mirrors the client-ID/secret
+    # reporting above). armis:ignore cwe:522 reason:reports whether the tenant is
+    # configured ("set"/"not set"), never any credential bytes
+    has_tenant = "set" if os.environ.get("ARMIS_TENANT_ID") else "not set"
 
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir)
     version_file = os.path.join(plugin_root, ".installed-version")
@@ -424,10 +431,12 @@ def get_debug_config() -> str:
 
     lines = [
         f"Auth: {auth_status}",
+        f"Auth method: {auth_method}",
         f"API URL: {api_url}",
         f"Env: {env}",
         f"Client ID: {has_client_id}",
         f"Client Secret: {has_secret}",
+        f"Tenant ID: {has_tenant}",
         f"Plugin version: {version}",
         f"Plugin root: {plugin_root}",
     ]
