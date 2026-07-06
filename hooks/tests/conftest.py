@@ -22,6 +22,49 @@ if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
 
 
+# A directory guaranteed to exist for the whole session — the repo root that
+# holds this conftest. Used to restore CWD after tests that chdir into a
+# temp/worktree dir which is then deleted while still current.
+_STABLE_CWD = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _repair_dangling_cwd():
+    """If the process CWD no longer exists, restore one that does."""
+    try:
+        os.getcwd()
+    except (FileNotFoundError, OSError):
+        os.chdir(_STABLE_CWD)
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_report_teststatus(report, config):
+    """Repair a dangling CWD around status reporting.
+
+    Many tests chdir into a tmp_path/worktree and let it be torn down while it
+    is still the process CWD (e.g. a `finally` that runs `git worktree remove`,
+    or a `TemporaryDirectory` that exits — monkeypatch.chdir only restores CWD at
+    fixture teardown, which is too late). The subsequent os.getcwd() then raises
+    FileNotFoundError.
+
+    Plain CLI pytest never calls getcwd() at this point, so the suite passes from
+    the terminal. But the VSCode pytest plugin implements pytest_report_teststatus
+    as a *hookwrapper* whose teardown (post-yield) calls pathlib.Path.cwd(); with a
+    dangling CWD that raises inside pluggy and crashes the whole run with an
+    INTERNALERROR, so every later test shows up skipped/grey.
+
+    A plain tryfirst hook is not enough — a hookwrapper's teardown runs *after* all
+    plain hooks, so the crash happens before we could react. We must be a wrapper
+    too, and (tryfirst) the OUTERMOST one, so we repair the CWD before yielding to
+    the inner wrappers and again after they return — bracketing the plugin's
+    Path.cwd() call on both sides.
+    """
+    _repair_dangling_cwd()
+    try:
+        return (yield)
+    finally:
+        _repair_dangling_cwd()
+
+
 @pytest.fixture
 def isolated_server_scan_pass(tmp_path, monkeypatch):
     """Redirect server.py's scan-pass writes into tmp_path for in-process tests.
