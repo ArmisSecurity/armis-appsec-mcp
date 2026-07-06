@@ -14,6 +14,7 @@ build/
 # Plugin runtime
 .scan-pass
 .deps-installed
+.in_use/
 
 # IDE
 .vscode/
