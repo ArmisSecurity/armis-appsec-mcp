@@ -521,3 +521,82 @@ class TestCallAppsecApiHappyPath:
             assert result == "```json\n[]\n```"
         finally:
             scanner_core.APPSEC_API_URL = original_url
+
+
+# ---------------------------------------------------------------------------
+# call_appsec_api 401 re-auth + retry
+# ---------------------------------------------------------------------------
+class TestCallAppsecApi401Retry:
+    def _resp(self, status, raw="```json\n[]\n```"):
+        r = MagicMock()
+        r.status_code = status
+        r.json.return_value = {"raw_response": raw}
+        r.raise_for_status = MagicMock()
+        return r
+
+    def test_401_invalidates_and_retries_once_then_succeeds(self):
+        import scanner_core
+
+        original_url = scanner_core.APPSEC_API_URL
+        try:
+            scanner_core.APPSEC_API_URL = "https://moose.armis.com/api/v1"
+            responses = [self._resp(401), self._resp(200)]
+
+            with (
+                patch("scanner_core.get_auth_header", return_value="Bearer t"),
+                patch("scanner_core.invalidate_auth") as mock_invalidate,
+                patch("scanner_core.httpx.post", side_effect=responses) as mock_post,
+            ):
+                result = scanner_core.call_appsec_api("code")
+
+            assert result == "```json\n[]\n```"
+            mock_invalidate.assert_called_once()  # session dropped before retry
+            assert mock_post.call_count == 2  # retried exactly once
+
+        finally:
+            scanner_core.APPSEC_API_URL = original_url
+
+    def test_persistent_401_raises_after_single_retry(self):
+        import httpx
+
+        import scanner_core
+
+        original_url = scanner_core.APPSEC_API_URL
+        try:
+            scanner_core.APPSEC_API_URL = "https://moose.armis.com/api/v1"
+            second = self._resp(401)
+            second.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "Unauthorized", request=MagicMock(), response=second
+            )
+
+            with (
+                patch("scanner_core.get_auth_header", return_value="Bearer t"),
+                patch("scanner_core.invalidate_auth") as mock_invalidate,
+                patch(
+                    "scanner_core.httpx.post", side_effect=[self._resp(401), second]
+                ) as mock_post,
+            ):
+                with pytest.raises(httpx.HTTPStatusError):
+                    scanner_core.call_appsec_api("code")
+
+            assert mock_post.call_count == 2  # one retry, no infinite loop
+            mock_invalidate.assert_called_once()
+
+        finally:
+            scanner_core.APPSEC_API_URL = original_url
+
+    def test_no_invalidate_on_success(self):
+        import scanner_core
+
+        original_url = scanner_core.APPSEC_API_URL
+        try:
+            scanner_core.APPSEC_API_URL = "https://moose.armis.com/api/v1"
+            with (
+                patch("scanner_core.get_auth_header", return_value="Bearer t"),
+                patch("scanner_core.invalidate_auth") as mock_invalidate,
+                patch("scanner_core.httpx.post", return_value=self._resp(200)),
+            ):
+                scanner_core.call_appsec_api("code")
+            mock_invalidate.assert_not_called()
+        finally:
+            scanner_core.APPSEC_API_URL = original_url

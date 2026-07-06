@@ -49,6 +49,11 @@ class TestInitAuth:
         """Reset module singleton before each test."""
         auth._auth = None
 
+    @pytest.fixture(autouse=True)
+    def _no_sso_by_default(self, monkeypatch):
+        # Most cases assume the SSO opt-in is NOT set; SSO-specific tests set it.
+        monkeypatch.delenv("ARMIS_DEFAULT_AUTH_METHOD", raising=False)
+
     def test_success_with_both_credentials(self, monkeypatch):
         monkeypatch.setenv("ARMIS_CLIENT_ID", "test-id")
         monkeypatch.setenv("ARMIS_CLIENT_SECRET", "test-secret")
@@ -82,6 +87,31 @@ class TestInitAuth:
         monkeypatch.setenv("ARMIS_CLIENT_SECRET", "test-secret")
         with pytest.raises(RuntimeError, match="ARMIS_CLIENT_ID is not set"):
             init_auth("https://example.com/api/v1")
+
+    def test_sso_opt_in_forces_shared_cache(self, monkeypatch):
+        # ARMIS_DEFAULT_AUTH_METHOD=sso selects the shared-cache / Device Auth path.
+        monkeypatch.setenv("ARMIS_DEFAULT_AUTH_METHOD", "sso")
+        monkeypatch.delenv("ARMIS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("ARMIS_CLIENT_SECRET", raising=False)
+        init_auth("https://example.com/api/v1")
+        assert isinstance(auth._auth, auth.SharedCacheAuth)
+
+    def test_sso_opt_in_overrides_client_credentials(self, monkeypatch):
+        # SSO opt-in wins even when client credentials are present.
+        monkeypatch.setenv("ARMIS_DEFAULT_AUTH_METHOD", "SSO")  # case-insensitive
+        monkeypatch.setenv("ARMIS_CLIENT_ID", "test-id")
+        monkeypatch.setenv("ARMIS_CLIENT_SECRET", "test-secret")
+        init_auth("https://example.com/api/v1")
+        assert isinstance(auth._auth, auth.SharedCacheAuth)
+        assert auth.get_auth_method() == "shared-cache/SSO"
+
+    def test_sso_opt_in_ignores_partial_client_credentials(self, monkeypatch):
+        # A stray ARMIS_CLIENT_ID must not raise a partial-config error under SSO.
+        monkeypatch.setenv("ARMIS_DEFAULT_AUTH_METHOD", "sso")
+        monkeypatch.setenv("ARMIS_CLIENT_ID", "test-id")
+        monkeypatch.delenv("ARMIS_CLIENT_SECRET", raising=False)
+        init_auth("https://example.com/api/v1")
+        assert isinstance(auth._auth, auth.SharedCacheAuth)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +240,27 @@ class TestJWTAuthGetHeader:
         assert header == f"Bearer {new_token}"
         mock_post.assert_called_once()
 
+    def test_invalidate_forces_reexchange(self):
+        # After a 401, invalidate() drops the cached token so the next call
+        # re-exchanges credentials even though the old token hadn't expired.
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        jwt_auth._token = "killed-token"
+        jwt_auth._expires_at = time.time() + 3600  # still valid locally
+
+        jwt_auth.invalidate()
+        assert jwt_auth._token is None
+
+        new_token = _make_jwt(exp=time.time() + 3600)
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"token": new_token, "region": "us1"}
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("auth.httpx.post", return_value=mock_response) as mock_post:
+            header = jwt_auth.get_header()
+
+        assert header == f"Bearer {new_token}"
+        mock_post.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # JWTAuth._parse_jwt_exp
@@ -254,6 +305,12 @@ class TestParseJWTExp:
 class TestModuleFunctions:
     def setup_method(self):
         auth._auth = None
+
+    @pytest.fixture(autouse=True)
+    def _no_sso_by_default(self, monkeypatch):
+        # Hermetic: a shell-exported ARMIS_DEFAULT_AUTH_METHOD=sso must not steer
+        # the client-credentials path this class exercises.
+        monkeypatch.delenv("ARMIS_DEFAULT_AUTH_METHOD", raising=False)
 
     def test_get_auth_header_before_init_raises(self):
         with pytest.raises(RuntimeError, match="not initialized"):
@@ -442,3 +499,53 @@ class TestSharedCacheAuth:
         status = provider.status()
         assert "valid" in status
         assert "a-secret-token" not in status
+
+    def test_invalidate_rejects_killed_token_and_reauths(self, tmp_path, monkeypatch):
+        # A locally-valid token that the server killed (401): after invalidate(),
+        # the same cached token must NOT be reused — re-auth (refresh) instead.
+        provider, store = self._make(tmp_path)
+        store.save(
+            self.ISSUER,
+            StoredToken(
+                access_token="killed",
+                refresh_token="r1",
+                expires_at=_future(1800),  # still valid locally
+                client_id="armis-cli",
+            ),
+        )
+        assert provider.get_header() == "Bearer killed"
+
+        provider.invalidate()  # scan came back 401
+
+        rotated = StoredToken(access_token="new", refresh_token="r2", expires_at=_future())
+        with patch.object(provider._device, "refresh", return_value=rotated) as mock_refresh:
+            header = provider.get_header()
+
+        assert header == "Bearer new"  # did NOT hand back the killed token
+        mock_refresh.assert_called_once_with("r1", "armis-cli")
+
+    def test_invalidate_skips_killed_token_even_when_reloaded_from_disk(
+        self, tmp_path, monkeypatch
+    ):
+        # The killed token is still on disk and unexpired; invalidate() must keep
+        # _ensure_access_token from re-selecting it (no infinite 401 loop).
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        provider, store = self._make(tmp_path)
+        store.save(
+            self.ISSUER,
+            StoredToken(access_token="killed", expires_at=_future(1800)),  # no refresh token
+        )
+        assert provider.get_header() == "Bearer killed"
+
+        provider.invalidate()
+
+        da = DeviceAuthorization("dc", "UC", "https://v", "https://v?c=UC", 600, 5)
+        fresh = StoredToken(access_token="fresh", expires_at=_future())
+        with (
+            patch.object(provider._device, "request_device_code", return_value=da),
+            patch.object(provider._device, "poll_token", return_value=fresh),
+            patch("shared_cache_auth.open_browser", return_value=False),
+        ):
+            header = provider.get_header()
+
+        assert header == "Bearer fresh"  # fell through to device login, not the killed token

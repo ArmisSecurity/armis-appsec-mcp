@@ -51,6 +51,10 @@ class SharedCacheAuth:
         self._store = store if store is not None else TokenStore()
         self._device = DeviceClient(issuer)
         self._token: StoredToken | None = None
+        # Access tokens the server rejected (401). A token can be unexpired
+        # locally yet killed server-side (session revoked/logged out), so we
+        # must not keep handing it back from the in-memory or on-disk cache.
+        self._rejected: set[str] = set()
 
     # ------------------------------------------------------------------
     # Token lifecycle
@@ -59,16 +63,33 @@ class SharedCacheAuth:
         """Return 'Bearer <token>', resolving/refreshing/logging-in as needed."""
         return f"Bearer {self._ensure_access_token()}"
 
+    def invalidate(self) -> None:
+        """Mark the last-issued access token as bad so the next call re-auths.
+
+        Called after the scan API rejects the token with 401: the session was
+        expired or revoked server-side even though the token looked valid
+        locally. Recording it in ``_rejected`` forces ``_ensure_access_token``
+        past the in-memory/cache hits into refresh → device login, and prevents
+        an infinite loop of re-reading the same dead token from ``.sessions``.
+        """
+        if self._token is not None and self._token.access_token:
+            self._rejected.add(self._token.access_token)
+        self._token = None
+
+    def _usable(self, token: StoredToken | None) -> bool:
+        """True when ``token`` is present, unexpired, and not server-rejected."""
+        return token is not None and token.is_valid() and token.access_token not in self._rejected
+
     def _ensure_access_token(self) -> str:
-        # 1. In-memory token still valid.
-        if self._token is not None and self._token.is_valid():
-            return self._token.access_token
+        # 1. In-memory token still valid (and not rejected).
+        if self._usable(self._token):
+            return self._token.access_token  # type: ignore[union-attr]
 
         # 2. Load from the shared cache.
         cached = self._store.load(self._issuer)
-        if cached is not None and cached.is_valid():
+        if self._usable(cached):
             self._token = cached
-            return cached.access_token
+            return cached.access_token  # type: ignore[union-attr]
 
         # 3. Refresh if we have a refresh token (from cache or memory).
         refresh_source = cached or self._token

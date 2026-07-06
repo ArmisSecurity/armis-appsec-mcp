@@ -10,11 +10,13 @@ Supports two credential paths, resolved in ``init_auth``:
    priority when both env vars are set (backward compatible).
 
 2. **Shared token cache + Device Auth** (``SharedCacheAuth``, defined in
-   ``shared_cache_auth.py``): when no client credentials are configured, reuse
-   the OAuth2 tokens armis-cli caches in ``~/.armis/.sessions`` (populated by
-   ``armis-cli auth login`` or by this plugin's own RFC 8628 device flow).
-   Access tokens are refreshed via the refresh-token grant; a fully-empty cache
-   triggers an interactive browser login (needs ARMIS_TENANT_ID). See
+   ``shared_cache_auth.py``): when no client credentials are configured (or when
+   ARMIS_DEFAULT_AUTH_METHOD=sso is set, which forces this path regardless of
+   any client credentials), reuse the OAuth2 tokens armis-cli caches in
+   ``~/.armis/.sessions`` (populated by ``armis-cli auth login`` or by this
+   plugin's own RFC 8628 device flow). Access tokens are refreshed via the
+   refresh-token grant; a fully-empty cache triggers an interactive browser
+   login (needs ARMIS_TENANT_ID). See
    ``shared_cache_auth`` / ``token_cache`` / ``device_auth``.
 """
 
@@ -37,6 +39,7 @@ __all__ = [
     "get_auth_header",
     "get_auth_status",
     "get_auth_method",
+    "invalidate_auth",
 ]
 
 logger = logging.getLogger("appsec-mcp")
@@ -126,6 +129,15 @@ class JWTAuth:
             self.exchange()
         return f"Bearer {self._token}"
 
+    def invalidate(self) -> None:
+        """Drop the cached token so the next call re-exchanges credentials.
+
+        Called after the scan API rejects the token with 401 (e.g. the token was
+        revoked server-side before its local expiry).
+        """
+        self._token = None
+        self._expires_at = 0.0
+
     # ------------------------------------------------------------------
     # JWT payload parsing
     #
@@ -179,18 +191,38 @@ class JWTAuth:
 _auth: JWTAuth | SharedCacheAuth | None = None
 
 
+def _sso_requested() -> bool:
+    """True when the user opted into SSO via ARMIS_DEFAULT_AUTH_METHOD=sso.
+
+    Case-insensitive, whitespace-tolerant, matching armis-cli's
+    ``shouldAutoLoginSSO``.
+    """
+    return os.environ.get("ARMIS_DEFAULT_AUTH_METHOD", "").strip().lower() == "sso"
+
+
 def init_auth(api_url: str) -> None:
     """Resolve the auth provider from the environment.  Call once at startup.
 
     Priority (see module docstring):
+      * ARMIS_DEFAULT_AUTH_METHOD=sso -> force the shared token cache + Device
+        Auth path (``SharedCacheAuth``), even if client credentials are set.
+        This is an explicit SSO opt-in, so client credentials are ignored;
       * both ARMIS_CLIENT_ID + ARMIS_CLIENT_SECRET set -> client-credentials
         (``JWTAuth``), unchanged and fully backward compatible;
       * exactly one set -> a clear partial-configuration error;
-      * neither set -> shared token cache + Device Auth (``SharedCacheAuth``),
-        constructed lazily (no disk/network here -- the device flow only runs on
-        the first scan that needs it).
+      * neither set -> shared token cache + Device Auth (``SharedCacheAuth``).
+
+    ``SharedCacheAuth`` is constructed lazily (no disk/network here -- it reuses
+    a cached token silently, refreshes it, or runs the browser device flow only
+    on the first scan that actually needs auth).
     """
     global _auth
+
+    # Explicit SSO opt-in wins over everything: the only credential path is the
+    # shared cache / Device Auth (matches armis-cli ARMIS_DEFAULT_AUTH_METHOD=SSO).
+    if _sso_requested():
+        _auth = SharedCacheAuth(issuer_from_api_url(api_url))
+        return
 
     client_id = os.environ.get("ARMIS_CLIENT_ID", "")
     client_secret = os.environ.get("ARMIS_CLIENT_SECRET", "")
@@ -212,6 +244,18 @@ def get_auth_header() -> str:
     if _auth is None:
         raise RuntimeError("Auth not initialized. Call init_auth() first.")
     return _auth.get_header()
+
+
+def invalidate_auth() -> None:
+    """Invalidate the current token so the next ``get_auth_header`` re-authenticates.
+
+    Called by the scan path on an HTTP 401: the token the server rejected was
+    accepted locally (unexpired) but the session was expired or revoked
+    server-side, so it must be discarded and re-acquired (re-exchange for
+    ``JWTAuth``; refresh or device login for ``SharedCacheAuth``).
+    """
+    if _auth is not None:
+        _auth.invalidate()
 
 
 def get_auth_status() -> str:
