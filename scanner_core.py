@@ -15,7 +15,7 @@ import urllib.parse
 
 import httpx
 
-from auth import get_auth_header
+from auth import get_auth_header, invalidate_auth
 
 logger = logging.getLogger("appsec-mcp")
 
@@ -43,21 +43,37 @@ SCAN_MODE = "fast"
 # API call
 # ---------------------------------------------------------------------------
 def call_appsec_api(code: str) -> str:
-    """Send code to the AppSec scanning API and return raw LLM response."""
+    """Send code to the AppSec scanning API and return raw LLM response.
+
+    On an HTTP 401 the token is invalidated and the request retried once: a
+    cached token can pass local expiry checks yet be rejected server-side
+    (session revoked/logged out), so we re-authenticate (re-exchange, refresh,
+    or device login) rather than fail the scan. A second 401 propagates.
+    """
     url = f"{APPSEC_API_URL.rstrip('/')}/scan/fast"
 
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" and parsed.hostname not in _LOCALHOST_HOSTS:
         raise RuntimeError("APPSEC_API_URL must use HTTPS (except localhost).")
 
-    response = httpx.post(
-        url,
-        json={"code": code, "mode": SCAN_MODE},
-        headers={"Authorization": get_auth_header()},
-        timeout=120.0,
-    )
-    response.raise_for_status()
-    return response.json()["raw_response"]
+    for attempt in range(2):
+        response = httpx.post(
+            url,
+            json={"code": code, "mode": SCAN_MODE},
+            headers={"Authorization": get_auth_header()},
+            timeout=120.0,
+        )
+        if response.status_code == 401 and attempt == 0:
+            # Token rejected server-side (expired/revoked session) despite
+            # passing local checks. Drop it and re-authenticate, then retry once.
+            logger.info("Scan API returned 401; re-authenticating and retrying once.")
+            invalidate_auth()
+            continue
+        response.raise_for_status()
+        return response.json()["raw_response"]
+
+    # Unreachable: the loop either returns or raises. Satisfies the type checker.
+    raise RuntimeError("Scan authentication failed after retry.")
 
 
 def parse_findings(raw: str) -> list[dict]:

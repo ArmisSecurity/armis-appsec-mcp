@@ -1,9 +1,23 @@
 """
-JWT authentication provider for the AppSec MCP plugin.
+Authentication provider for the AppSec MCP plugin.
 
-Exchanges ARMIS_CLIENT_ID / ARMIS_CLIENT_SECRET for a short-lived Bearer
-token via POST /api/v1/auth/token (same flow as armis-cli).  Token is cached
-in memory and refreshed automatically when within 5 minutes of expiry.
+Supports two credential paths, resolved in ``init_auth``:
+
+1. **Client credentials** (``JWTAuth``): exchange ARMIS_CLIENT_ID /
+   ARMIS_CLIENT_SECRET for a short-lived Bearer token via
+   POST /api/v1/auth/token (same flow as armis-cli). Token cached in memory,
+   refreshed within 5 minutes of expiry. This path is unchanged and takes
+   priority when both env vars are set (backward compatible).
+
+2. **Shared token cache + Device Auth** (``SharedCacheAuth``, defined in
+   ``shared_cache_auth.py``): when no client credentials are configured (or when
+   ARMIS_DEFAULT_AUTH_METHOD=sso is set, which forces this path regardless of
+   any client credentials), reuse the OAuth2 tokens armis-cli caches in
+   ``~/.armis/.sessions`` (populated by ``armis-cli auth login`` or by this
+   plugin's own RFC 8628 device flow). Access tokens are refreshed via the
+   refresh-token grant; a fully-empty cache triggers an interactive browser
+   login (needs ARMIS_TENANT_ID). See
+   ``shared_cache_auth`` / ``token_cache`` / ``device_auth``.
 """
 
 import base64
@@ -14,6 +28,19 @@ import time
 import urllib.parse
 
 import httpx
+
+from shared_cache_auth import SharedCacheAuth
+from token_cache import issuer_from_api_url
+
+__all__ = [
+    "JWTAuth",
+    "SharedCacheAuth",
+    "init_auth",
+    "get_auth_header",
+    "get_auth_status",
+    "get_auth_method",
+    "invalidate_auth",
+]
 
 logger = logging.getLogger("appsec-mcp")
 
@@ -102,6 +129,15 @@ class JWTAuth:
             self.exchange()
         return f"Bearer {self._token}"
 
+    def invalidate(self) -> None:
+        """Drop the cached token so the next call re-exchanges credentials.
+
+        Called after the scan API rejects the token with 401 (e.g. the token was
+        revoked server-side before its local expiry).
+        """
+        self._token = None
+        self._expires_at = 0.0
+
     # ------------------------------------------------------------------
     # JWT payload parsing
     #
@@ -152,26 +188,55 @@ class JWTAuth:
 # Module-level singleton
 # ======================================================================
 
-_auth: JWTAuth | None = None
+_auth: JWTAuth | SharedCacheAuth | None = None
+
+
+def _sso_requested() -> bool:
+    """True when the user opted into SSO via ARMIS_DEFAULT_AUTH_METHOD=sso.
+
+    Case-insensitive, whitespace-tolerant, matching armis-cli's
+    ``shouldAutoLoginSSO``.
+    """
+    return os.environ.get("ARMIS_DEFAULT_AUTH_METHOD", "").strip().lower() == "sso"
 
 
 def init_auth(api_url: str) -> None:
-    """Initialize JWT auth from environment variables.  Call once at startup."""
+    """Resolve the auth provider from the environment.  Call once at startup.
+
+    Priority (see module docstring):
+      * ARMIS_DEFAULT_AUTH_METHOD=sso -> force the shared token cache + Device
+        Auth path (``SharedCacheAuth``), even if client credentials are set.
+        This is an explicit SSO opt-in, so client credentials are ignored;
+      * both ARMIS_CLIENT_ID + ARMIS_CLIENT_SECRET set -> client-credentials
+        (``JWTAuth``), unchanged and fully backward compatible;
+      * exactly one set -> a clear partial-configuration error;
+      * neither set -> shared token cache + Device Auth (``SharedCacheAuth``).
+
+    ``SharedCacheAuth`` is constructed lazily (no disk/network here -- it reuses
+    a cached token silently, refreshes it, or runs the browser device flow only
+    on the first scan that actually needs auth).
+    """
     global _auth
+
+    # Explicit SSO opt-in wins over everything: the only credential path is the
+    # shared cache / Device Auth (matches armis-cli ARMIS_DEFAULT_AUTH_METHOD=SSO).
+    if _sso_requested():
+        _auth = SharedCacheAuth(issuer_from_api_url(api_url))
+        return
 
     client_id = os.environ.get("ARMIS_CLIENT_ID", "")
     client_secret = os.environ.get("ARMIS_CLIENT_SECRET", "")
 
-    if not client_id and not client_secret:
-        raise RuntimeError(
-            "No auth credentials configured. Set ARMIS_CLIENT_ID and ARMIS_CLIENT_SECRET."
-        )
-    if not client_id:
-        raise RuntimeError("ARMIS_CLIENT_ID is not set (ARMIS_CLIENT_SECRET is set).")
-    if not client_secret:
+    if client_id and client_secret:
+        _auth = JWTAuth(api_url, client_id)
+        return
+    if client_id and not client_secret:
         raise RuntimeError("ARMIS_CLIENT_SECRET is not set (ARMIS_CLIENT_ID is set).")
+    if client_secret and not client_id:
+        raise RuntimeError("ARMIS_CLIENT_ID is not set (ARMIS_CLIENT_SECRET is set).")
 
-    _auth = JWTAuth(api_url, client_id)
+    # No client credentials -> shared cache / Device Auth fallback.
+    _auth = SharedCacheAuth(issuer_from_api_url(api_url))
 
 
 def get_auth_header() -> str:
@@ -181,8 +246,29 @@ def get_auth_header() -> str:
     return _auth.get_header()
 
 
+def invalidate_auth() -> None:
+    """Invalidate the current token so the next ``get_auth_header`` re-authenticates.
+
+    Called by the scan path on an HTTP 401: the token the server rejected was
+    accepted locally (unexpired) but the session was expired or revoked
+    server-side, so it must be discarded and re-acquired (re-exchange for
+    ``JWTAuth``; refresh or device login for ``SharedCacheAuth``).
+    """
+    if _auth is not None:
+        _auth.invalidate()
+
+
 def get_auth_status() -> str:
     """Return human-readable auth status for debug_config."""
     if _auth is None:
         return "not initialized"
     return _auth.status()
+
+
+def get_auth_method() -> str:
+    """Return the credential path in use, for debug_config."""
+    if _auth is None:
+        return "not initialized"
+    if isinstance(_auth, JWTAuth):
+        return "client-credentials"
+    return "shared-cache/SSO"

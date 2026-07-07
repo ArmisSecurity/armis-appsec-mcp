@@ -48,7 +48,9 @@ python server.py
 - `scanner_core.call_appsec_api()` → POSTs to `{APPSEC_API_URL}/scan/fast` with `{code, mode: "fast"}` and a JWT Bearer. HTTPS is enforced (localhost exempt).
 - `scanner_core.parse_findings()` → extracts the JSON block from the LLM response; findings with `cwe in (None, 0)` are filtered out to match the production pipeline.
 - `scanner_core.format_findings()` → compact, no-markdown plain text (optimized for LLM token cost, not human readability).
+- `auth.init_auth()` → picks the credential path once at startup. **`ARMIS_DEFAULT_AUTH_METHOD=sso`** → forces `auth.SharedCacheAuth`, *ignoring* any client credentials (explicit SSO opt-in, matches armis-cli). Otherwise: **both** `ARMIS_CLIENT_ID`+`ARMIS_CLIENT_SECRET` set → `auth.JWTAuth` (client-credentials, takes priority, unchanged — backward compatible); exactly one set → a partial-config error; **neither** set → `auth.SharedCacheAuth` (shared token cache + Device Auth, PPSC-1038).
 - `auth.JWTAuth` → OAuth2 client-credentials against `/auth/token`. Token cached in memory, re-exchanged when within 5 minutes of `exp`. `_parse_jwt_exp` bounds-checks `exp` (must be future, ≤24h out).
+- `auth.SharedCacheAuth` → reuses the OAuth2 tokens armis-cli caches in `~/.armis/.sessions` (the cross-process contract in `token_cache.py`, a port of armis-cli's `tokenstore.go`). Lazy: no disk/network in `init_auth`. On the first scan that needs auth it (1) uses a valid cached access token, else (2) refreshes via the rotated-refresh grant (persisting the new pair — never keep a divergent second store, or reuse-detection revokes the token family), else (3) runs the RFC 8628 browser **Device Auth** flow (`device_auth.DeviceClient`, needs `ARMIS_TENANT_ID`) and writes the result back to the shared cache so armis-cli / knowledge-mcp reuse it. The OAuth2 device/token endpoints are root-mounted on the **issuer** (`{issuer}/oauth2/device|token`), where issuer = `APPSEC_API_URL` minus a trailing `/api/vN` (`token_cache.issuer_from_api_url`) — that stripped issuer is also the `.sessions` env key, matching how the CLI keys the cache. Fail-**closed** (can't scan without auth), same as `JWTAuth`.
 - `suppression` → two mechanisms, both deterministic local matching (no LLM involvement): (1) **`.armisignore`** at git root — `cwe:`, `severity:`, `category:`, `rule:` directives and path patterns (basename, glob, or `dir/` prefix); (2) **inline `armis:ignore`** source comments — `apply_inline_suppressions` (file scans, by source line) and `apply_inline_suppressions_to_diff` (diff scans, by blob line via `build_diff_line_map`). Fail-open on any parse/IO error.
 - `hash_utils.compute_staged_hash()` → SHA-256 of `git diff --cached --no-color --no-ext-diff`; used by both server and hook to agree on "same staged diff."
 
@@ -121,7 +123,8 @@ anchor on). Syntax:
 | `hooks/pre_commit_scan.py` | **Fail open** (catch-all wraps `main()`) | Plugin bugs must never block the developer |
 | `hooks/protect_scan_pass.py` | **Fail open** | Same |
 | `suppression.load_armisignore` | **Fail open** on IO/parse errors | Never lose findings due to a malformed ignore file |
-| `auth.JWTAuth` | **Fail closed** | Can't scan without auth; errors propagate as `RuntimeError` → `ToolError` |
+| `auth.JWTAuth` / `auth.SharedCacheAuth` | **Fail closed** | Can't scan without auth; errors propagate as `RuntimeError` → `ToolError` |
+| `token_cache.TokenStore.load` | **Fail open** (missing/corrupt/oversized → `None`) | A bad `.sessions` file must never break credential resolution — fall through to the next source |
 | CI scanner (separate pipeline) | **Fail closed** | Second line of defense |
 
 When you edit either hook, preserve the outer `try: ... except Exception: print({}); sys.exit(0)` — it is load-bearing.
@@ -152,8 +155,10 @@ When you edit either hook, preserve the outer `try: ... except Exception: print(
 
 | Var | Default | Notes |
 |---|---|---|
-| `ARMIS_CLIENT_ID` | (required) | Read from `.env` in plugin dir |
-| `ARMIS_CLIENT_SECRET` | (required) | Read fresh from env on each `exchange()` — not cached in memory |
+| `ARMIS_CLIENT_ID` | optional | Read from `.env` in plugin dir. With `ARMIS_CLIENT_SECRET`, selects client-credentials auth (takes priority). Omit **both** to use the shared token cache / Device Auth. |
+| `ARMIS_CLIENT_SECRET` | optional | Read fresh from env on each `exchange()` — not cached in memory |
+| `ARMIS_DEFAULT_AUTH_METHOD` | unset | Set to `sso` (case-insensitive) to force the shared-cache / Device Auth path even when client credentials are present. Mirrors armis-cli's SSO opt-in. |
+| `ARMIS_TENANT_ID` | optional | Tenant to authenticate against. Required **only** when the plugin itself starts the browser Device Auth flow (SSO path with an empty `~/.armis/.sessions`). Ignored by the client-credentials path. |
 | `APPSEC_ENV` | `prod` | Selects `moose.armis.com` (prod) or `moose-dev.armis.com` (dev) |
 | `APPSEC_API_URL` | auto | Full override; must be HTTPS unless hostname is localhost |
 | `APPSEC_DEBUG` | unset | Any truthy value enables debug logging |

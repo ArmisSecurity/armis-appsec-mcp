@@ -157,6 +157,19 @@ This installs a git pre-commit hook that verifies the scan-pass (stored inside `
 
 To remove: `make uninstall-hooks`
 
+## Local Development
+
+To test uncommitted changes from a clone end-to-end in Claude Code (or any client that loads the installed plugin), point the installed plugin at your working tree:
+
+```bash
+make dev-install     # backs up the installed plugin, symlinks it -> this repo
+# ...restart Claude Code, then test...
+make dev-uninstall   # restores the backed-up plugin exactly
+make dev-status      # show whether dev mode is active
+```
+
+`dev-install` backs up the real plugin to `latest.bak`, symlinks `latest` to this repo, and copies the installed `.env` (credentials) over so the launcher's preflight still passes. **Restart Claude Code after each install/uninstall** — MCP servers launch at session start. Override the cache location with `PLUGIN_CACHE=...` if your plugins live elsewhere.
+
 ## Usage
 
 ### Scan staged changes (default)
