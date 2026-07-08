@@ -40,6 +40,7 @@ from auth import get_auth_method, get_auth_status, init_auth
 from hash_utils import (
     cleanup_legacy_scan_pass,
     compute_staged_hash,
+    merge_or_rebase_in_progress,
     resolve_scan_pass_path,
 )
 from scanner_core import (
@@ -572,6 +573,35 @@ async def scan_file(
     )
 
 
+def _shipping_decision(
+    ref: str, staged: bool, truncated: bool, scan_repo: str | None
+) -> tuple[bool, bool]:
+    """Decide (is_shipping_scan, require_approval) for a scan_diff run.
+
+    Extracted as a sync helper so it is unit-testable without the async MCP
+    wrapper (which tests replace with a MagicMock).
+
+    Both staged and ref-based scans are shipping-eligible so they can write
+    .scan-pass (fixes push/PR gate loop — comments #8+#9). BUT a truncated diff
+    means the scanner saw less than the scan-pass hash vouches for, so normally
+    it is NOT shipping-eligible — refuse to gate it (#6).
+
+    EXCEPTION (ticket.md): a merge/rebase in progress. Its staged diff is mostly
+    already-landed, CI-scanned upstream code — the only newly authored content
+    is the conflict resolution. When such a diff is truncated, blunt refusal
+    paralyzes the developer: auto-pass is blocked AND approve_findings is blocked,
+    with no in-band escape. So for a mid-merge truncated diff we keep the scan
+    shipping-eligible (so approve_findings stays live) but flag require_approval —
+    _cache_scan never auto-writes the pass, so the ONLY way through is an explicit
+    human approve_findings. A human stays accountable for the un-scannable
+    content; the hook's hash logic is unchanged.
+    """
+    shipping_kind = bool(ref) or staged
+    merge_in_progress = truncated and shipping_kind and merge_or_rebase_in_progress(scan_repo)
+    is_shipping_scan = shipping_kind and (not truncated or merge_in_progress)
+    return is_shipping_scan, merge_in_progress
+
+
 @mcp.tool()
 async def scan_diff(
     repo_path: str = "",
@@ -610,11 +640,7 @@ async def scan_diff(
         await ctx.info(f"Scanning {label} ({len(diff_text)} chars)")
     logger.info("Scanning %s (%d chars)", label, len(diff_text))
 
-    # Treat both staged and ref-based scans as shipping-eligible so they
-    # can write .scan-pass (fixes push/PR gate loop — comments #8+#9).
-    # BUT: a truncated diff means the scanner saw less than the scan-pass hash
-    # vouches for, so it is NOT shipping-eligible — refuse to gate it (#6).
-    is_shipping_scan = (bool(ref) or staged) and not truncated
+    is_shipping_scan, require_approval = _shipping_decision(ref, staged, truncated, scan_repo)
     scan_hash = ""
     if is_shipping_scan:
         if staged:
@@ -637,6 +663,7 @@ async def scan_diff(
                 scan_hash=scan_hash,
                 repo_path=scan_repo,
                 staged=staged,
+                require_approval=require_approval,
             )
             return report
 
@@ -687,6 +714,7 @@ async def scan_diff(
         suppression_summary=suppression_summary,
         repo_path=scan_repo,
         staged=staged,
+        require_approval=require_approval,
     )
 
     if ctx:
@@ -696,13 +724,30 @@ async def scan_diff(
     # A truncated diff was scanned only up to _MAX_CODE_CHARS, so it cannot
     # gate a commit — tell the user to split it. No scan-pass was
     # written above because is_shipping_scan was forced False on truncation.
+    #
+    # For a mid-merge truncated diff (require_approval) the message differs: the
+    # diff is un-scannable but is mostly already-landed upstream code, so
+    # splitting isn't the right move — the developer can't split a merge. The
+    # in-band escape is an explicit human approve_findings.
     if truncated and (bool(ref) or staged):
-        warning = (
-            f"WARNING: diff exceeded {_MAX_CODE_CHARS} chars and was truncated; "
-            "only the first part was scanned. This scan CANNOT authorize a commit "
-            "(no scan-pass written). Split your changes into smaller commits and "
-            "re-scan each."
-        )
+        if require_approval:
+            warning = (
+                f"WARNING: this is a MERGE/REBASE in progress and its diff exceeded "
+                f"{_MAX_CODE_CHARS} chars, so only the first part was scanned. A merge "
+                "diff is mostly already-landed upstream code, not newly authored work, "
+                "so it cannot be split. No scan-pass was auto-written. If you (the human) "
+                "have reviewed the conflict resolution and accept shipping the "
+                "un-scannable upstream content, approve explicitly: call "
+                "approve_findings(reason='<why>'). Do NOT approve on the agent's own "
+                "initiative — wait for the user to say so."
+            )
+        else:
+            warning = (
+                f"WARNING: diff exceeded {_MAX_CODE_CHARS} chars and was truncated; "
+                "only the first part was scanned. This scan CANNOT authorize a commit "
+                "(no scan-pass written). Split your changes into smaller commits and "
+                "re-scan each."
+            )
         logger.warning(warning)
         if ctx:
             await ctx.info(warning)
@@ -739,6 +784,12 @@ _last_scan: dict = {
     "staged": False,
     "scan_hash": "",
     "repo_path": "",
+    # True when the scan is shipping-eligible but must NOT auto-write a
+    # scan-pass — the only way through is an explicit human approve_findings.
+    # Set for a mid-merge/rebase truncated diff (ticket.md): un-scannable but
+    # mostly already-landed upstream code, so blunt refusal would paralyze the
+    # developer. do_approve_findings honors this to allow zero-finding approval.
+    "require_approval": False,
 }
 
 
@@ -773,7 +824,13 @@ def do_approve_findings(reason: str) -> str:
         f for f in _last_scan.get("suppressed", []) if f.get("severity", "").upper() == "CRITICAL"
     ]
     all_requiring_approval = high_critical + suppressed_critical
-    if not all_requiring_approval:
+    # A mid-merge/rebase truncated scan (require_approval) is approvable even
+    # with zero active findings: the un-scannable content is the reason for the
+    # approval, not any specific finding. Only this flagged case bypasses the
+    # "must have HIGH/CRITICAL" guard — normal scans still require findings to
+    # approve, so approve_findings can't be used as a blanket bypass. (ticket.md)
+    require_approval = _last_scan.get("require_approval", False)
+    if not all_requiring_approval and not require_approval:
         return "ERROR: No HIGH/CRITICAL findings to approve. Run scan_diff first."
 
     if not reason.strip():
@@ -831,6 +888,14 @@ def do_approve_findings(reason: str) -> str:
         approval_hash[:12],
     )
 
+    if not all_requiring_approval and require_approval:
+        # Mid-merge/rebase truncated diff with no active findings: the approval
+        # is for the un-scannable upstream content itself, not any finding.
+        return (
+            f"Approved shipping the truncated merge/rebase diff (no HIGH/CRITICAL "
+            f"findings in the scanned portion). Reason: {reason}. "
+            f".scan-pass written. You may now retry the commit."
+        )
     return (
         f"Approved {len(all_requiring_approval)} HIGH/CRITICAL findings. "
         f"Reason: {reason}. "
@@ -863,6 +928,7 @@ def _cache_scan(
     suppression_summary: dict | None = None,
     repo_path: str | None = None,
     staged: bool = False,
+    require_approval: bool = False,
 ):
     """Update the last scan cache and write .scan-pass if clean.
 
@@ -881,6 +947,10 @@ def _cache_scan(
             being committed (see resolve_scan_pass_path).
         staged: True only for a real staged-index scan (vs a ref scan). Cached
             so do_approve_findings can detect the index drifting after the scan.
+        require_approval: True for a mid-merge/rebase truncated diff. The scan
+            stays shipping-eligible (approve_findings live) but this function
+            never auto-writes the scan-pass — an explicit human approval is the
+            only way through. See ticket.md.
     """
     _last_scan.update(
         {
@@ -894,10 +964,24 @@ def _cache_scan(
             "staged": staged,
             "scan_hash": scan_hash,
             "repo_path": repo_path or "",
+            "require_approval": require_approval,
         }
     )
 
     if not is_staged_scan:
+        return
+
+    # A require_approval scan is shipping-eligible but must never auto-pass:
+    # the only route through the gate is an explicit human approve_findings.
+    # Remove any stale pass so a prior clean scan can't vouch for this diff.
+    if require_approval:
+        scan_pass_path = _scan_pass_path(repo_path)
+        cleanup_legacy_scan_pass(repo_path)
+        try:
+            if os.path.isfile(scan_pass_path):
+                os.remove(scan_pass_path)
+        except OSError:
+            pass
         return
 
     # Write/remove .scan-pass for the PreToolUse hook

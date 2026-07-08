@@ -78,6 +78,34 @@ def resolve_scan_pass_path(repo_path: str | None = None) -> str:
     return os.path.join(_plugin_dir, SCAN_PASS_BASENAME)
 
 
+# Marker files/dirs git writes into the git dir while a merge or rebase is in
+# progress. A staged diff taken mid-operation includes everything upstream
+# added since the branch point (already-landed, CI-scanned code), not just the
+# newly authored conflict resolution — see ticket.md. The gate uses this to
+# grant an approve_findings escape hatch for an un-scannable (truncated) merge
+# diff that it would otherwise block forever.
+_MERGE_MARKERS = ("MERGE_HEAD", "REBASE_HEAD", "rebase-merge", "rebase-apply")
+
+
+def merge_or_rebase_in_progress(repo_path: str | None = None) -> bool:
+    """Return True if a merge or rebase is in progress in the repository.
+
+    Detected by the presence of any of git's operation-marker files in the git
+    dir (``MERGE_HEAD``, ``REBASE_HEAD``, ``rebase-merge/``, ``rebase-apply/``).
+    ``repo_path`` selects the repo (``None`` → process CWD), resolved via the
+    same ``git rev-parse --absolute-git-dir`` as ``resolve_scan_pass_path`` so
+    the server (writer) and hook (reader) agree even inside worktrees.
+
+    Fail-soft: any error (not a repo, git missing) → False, so a detection
+    failure can only make the gate *stricter* (no escape hatch), never looser.
+    """
+    # armis:ignore cwe:22 cwe:23 cwe:73 reason:FP — cwd to subprocess.run(shell=False), no file r/w
+    git_dir = _git_output(["rev-parse", "--absolute-git-dir"], cwd=repo_path)
+    if not git_dir:
+        return False
+    return any(os.path.exists(os.path.join(git_dir, marker)) for marker in _MERGE_MARKERS)
+
+
 def resolve_repo_toplevel(repo_path: str | None = None) -> str | None:
     """Return the work-tree root (``git rev-parse --show-toplevel``) or None.
 

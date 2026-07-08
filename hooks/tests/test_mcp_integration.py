@@ -314,6 +314,167 @@ class TestApproveFindings:
         assert "not a shipping scan" in result
 
 
+class TestMergeAwareTruncatedApproval:
+    """ticket.md: a merge/rebase in progress whose staged diff exceeds
+    _MAX_CODE_CHARS must NOT silently auto-pass, but MUST remain approvable via
+    approve_findings even with zero active findings — the only in-band escape
+    for un-scannable, mostly-already-landed upstream code."""
+
+    def _init_midmerge_repo(self, path):
+        """A repo with MERGE_HEAD present and a staged change."""
+        _init_git_repo(path)  # leaves new.py staged
+        git_dir = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"],
+            cwd=str(path),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        with open(os.path.join(git_dir, "MERGE_HEAD"), "w") as f:
+            f.write("0" * 40 + "\n")
+
+    def test_cache_scan_require_approval_does_not_auto_write(self, plugin_root, tmp_path):
+        """require_approval=True must keep is_staged_scan True (shipping) yet
+        never auto-write the scan-pass, even with zero findings."""
+        staged_hash = _init_git_repo(tmp_path)
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(str(tmp_path))
+            server._cache_scan(
+                "clean but merge",
+                _CLEAN_FINDINGS,
+                "staged changes",
+                is_staged_scan=True,
+                scan_hash=staged_hash,
+                staged=True,
+                require_approval=True,
+            )
+        finally:
+            os.chdir(original_cwd)
+
+        # Shipping scan recorded (approve_findings stays live)...
+        assert server._last_scan["is_staged_scan"] is True
+        assert server._last_scan["require_approval"] is True
+        # ...but NO auto-pass was written.
+        assert not (plugin_root / "armis-scan-pass").exists()
+
+    def test_approve_succeeds_with_zero_active_findings(self, plugin_root, tmp_path):
+        """approve_findings must write the scan-pass for a require_approval scan
+        even though there are no HIGH/CRITICAL findings to point at."""
+        staged_hash = _init_git_repo(tmp_path)
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(str(tmp_path))
+            server._cache_scan(
+                "clean but merge, truncated",
+                _CLEAN_FINDINGS,
+                "staged changes",
+                is_staged_scan=True,
+                scan_hash=staged_hash,
+                staged=True,
+                require_approval=True,
+            )
+            result = server.do_approve_findings(reason="pre-existing upstream code, human accepts")
+        finally:
+            os.chdir(original_cwd)
+
+        assert "ERROR" not in result
+        scan_pass = plugin_root / "armis-scan-pass"
+        assert scan_pass.exists()
+        assert scan_pass.read_text().strip() == staged_hash
+
+    def test_normal_truncated_still_blocks_approval(self, plugin_root, tmp_path):
+        """A NON-merge truncated diff (require_approval never set, and the ticket
+        keeps is_staged_scan False for it) must still block approve_findings —
+        the fix is scoped to merges only."""
+        _init_git_repo(tmp_path)
+        # Mirror scan_diff's normal-truncation behavior: not shipping-eligible.
+        server._cache_scan(
+            "truncated non-merge",
+            _CLEAN_FINDINGS,
+            "staged changes",
+            is_staged_scan=False,
+            staged=True,
+        )
+        result = server.do_approve_findings(reason="trying to sneak past")
+        assert "ERROR" in result
+        assert "not a shipping scan" in result
+        assert not (plugin_root / "armis-scan-pass").exists()
+
+    def test_shipping_decision_midmerge_truncated(self, tmp_path):
+        """The sync decision helper (what scan_diff delegates to): a truncated
+        staged diff mid-merge stays shipping-eligible AND flags require_approval.
+        A truncated staged diff with no merge stays non-shipping (the trap fix
+        is scoped to merges)."""
+        self._init_midmerge_repo(tmp_path)
+        is_shipping, require_approval = server._shipping_decision(
+            ref="", staged=True, truncated=True, scan_repo=str(tmp_path)
+        )
+        assert is_shipping is True
+        assert require_approval is True
+
+    def test_shipping_decision_truncated_non_merge_blocks(self, tmp_path):
+        """Truncated staged diff, NO merge in progress → not shipping-eligible
+        (unchanged behavior — a vuln past the cut must not ship)."""
+        _init_git_repo(tmp_path)  # clean repo, no MERGE_HEAD
+        is_shipping, require_approval = server._shipping_decision(
+            ref="", staged=True, truncated=True, scan_repo=str(tmp_path)
+        )
+        assert is_shipping is False
+        assert require_approval is False
+
+    def test_shipping_decision_untruncated_merge_is_plain_shipping(self, tmp_path):
+        """A merge whose diff fits under the limit is a normal shipping scan —
+        no require_approval, auto-pass allowed if clean."""
+        self._init_midmerge_repo(tmp_path)
+        is_shipping, require_approval = server._shipping_decision(
+            ref="", staged=True, truncated=False, scan_repo=str(tmp_path)
+        )
+        assert is_shipping is True
+        assert require_approval is False
+
+    def test_midmerge_truncated_end_to_end_via_helpers(self, plugin_root, tmp_path):
+        """End-to-end (ticket acceptance #1 + #2) using the sync helpers
+        scan_diff itself calls: decision → _cache_scan → approve_findings.
+        Mirrors the production flow without the async MCP wrapper (mocked here)."""
+        self._init_midmerge_repo(tmp_path)
+        staged_hash = subprocess.run(
+            ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
+            cwd=str(tmp_path),
+            capture_output=True,
+        ).stdout
+        import hashlib as _h
+
+        staged_hash = _h.sha256(staged_hash).hexdigest()
+
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(str(tmp_path))
+            is_shipping, require_approval = server._shipping_decision(
+                ref="", staged=True, truncated=True, scan_repo=str(tmp_path)
+            )
+            server._cache_scan(
+                "clean merge scan",
+                _CLEAN_FINDINGS,
+                "staged changes",
+                is_staged_scan=is_shipping,
+                scan_hash=staged_hash,
+                staged=True,
+                repo_path=str(tmp_path),
+                require_approval=require_approval,
+            )
+            # Acceptance #1: shipping (is_staged_scan True), but no auto-pass.
+            assert server._last_scan["is_staged_scan"] is True
+            assert not (plugin_root / "armis-scan-pass").exists()
+
+            # Acceptance #2: approve succeeds even with zero active findings.
+            result = server.do_approve_findings(reason="already-landed master code")
+            assert "ERROR" not in result
+            assert (plugin_root / "armis-scan-pass").exists()
+        finally:
+            os.chdir(original_cwd)
+
+
 class TestApproveFindingsMatchesScannedContent:
     """approve_findings must bless ONLY what was scanned, not
     whatever happens to be staged at approval time."""

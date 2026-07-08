@@ -19,6 +19,7 @@ from hash_utils import (  # noqa: E402
     SCAN_PASS_BASENAME,
     cleanup_legacy_scan_pass,
     compute_staged_hash,
+    merge_or_rebase_in_progress,
     resolve_scan_pass_path,
 )
 
@@ -239,6 +240,56 @@ class TestComputeStagedHashNonUtf8:
         ).stdout
         # This is exactly what git-hooks/scan-staged.py now hashes.
         assert hashlib.sha256(raw).hexdigest() == compute_staged_hash()
+
+
+class TestMergeOrRebaseInProgress:
+    """merge_or_rebase_in_progress detects the MERGE_HEAD / REBASE_HEAD marker
+    files git writes into the git dir mid-operation. This is what lets the gate
+    distinguish a merge/rebase (whose staged diff is mostly already-landed
+    upstream code) from newly authored work — see ticket.md."""
+
+    def test_false_on_clean_repo(self, git_repo):
+        assert merge_or_rebase_in_progress() is False
+
+    def test_true_with_merge_head(self, git_repo):
+        git_dir = _expected_git_dir(git_repo)
+        with open(os.path.join(git_dir, "MERGE_HEAD"), "w") as f:
+            f.write("0" * 40 + "\n")
+        assert merge_or_rebase_in_progress() is True
+
+    def test_true_with_rebase_merge_head(self, git_repo):
+        # `git rebase` (interactive/merge backend) records REBASE_HEAD.
+        git_dir = _expected_git_dir(git_repo)
+        with open(os.path.join(git_dir, "REBASE_HEAD"), "w") as f:
+            f.write("0" * 40 + "\n")
+        assert merge_or_rebase_in_progress() is True
+
+    def test_true_with_rebase_apply_dir(self, git_repo):
+        # `git rebase` (apply backend) / `am` create a rebase-apply/ directory.
+        git_dir = _expected_git_dir(git_repo)
+        os.mkdir(os.path.join(git_dir, "rebase-apply"))
+        assert merge_or_rebase_in_progress() is True
+
+    def test_respects_repo_path(self, git_repo, monkeypatch, tmp_path):
+        """Detection reads the *passed* repo's git dir, not the process CWD —
+        matching the worktree handshake in resolve_scan_pass_path."""
+        other = tmp_path.parent / "merge_other_repo"
+        other.mkdir(exist_ok=True)
+        _git(["init"], other)
+        other_git_dir = _expected_git_dir(other)
+        with open(os.path.join(other_git_dir, "MERGE_HEAD"), "w") as f:
+            f.write("0" * 40 + "\n")
+
+        # CWD is the clean git_repo; only `other` is mid-merge.
+        assert merge_or_rebase_in_progress() is False
+        assert merge_or_rebase_in_progress(str(other)) is True
+
+    def test_false_outside_git_repo(self, monkeypatch):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as isolated:
+            monkeypatch.chdir(isolated)
+            assert merge_or_rebase_in_progress() is False
 
 
 class TestCleanupLegacyScanPass:
