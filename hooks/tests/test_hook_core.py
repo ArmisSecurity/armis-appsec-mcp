@@ -438,6 +438,28 @@ class TestBuildSystemMessage:
         assert ast.literal_eval(literal) == weird
 
 
+class TestBuildSystemMessageMergeAware:
+    """ticket.md: when a merge/rebase is in progress, the agent should be told
+    upfront that a truncated diff is expected and that approve_findings is the
+    intended path — instead of discovering the dead end after several attempts."""
+
+    def test_merge_message_mentions_approve_findings(self):
+        msg = hook_core.build_system_message(
+            "git commit -m 'merge'", repo_path="/wt", merge_in_progress=True
+        )
+        assert "merge" in msg.lower() or "rebase" in msg.lower()
+        assert "approve_findings" in msg
+        # Still recommends the scan first.
+        assert "scan_diff(staged=True, repo_path='/wt')" in msg
+
+    def test_non_merge_message_unchanged(self):
+        """Default (no merge) message must not mention the merge escape hatch."""
+        msg = hook_core.build_system_message("git commit -m 'x'", repo_path="/wt")
+        assert "scan_diff(staged=True, repo_path='/wt')" in msg
+        # The ordinary flow does not proactively suggest approve_findings for a merge.
+        assert "merge in progress" not in msg.lower()
+
+
 class TestCrossAdapterInterop:
     """Verify .scan-pass written once is accepted by all adapter scripts."""
 

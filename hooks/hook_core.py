@@ -18,6 +18,7 @@ if _plugin_root_dir not in sys.path:
 
 from hash_utils import (  # noqa: E402
     compute_staged_hash,
+    merge_or_rebase_in_progress,
     resolve_repo_toplevel,
     resolve_scan_pass_path,
 )
@@ -269,19 +270,31 @@ def _scan_call(cmd: str, repo_path: str | None) -> str:
     return f"scan_diff({', '.join(args)})"
 
 
-def build_system_message(cmd: str, repo_path: str | None = None) -> str:
+def build_system_message(
+    cmd: str, repo_path: str | None = None, merge_in_progress: bool | None = None
+) -> str:
     """Build the scan instruction based on command type.
 
     ``repo_path`` defaults to the hook's resolved work-tree root; tests pass it
     explicitly. It is woven into the recommended ``scan_diff`` call so the
     scan-pass is written where this gate will read it.
+
+    ``merge_in_progress`` defaults to detecting a merge/rebase in ``repo_path``.
+    When True, the message gets a merge-aware branch (ticket.md): a merge diff
+    can be huge and un-scannable (truncated), it is mostly already-landed
+    upstream code, and it can't be split — so the agent is told upfront that an
+    explicit human approve_findings is the intended path, instead of discovering
+    that dead end after several failed attempts.
     """
     if repo_path is None:
         repo_path = resolve_repo_toplevel()
 
+    if merge_in_progress is None:
+        merge_in_progress = merge_or_rebase_in_progress(repo_path or None)
+
     scan_instruction = _scan_call(cmd, repo_path)
 
-    return (
+    base = (
         f"Security scan required before shipping. "
         f"Call {scan_instruction} to scan your changes. "
         f"After scanning:\n"
@@ -295,6 +308,17 @@ def build_system_message(cmd: str, repo_path: str | None = None) -> str:
         f"the original command.\n"
         f"MEDIUM/LOW/INFO findings can be ignored."
     )
+    if merge_in_progress:
+        base += (
+            "\nNOTE: a merge/rebase is in progress. Its staged diff includes "
+            "already-landed upstream code, not just your work, and may exceed the "
+            "scan size limit (truncated). If the scan reports it was truncated and "
+            "cannot auto-authorize the commit, the diff can't be split — present the "
+            "situation to the user and, only if they explicitly accept shipping the "
+            "un-scannable upstream content, call approve_findings(reason='<user "
+            "reason>') to proceed."
+        )
+    return base
 
 
 # ---------------------------------------------------------------------------
