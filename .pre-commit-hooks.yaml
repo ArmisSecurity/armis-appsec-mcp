@@ -1,0 +1,43 @@
+# Hook definitions for the `pre-commit` framework (https://pre-commit.com).
+#
+# Consume from another repo's .pre-commit-config.yaml:
+#
+#   - repo: https://github.com/ArmisSecurity/armis-appsec-mcp.git
+#     rev: <tag>
+#     hooks:
+#       - id: armis-appsec-scan
+#
+# The framework builds an isolated venv per hook repo and runs `entry` in it, so it
+# never sees <plugin_dir>/.env. Credentials must be present in the ambient environment:
+# ARMIS_CLIENT_ID / ARMIS_CLIENT_SECRET, or ARMIS_DEFAULT_AUTH_METHOD=sso with
+# ARMIS_TENANT_ID.
+#
+# Both hooks fail OPEN by default (a scanner outage must not stop every commit in the
+# org). Set APPSEC_HOOK_STRICT=1, or add `args: [--strict]`, to fail closed.
+
+- id: armis-appsec-scan
+  name: Armis AppSec scan (changed files)
+  description: >-
+    Scan the files pre-commit selected and block on HIGH/CRITICAL findings.
+    This is the hook to use when the workflow is `pre-commit run --all-files`
+    (locally and in CI) rather than the git pre-commit hook, because a CI
+    checkout has an empty index and a staged-diff scan would pass vacuously.
+  entry: armis-scan-staged
+  language: python
+  pass_filenames: true
+  types_or: [python, jupyter, shell, sql, yaml, terraform]
+  require_serial: true
+  stages: [pre-commit, pre-push, manual]
+
+- id: armis-appsec-scan-staged
+  name: Armis AppSec scan (staged diff)
+  description: >-
+    Scan `git diff --cached` and block on HIGH/CRITICAL findings. Scans only what
+    is actually being committed, and writes the scan-pass token that
+    git-hooks/pre-commit verifies. No-ops when the index is empty, so this hook is
+    for the git pre-commit path only -- not for CI.
+  entry: armis-scan-staged --staged
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit]

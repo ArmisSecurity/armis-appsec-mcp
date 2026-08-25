@@ -6,6 +6,24 @@ build-backend = "setuptools.build_meta"
 include = ["hooks*"]
 exclude = ["hooks.tests*"]
 
+# The scanner lives in top-level modules at the repo root, and hooks/* imports them by
+# bare name (`from hash_utils import ...`) after a sys.path.insert of the repo root.
+# That only resolves when running FROM a clone. Without these modules in the
+# distribution, `import hooks.hook_core` raises ModuleNotFoundError in any installed
+# package -- including the isolated venv the `pre-commit` framework builds per hook repo.
+# Closed set: auth -> {shared_cache_auth, token_cache}, shared_cache_auth -> device_auth,
+# scanner_core -> auth. Everything else in the chain is stdlib or a declared dependency.
+[tool.setuptools]
+py-modules = [
+    "auth",
+    "device_auth",
+    "hash_utils",
+    "scanner_core",
+    "shared_cache_auth",
+    "suppression",
+    "token_cache",
+]
+
 [project]
 name = "armis-appsec-mcp"
 version = "1.2.0"
@@ -16,6 +34,11 @@ dependencies = [
     "httpx>=0.28.1",
     "python-dotenv>=1.0.1",
 ]
+
+# Console entry point so the scanner can gate from a `pre-commit` framework hook
+# (language: python) or any installed venv, without knowing where the clone lives.
+[project.scripts]
+armis-scan-staged = "hooks.scan_staged_cli:cli_main"
 
 [project.optional-dependencies]
 dev = [
