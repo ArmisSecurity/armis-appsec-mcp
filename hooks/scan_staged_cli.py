@@ -244,7 +244,11 @@ def main(argv: list[str] | None = None) -> int:
             print("appsec: no scannable files after exclusions", file=sys.stderr)
             return 0
         diff_text = _synthesize_diff(selected, git_root)
-        label = f"{len(selected)} file(s)"
+        # format_findings() appends its own "(N file(s))" from changed_files, so the
+        # blocking-report label must not repeat the count -- the clean line has no
+        # such suffix, so it carries the count itself.
+        label = "files"
+        clean_label = f"{len(selected)} file(s)"
     else:
         raw_diff = _run_git_diff([args.ref] if args.ref else ["--cached"])
         if not raw_diff.strip():
@@ -263,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             if not diff_text.strip():
                 print("appsec: all changed files excluded by .armisignore", file=sys.stderr)
                 return 0
-        label = args.ref or "staged-diff"
+        label = clean_label = args.ref or "staged-diff"
 
     if not diff_text.strip():
         print("appsec: nothing to scan", file=sys.stderr)
@@ -299,7 +303,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     else:
-        print(f"appsec: scan clean ({total} finding(s), none blocking) — {label}", file=sys.stderr)
+        print(
+            f"appsec: scan clean ({total} finding(s), none blocking) — {clean_label}",
+            file=sys.stderr,
+        )
     return 0
 
 
