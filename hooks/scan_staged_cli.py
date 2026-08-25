@@ -158,13 +158,21 @@ def _select_files(paths: list[str], config: ArmisIgnoreConfig, git_root: str | N
     return selected
 
 
-def _blocking_findings(diff_text: str, config: ArmisIgnoreConfig) -> tuple[list[dict], int]:
-    """Scan one code blob and return (blocking findings, total findings)."""
+def _blocking_findings(
+    diff_text: str, config: ArmisIgnoreConfig
+) -> tuple[list[dict], int, dict[int, tuple[str, int]], list[str]]:
+    """Scan one code blob.
+
+    Returns (blocking findings, total findings, line_map, changed_files). The last two
+    are what let format_findings() translate a finding's diff-blob line number into a
+    real `path:line` -- upstream never passed them, so every git-hook finding was
+    reported at a blob coordinate that looks like a file line and is not.
+    """
     response = call_appsec_api(diff_text)
     findings = parse_findings(response)
 
     active, suppressed, _summary = apply_suppressions(findings, config)
-    line_map, _changed = build_diff_line_map(diff_text)
+    line_map, changed = build_diff_line_map(diff_text)
     active, inline_suppressed = apply_inline_suppressions_to_diff(active, diff_text, line_map)
 
     def _sev(finding: dict) -> str:
@@ -175,7 +183,7 @@ def _blocking_findings(diff_text: str, config: ArmisIgnoreConfig) -> tuple[list[
     blocking = [f for f in active if _sev(f) in ("HIGH", "CRITICAL")]
     blocking.extend(f for f in suppressed if _sev(f) == "CRITICAL")
     blocking.extend(f for f in inline_suppressed if _sev(f) == "CRITICAL")
-    return blocking, len(findings)
+    return blocking, len(findings), line_map, changed
 
 
 def _write_scan_pass(raw_diff: bytes) -> None:
@@ -269,10 +277,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         diff_text = diff_text[:MAX_CODE_CHARS]
 
-    blocking, total = _blocking_findings(diff_text, config)
+    blocking, total, line_map, changed_files = _blocking_findings(diff_text, config)
 
     if blocking:
-        print(format_findings(blocking, filename=label), file=sys.stderr)
+        print(
+            format_findings(
+                blocking, filename=label, line_map=line_map, changed_files=changed_files
+            ),
+            file=sys.stderr,
+        )
         print(
             f"\nappsec: {len(blocking)} HIGH/CRITICAL findings. Fix before committing.",
             file=sys.stderr,

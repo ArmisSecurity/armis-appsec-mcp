@@ -274,3 +274,49 @@ class TestTruncation:
         assert "exceeds" in stderr
         captured = int(out.split("CAPTURED_CHARS=")[1].split()[0])
         assert captured == MAX_CODE_CHARS
+
+
+class TestFindingLocations:
+    """Findings must be reported at a source path:line, not a diff-blob line.
+
+    The blob line is offset by the synthesized/real diff headers, so an unmapped
+    report reads as a file line and points at the wrong code. format_findings()
+    can translate it, but only when handed the line_map.
+    """
+
+    def test_files_mode_reports_source_path_and_line(self, tmp_path):
+        _init_repo(tmp_path)
+        # Token on source line 6; the 5 synthesized diff header lines put it at
+        # blob line 11, which is what an unmapped report would print.
+        (tmp_path / "app.py").write_text(
+            '# header\nimport os\n\nimport requests\n\nTOKEN = "dapi0000000000000000000000000000"\n'
+        )
+        finding = json.dumps(
+            [
+                {
+                    "severity": "HIGH",
+                    "cwe": 798,
+                    "line": 11,
+                    "explanation": "hard-coded token",
+                }
+            ]
+        )
+        _out, stderr, rc = _run_cli(tmp_path, ["app.py"], mock_response=f"```json\n{finding}\n```")
+        assert rc == 1, stderr
+        assert "app.py:6" in stderr
+        assert "L11" not in stderr
+
+    def test_staged_mode_reports_source_path_and_line(self, tmp_path):
+        _init_repo(tmp_path)
+        (tmp_path / "app.py").write_text("import os\nx = 1\ny = 2\n")
+        _git(["add", "app.py"], tmp_path)
+
+        # A real staged diff for a new file has 6 header lines (diff --git, new file
+        # mode, index, ---, +++, @@) -- one more than the synthesized files-mode diff,
+        # which has no `index` line. So source line 2 sits at blob line 8.
+        finding = json.dumps([{"severity": "HIGH", "cwe": 89, "line": 8, "explanation": "bad"}])
+        _out, stderr, rc = _run_cli(
+            tmp_path, ["--staged"], mock_response=f"```json\n{finding}\n```"
+        )
+        assert rc == 1, stderr
+        assert "app.py:2" in stderr
