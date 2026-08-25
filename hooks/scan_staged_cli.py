@@ -191,6 +191,38 @@ def _blocking_findings(
     return blocking, len(findings), line_map, changed
 
 
+def _split_diff(diff_text: str, limit: int = MAX_CODE_CHARS) -> list[str]:
+    """Split a diff into per-file chunks that each fit under `limit` chars.
+
+    One 90k blob is not enough for a real repository: `pre-commit run --all-files` on a
+    50-file Databricks project synthesizes ~317k chars, so a single truncated request
+    reported ~70% of the tree as clean without ever sending it. Splitting on `diff --git`
+    boundaries keeps every chunk a valid diff, so build_diff_line_map / inline
+    suppression / format_findings keep working per chunk.
+
+    A single file larger than `limit` is still truncated -- there is nothing smaller to
+    split it into -- and the caller warns about that case.
+    """
+    if len(diff_text) <= limit:
+        return [diff_text] if diff_text.strip() else []
+
+    # keepends-style split: every part after the first starts with "diff --git ".
+    pieces = diff_text.split("diff --git ")
+    files = [pieces[0]] if pieces[0].strip() else []
+    files.extend("diff --git " + piece for piece in pieces[1:])
+
+    chunks: list[str] = []
+    current = ""
+    for f in files:
+        if current and len(current) + len(f) > limit:
+            chunks.append(current)
+            current = ""
+        current += f
+    if current.strip():
+        chunks.append(current)
+    return chunks
+
+
 def _write_scan_pass(raw_diff: bytes) -> None:
     """Record the staged-hash claim that git-hooks/pre-commit verifies."""
     staged_hash = hashlib.sha256(raw_diff).hexdigest()
@@ -283,23 +315,39 @@ def main(argv: list[str] | None = None) -> int:
         print("appsec: nothing to scan", file=sys.stderr)
         return 0
 
-    if len(diff_text) > MAX_CODE_CHARS:
+    # One request per chunk instead of one truncated request for the whole input.
+    chunks = _split_diff(diff_text)
+    if len(chunks) > 1:
         print(
             f"appsec: input {len(diff_text)} chars exceeds {MAX_CODE_CHARS}; "
-            "scanning the first part only",
+            f"scanning in {len(chunks)} request(s)",
             file=sys.stderr,
         )
-        diff_text = diff_text[:MAX_CODE_CHARS]
 
-    blocking, total, line_map, changed_files = _blocking_findings(diff_text, config)
+    blocking: list[dict] = []
+    total = 0
+    reports: list[str] = []
+    for chunk in chunks:
+        if len(chunk) > MAX_CODE_CHARS:
+            # A single file over the cap; nothing smaller to split it into.
+            print(
+                f"appsec: a single file exceeds {MAX_CODE_CHARS} chars; "
+                "scanning the first part only",
+                file=sys.stderr,
+            )
+            chunk = chunk[:MAX_CODE_CHARS]
+        c_blocking, c_total, line_map, changed_files = _blocking_findings(chunk, config)
+        total += c_total
+        blocking.extend(c_blocking)
+        if c_blocking:
+            reports.append(
+                format_findings(
+                    c_blocking, filename=label, line_map=line_map, changed_files=changed_files
+                )
+            )
 
     if blocking:
-        print(
-            format_findings(
-                blocking, filename=label, line_map=line_map, changed_files=changed_files
-            ),
-            file=sys.stderr,
-        )
+        print("\n".join(reports), file=sys.stderr)
         if args.warn_only:
             print(
                 f"\nappsec: {len(blocking)} HIGH/CRITICAL findings (warn-only, not blocking).",

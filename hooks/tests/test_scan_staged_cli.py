@@ -347,3 +347,58 @@ class TestWarnOnly:
         )
         assert rc == 1
         assert "Fix before committing" in stderr
+
+
+class TestChunking:
+    """A repo-sized input must be split into several requests, not truncated.
+
+    `pre-commit run --all-files` on a real 50-file project synthesizes ~317k chars.
+    Truncating to one 90k request reported the remaining ~70% as clean without ever
+    sending it -- a green run that scanned less than a third of the tree.
+    """
+
+    def _two_big_files(self, tmp_path, chars_each=60_000):
+        body = "\n".join(f"x{i} = {i}" for i in range(chars_each // 10)) + "\n"
+        (tmp_path / "a.py").write_text(body)
+        (tmp_path / "b.py").write_text(body)
+        return body
+
+    def test_oversized_file_set_is_split_not_truncated(self, tmp_path):
+        _init_repo(tmp_path)
+        from hooks.scan_staged_cli import MAX_CODE_CHARS
+
+        self._two_big_files(tmp_path)
+        out, stderr, rc = _run_cli(tmp_path, ["a.py", "b.py"])
+        assert rc == 0, stderr
+
+        sizes = [int(chunk.split()[0]) for chunk in out.split("CAPTURED_CHARS=")[1:]]
+        assert len(sizes) == 2, f"expected 2 requests, got {len(sizes)}: {sizes}"
+        assert all(s <= MAX_CODE_CHARS for s in sizes), sizes
+        assert "scanning in 2 request(s)" in stderr
+
+    def test_every_file_reaches_the_scanner_when_split(self, tmp_path):
+        _init_repo(tmp_path)
+        self._two_big_files(tmp_path)
+        out, stderr, rc = _run_cli(tmp_path, ["a.py", "b.py"])
+        assert rc == 0, stderr
+        # Both files must appear in some request; upstream only ever sent the first.
+        assert "+++ b/a.py" in out
+        assert "+++ b/b.py" in out
+
+    def test_findings_are_aggregated_across_chunks(self, tmp_path):
+        _init_repo(tmp_path)
+        self._two_big_files(tmp_path)
+        # Every request returns one HIGH, so a correct aggregation reports two.
+        out, stderr, rc = _run_cli(
+            tmp_path, ["a.py", "b.py"], mock_response=f"```json\n{_HIGH_FINDING}\n```"
+        )
+        assert rc == 1, stderr
+        assert "2 HIGH/CRITICAL findings" in stderr
+
+    def test_small_input_still_makes_one_request(self, tmp_path):
+        _init_repo(tmp_path)
+        (tmp_path / "small.py").write_text("x = 1\n")
+        out, stderr, rc = _run_cli(tmp_path, ["small.py"])
+        assert rc == 0, stderr
+        assert out.count("CAPTURED_CHARS=") == 1
+        assert "exceeds" not in stderr
