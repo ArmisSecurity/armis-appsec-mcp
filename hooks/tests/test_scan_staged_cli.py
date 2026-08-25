@@ -23,9 +23,10 @@ _HIGH_FINDING = json.dumps(
         {
             "severity": "HIGH",
             "cwe": 89,
-            "title": "SQL injection",
             "line": 5,
-            "description": "concatenated query",
+            # parse_findings/format_findings use "explanation", not "description" --
+            # a finding built with the wrong key renders with an empty message.
+            "explanation": "SQL injection: concatenated query",
         }
     ]
 )
@@ -320,3 +321,29 @@ class TestFindingLocations:
         )
         assert rc == 1, stderr
         assert "app.py:2" in stderr
+
+
+class TestWarnOnly:
+    """--warn-only reports but never blocks; the report itself must be unchanged."""
+
+    def test_warn_only_reports_and_exits_zero(self, tmp_path):
+        _init_repo(tmp_path)
+        (tmp_path / "app.py").write_text("q = 'SELECT ' + user\n")
+
+        _out, stderr, rc = _run_cli(
+            tmp_path, ["--warn-only", "app.py"], mock_response=f"```json\n{_HIGH_FINDING}\n```"
+        )
+        assert rc == 0, stderr
+        assert "SQL injection" in stderr
+        assert "warn-only, not blocking" in stderr
+        assert "Fix before committing" not in stderr
+
+    def test_without_warn_only_the_same_input_blocks(self, tmp_path):
+        _init_repo(tmp_path)
+        (tmp_path / "app.py").write_text("q = 'SELECT ' + user\n")
+
+        _out, stderr, rc = _run_cli(
+            tmp_path, ["app.py"], mock_response=f"```json\n{_HIGH_FINDING}\n```"
+        )
+        assert rc == 1
+        assert "Fix before committing" in stderr

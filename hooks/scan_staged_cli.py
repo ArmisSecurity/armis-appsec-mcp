@@ -16,6 +16,11 @@ Suppression, path exclusion, truncation and the scan-pass token all behave the s
 across modes, except that the scan-pass token is only written for a staged scan --
 that token is a staged-hash claim and means nothing for the other two sources.
 
+Warn-only mode (--warn-only) reports findings and still exits 0. A gate whose
+false-positive rate is unmeasured cannot be turned on blocking without stalling every
+team it lands on; warn-only lets a rollout collect that rate from real repositories
+first, and is meant to be temporary.
+
 Failure policy: fail-open by default (a scanner outage must not stop every commit in
 the org), fail-closed with --strict or APPSEC_HOOK_STRICT=1. This is enforced here in
 `cli_main` rather than under `if __name__ == "__main__":` so that a console-script
@@ -217,6 +222,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail closed: exit non-zero on auth/scan errors instead of allowing the commit.",
     )
     parser.add_argument(
+        "--warn-only",
+        action="store_true",
+        help="Report HIGH/CRITICAL findings but always exit 0. For piloting a new gate.",
+    )
+    parser.add_argument(
         "--no-scan-pass",
         action="store_true",
         help="Do not write the scan-pass token on a clean staged scan.",
@@ -290,6 +300,12 @@ def main(argv: list[str] | None = None) -> int:
             ),
             file=sys.stderr,
         )
+        if args.warn_only:
+            print(
+                f"\nappsec: {len(blocking)} HIGH/CRITICAL findings (warn-only, not blocking).",
+                file=sys.stderr,
+            )
+            return 0
         print(
             f"\nappsec: {len(blocking)} HIGH/CRITICAL findings. Fix before committing.",
             file=sys.stderr,
