@@ -75,6 +75,10 @@ def _run_scan_staged(tmp_path, mock_response=None, mock_auth_error=None, env_ove
                 raise RuntimeError(mock_auth_error)
 
         def fake_call_appsec_api(code):
+            # Record the exact blob handed to the API so tests can assert on what
+            # was (and was not) scanned. Absence of the file means no API call.
+            with open({repr(str(tmp_path / "_scanned.txt"))}, "w") as fh:
+                fh.write(code)
             return mock_response
 
         auth.init_auth = fake_init_auth
@@ -447,3 +451,122 @@ class TestInlineSuppression:
         assert "HIGH/CRITICAL findings" in stderr
         assert "scan-pass written" not in stderr
         assert "HIGH/CRITICAL findings" in stderr
+
+
+def _scanned_text(tmp_path):
+    """The exact blob the API was handed, or None if it was never called."""
+    path = tmp_path / "_scanned.txt"
+    return path.read_text() if path.exists() else None
+
+
+def _init_git_repo_multi(path, files):
+    """Commit an init file, then stage `files` ({rel_path: content}).
+
+    Returns the sha256 of the *unfiltered* staged diff — what
+    hash_utils.compute_staged_hash and git-hooks/pre-commit compute.
+    """
+    subprocess.run(["git", "init"], cwd=str(path), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=str(path),
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=str(path), capture_output=True, check=True
+    )
+    (path / "init.txt").write_text("init")
+    subprocess.run(["git", "add", "init.txt"], cwd=str(path), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(path), capture_output=True, check=True)
+
+    for rel, content in files.items():
+        target = path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        subprocess.run(["git", "add", rel], cwd=str(path), capture_output=True, check=True)
+
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
+        cwd=str(path),
+        capture_output=True,
+    )
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
+class TestArmisIgnorePathExclusion:
+    """`.armisignore` path patterns must exclude files from the git-hook scan.
+
+    filter_diff_excluded_paths() shipped but was only ever called from server.py's
+    scan_diff tool. In the git hook a path pattern was a silent no-op: the only
+    other suppression, apply_suppressions(), matches a finding's cwe/severity/
+    category and never its file — so an excluded file was still sent to the API
+    and could still block the commit.
+    """
+
+    _HIGH = json.dumps(
+        [
+            {
+                "severity": "HIGH",
+                "cwe": 798,
+                "cwe_name": "Hard-coded Creds",
+                "line": 1,
+                "explanation": "token in source",
+            }
+        ]
+    )
+
+    def test_excluded_file_is_dropped_from_the_scanned_diff(self, tmp_path):
+        _init_git_repo_multi(
+            tmp_path,
+            {"app.py": "print('app')\n", "generated/schema.py": "TOKEN = 'abc123'\n"},
+        )
+        (tmp_path / ".armisignore").write_text("generated/\n")
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response="```json\n[]\n```")
+        assert rc == 0
+        scanned = _scanned_text(tmp_path)
+        assert "app.py" in scanned
+        assert "generated/schema.py" not in scanned
+        assert "TOKEN" not in scanned
+
+    def test_excluded_file_no_longer_blocks_the_commit(self, tmp_path):
+        """The whole point of the directive: a HIGH in an excluded file cannot gate."""
+        _init_git_repo_multi(tmp_path, {"generated/schema.py": "TOKEN = 'abc123'\n"})
+        (tmp_path / ".armisignore").write_text("generated/\n")
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{self._HIGH}\n```")
+        assert rc == 0
+        # Every staged file excluded → the API is never called at all.
+        assert _scanned_text(tmp_path) is None
+        assert "all changed files excluded by .armisignore" in stderr
+
+    def test_basename_pattern_excludes(self, tmp_path):
+        """A pattern with no '/' matches the basename, as in .gitignore."""
+        _init_git_repo_multi(tmp_path, {"src/fixtures.py": "TOKEN = 'abc123'\n"})
+        (tmp_path / ".armisignore").write_text("fixtures.py\n")
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{self._HIGH}\n```")
+        assert rc == 0
+        assert _scanned_text(tmp_path) is None
+
+    def test_all_excluded_writes_a_scan_pass_over_the_unfiltered_diff(self, tmp_path):
+        """Nothing left to scan is a clean scan, and the handshake must still match.
+
+        Two things are being asserted. (1) The scan-pass is written, so a repo that
+        legitimately excludes every staged file is not blocked by git-hooks/pre-commit
+        under APPSEC_HOOK_STRICT=1. (2) It hashes the diff *before* filtering — the
+        gate reader (hash_utils.compute_staged_hash) hashes the unfiltered diff, so a
+        hash over the filtered text could never match.
+        """
+        expected_hash = _init_git_repo_multi(tmp_path, {"generated/schema.py": "TOKEN = 'a'\n"})
+        (tmp_path / ".armisignore").write_text("generated/\n")
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response="```json\n[]\n```")
+        assert rc == 0
+        assert _scanned_text(tmp_path) is None
+        assert scan_pass_path(tmp_path).read_text().strip() == expected_hash
+
+    def test_cwe_directive_alone_does_not_filter_the_diff(self, tmp_path):
+        """A .armisignore with no path patterns must leave the diff untouched."""
+        _init_git_repo_multi(tmp_path, {"app.py": "TOKEN = 'abc123'\n"})
+        (tmp_path / ".armisignore").write_text("cwe:798\n")
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{self._HIGH}\n```")
+        # Suppressed by cwe:798, not by path — the file was still scanned.
+        assert rc == 0
+        assert "app.py" in _scanned_text(tmp_path)
