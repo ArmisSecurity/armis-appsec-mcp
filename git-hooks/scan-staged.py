@@ -29,9 +29,26 @@ from scanner_core import (  # noqa: E402
 from suppression import (  # noqa: E402
     apply_inline_suppressions_to_diff,
     apply_suppressions,
+    filter_diff_excluded_paths,
     find_git_root,
     load_armisignore,
 )
+
+
+def _write_scan_pass(raw_diff: bytes) -> None:
+    """Record a passing scan for git-hooks/pre-commit to verify.
+
+    Hashes the *unfiltered* staged diff, which is what hash_utils.compute_staged_hash
+    and git-hooks/pre-commit hash. Any filtering applied to the text sent to the API
+    must not reach this hash, or the gate reader can never match it.
+    """
+    staged_hash = hashlib.sha256(raw_diff).hexdigest()
+    cleanup_legacy_scan_pass()  # remove any stale working-tree .scan-pass
+    scan_pass_path = resolve_scan_pass_path()
+    tmp_path_file = scan_pass_path + ".tmp"
+    with open(tmp_path_file, "w") as f:
+        f.write(staged_hash)
+    os.replace(tmp_path_file, scan_pass_path)
 
 
 def main() -> None:
@@ -55,11 +72,32 @@ def main() -> None:
     # keeps non-UTF-8 staged content from raising UnicodeDecodeError → the
     # fail-open catch-all, which would silently allow an unscanned commit.
     diff_text = result.stdout.decode("utf-8", errors="replace")
-    response = call_appsec_api(diff_text)
-    findings = parse_findings(response)
 
     git_root = find_git_root()
     config = load_armisignore(git_root)
+
+    # Drop diff sections for files excluded by .armisignore path patterns before
+    # the API call, exactly as server.py's scan_diff does. Without this the path
+    # patterns are a silent no-op in the git hook: apply_suppressions() below only
+    # matches a finding's cwe/severity/category, never its file, so an excluded
+    # file was still scanned and could still block the commit. Filter only the text
+    # sent to the API -- the scan-pass hash stays over the unfiltered diff.
+    if git_root and config.file_patterns:
+        diff_text = filter_diff_excluded_paths(diff_text, config, git_root)
+        if not diff_text.strip():
+            # Nothing left to scan is a clean scan, not an absent one: write the
+            # scan-pass so a repo that legitimately excludes every staged file is
+            # not blocked by git-hooks/pre-commit under APPSEC_HOOK_STRICT=1.
+            _write_scan_pass(result.stdout)
+            print(
+                "appsec: all changed files excluded by .armisignore. scan-pass written.",
+                file=sys.stderr,
+            )
+            sys.exit(0)
+
+    response = call_appsec_api(diff_text)
+    findings = parse_findings(response)
+
     active, _suppressed, _summary = apply_suppressions(findings, config)
 
     # Apply inline armis:ignore suppression against the staged diff blob. Keeps the
@@ -67,7 +105,7 @@ def main() -> None:
     # Use the decoded text copy (same string the API scanned) for line mapping and
     # inline suppression -- the raw result.stdout is bytes here (hashed below to match
     # hash_utils.compute_staged_hash), but these helpers operate on str.
-    line_map, _changed = build_diff_line_map(diff_text)
+    line_map, changed_files = build_diff_line_map(diff_text)
     active, inline_suppressed = apply_inline_suppressions_to_diff(active, diff_text, line_map)
 
     # Suppressed HIGH does not block (team already accepted risk via .armisignore /
@@ -84,20 +122,25 @@ def main() -> None:
     blocking.extend(inline_suppressed_critical)
 
     if blocking:
-        print(format_findings(blocking, filename="staged-diff"), file=sys.stderr)
+        # line_map/changed_files let format_findings() translate a finding's diff-blob
+        # line number into the real path:line. Without them every finding printed as a
+        # bare `L<blob line>`, which reads as a file line and points at the wrong code.
+        print(
+            format_findings(
+                blocking,
+                filename="staged-diff",
+                line_map=line_map,
+                changed_files=changed_files,
+            ),
+            file=sys.stderr,
+        )
         print(
             f"\nappsec: {len(blocking)} HIGH/CRITICAL findings. Fix before committing.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    staged_hash = hashlib.sha256(result.stdout).hexdigest()
-    cleanup_legacy_scan_pass()  # remove any stale working-tree .scan-pass
-    scan_pass_path = resolve_scan_pass_path()
-    tmp_path_file = scan_pass_path + ".tmp"
-    with open(tmp_path_file, "w") as f:
-        f.write(staged_hash)
-    os.replace(tmp_path_file, scan_pass_path)
+    _write_scan_pass(result.stdout)
     print("appsec: scan clean. scan-pass written.", file=sys.stderr)
 
     sys.exit(0)
