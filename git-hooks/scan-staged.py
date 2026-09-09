@@ -105,7 +105,7 @@ def main() -> None:
     # Use the decoded text copy (same string the API scanned) for line mapping and
     # inline suppression -- the raw result.stdout is bytes here (hashed below to match
     # hash_utils.compute_staged_hash), but these helpers operate on str.
-    line_map, _changed = build_diff_line_map(diff_text)
+    line_map, changed_files = build_diff_line_map(diff_text)
     active, inline_suppressed = apply_inline_suppressions_to_diff(active, diff_text, line_map)
 
     # Suppressed HIGH does not block (team already accepted risk via .armisignore /
@@ -122,7 +122,18 @@ def main() -> None:
     blocking.extend(inline_suppressed_critical)
 
     if blocking:
-        print(format_findings(blocking, filename="staged-diff"), file=sys.stderr)
+        # line_map/changed_files let format_findings() translate a finding's diff-blob
+        # line number into the real path:line. Without them every finding printed as a
+        # bare `L<blob line>`, which reads as a file line and points at the wrong code.
+        print(
+            format_findings(
+                blocking,
+                filename="staged-diff",
+                line_map=line_map,
+                changed_files=changed_files,
+            ),
+            file=sys.stderr,
+        )
         print(
             f"\nappsec: {len(blocking)} HIGH/CRITICAL findings. Fix before committing.",
             file=sys.stderr,

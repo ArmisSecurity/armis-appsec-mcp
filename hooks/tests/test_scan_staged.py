@@ -570,3 +570,56 @@ class TestArmisIgnorePathExclusion:
         # Suppressed by cwe:798, not by path — the file was still scanned.
         assert rc == 0
         assert "app.py" in _scanned_text(tmp_path)
+
+
+class TestFindingLocations:
+    """Findings must be reported at a source path:line, not a diff-blob line.
+
+    format_findings() can translate a finding's blob line number into the real
+    path:line, but only when handed the line_map that build_diff_line_map()
+    produces. scan-staged.py computed that map (it needs it for inline
+    suppression) and then called format_findings() without it, so every finding
+    printed as a bare `L<blob line>` — offset by the diff headers, and
+    indistinguishable from a file line number to whoever reads the failure.
+    """
+
+    def test_blocking_finding_reports_source_path_and_line(self, tmp_path):
+        # Token on source line 4. The diff header lines push it further down the
+        # blob, so an unmapped report cannot name line 4.
+        content = "import os\n\n\nTOKEN = 'abc123'\n"
+        _init_git_repo(tmp_path, staged_content=content)
+        blob_line = _staged_blob_line(tmp_path, "TOKEN")
+        assert blob_line != 4, "fixture must separate blob line from source line"
+        findings = json.dumps(
+            [
+                {
+                    "severity": "HIGH",
+                    "cwe": 798,
+                    "cwe_name": "Hard-coded Creds",
+                    "line": blob_line,
+                    "explanation": "token in source",
+                }
+            ]
+        )
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{findings}\n```")
+        assert rc == 1
+        assert "test.py:4" in stderr
+        assert f"L{blob_line}" not in stderr
+
+    def test_unmappable_line_still_falls_back(self, tmp_path):
+        """A finding whose line is outside the map must still print, not crash."""
+        _init_git_repo(tmp_path, staged_content="TOKEN = 'abc123'\n")
+        findings = json.dumps(
+            [
+                {
+                    "severity": "CRITICAL",
+                    "cwe": 798,
+                    "cwe_name": "Hard-coded Creds",
+                    "line": 9999,
+                    "explanation": "token in source",
+                }
+            ]
+        )
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{findings}\n```")
+        assert rc == 1
+        assert "L9999" in stderr
