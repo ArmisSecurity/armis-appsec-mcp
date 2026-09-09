@@ -22,6 +22,7 @@ from device_auth import (
     OAuthError,
     open_browser,
 )
+from single_flight import SingleFlight
 from token_cache import StoredToken, TokenStore
 
 logger = logging.getLogger("appsec-mcp")
@@ -43,7 +44,12 @@ class SharedCacheAuth:
     Fail-closed: a terminal failure raises ``RuntimeError`` (can't scan without
     auth), matching the fail-open/closed policy table in CLAUDE.md.
 
-    Not thread-safe -- the MCP plugin processes tool calls sequentially.
+    Thread-safe: concurrent ``get_header`` calls are coalesced into a single
+    resolution by ``single_flight.SingleFlight``. Steps 3 and 4 are the reason
+    it matters -- the refresh grant is rotated, so a second thread replaying
+    the same refresh token is reuse and the server revokes the whole token
+    family; and two threads with an empty cache each start their own RFC 8628
+    flow, so the developer gets N browser prompts with N codes for one scan.
     """
 
     def __init__(self, issuer: str, store: TokenStore | None = None):
@@ -51,6 +57,8 @@ class SharedCacheAuth:
         self._store = store if store is not None else TokenStore()
         self._device = DeviceClient(issuer)
         self._token: StoredToken | None = None
+        # Coalesces concurrent resolutions and guards _token / _rejected.
+        self._flight = SingleFlight()
         # Access tokens the server rejected (401). A token can be unexpired
         # locally yet killed server-side (session revoked/logged out), so we
         # must not keep handing it back from the in-memory or on-disk cache.
@@ -60,8 +68,21 @@ class SharedCacheAuth:
     # Token lifecycle
     # ------------------------------------------------------------------
     def get_header(self) -> str:
-        """Return 'Bearer <token>', resolving/refreshing/logging-in as needed."""
-        return f"Bearer {self._ensure_access_token()}"
+        """Return 'Bearer <token>', resolving/refreshing/logging-in as needed.
+
+        Concurrent callers share one resolution, and one failure -- see
+        ``single_flight.SingleFlight``.
+        """
+
+        def in_memory() -> str | None:
+            if self._usable(self._token):
+                return f"Bearer {self._token.access_token}"  # type: ignore[union-attr]
+            return None
+
+        def resolve_once() -> str:
+            return f"Bearer {self._ensure_access_token()}"
+
+        return self._flight.run(in_memory, resolve_once)
 
     def invalidate(self) -> None:
         """Mark the last-issued access token as bad so the next call re-auths.
@@ -72,15 +93,20 @@ class SharedCacheAuth:
         past the in-memory/cache hits into refresh → device login, and prevents
         an infinite loop of re-reading the same dead token from ``.sessions``.
         """
-        if self._token is not None and self._token.access_token:
-            self._rejected.add(self._token.access_token)
-        self._token = None
+        with self._flight.lock:
+            if self._token is not None and self._token.access_token:
+                self._rejected.add(self._token.access_token)
+            self._token = None
+        # A 401 is new information: let the next caller attempt again rather
+        # than inherit the previous attempt's error.
+        self._flight.clear_error()
 
     def _usable(self, token: StoredToken | None) -> bool:
         """True when ``token`` is present, unexpired, and not server-rejected."""
         return token is not None and token.is_valid() and token.access_token not in self._rejected
 
     def _ensure_access_token(self) -> str:
+        """Resolve a usable access token. Runs single-flighted (see ``get_header``)."""
         # 1. In-memory token still valid (and not rejected).
         if self._usable(self._token):
             return self._token.access_token  # type: ignore[union-attr]
@@ -188,7 +214,8 @@ class SharedCacheAuth:
     # ------------------------------------------------------------------
     def status(self) -> str:
         """Human-readable, token-free status label."""
-        token = self._token or self._store.load(self._issuer)
+        with self._flight.lock:
+            token = self._token or self._store.load(self._issuer)
         if token is None or not token.access_token:
             return "shared cache: not signed in"
         remaining = token.seconds_remaining()

@@ -549,3 +549,251 @@ class TestSharedCacheAuth:
             header = provider.get_header()
 
         assert header == "Bearer fresh"  # fell through to device login, not the killed token
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: both providers are reached from several threads at once
+#
+# server._run_scan dispatches call_appsec_api through asyncio.to_thread, and
+# the MCP SDK starts each incoming request as its own task
+# (mcp/server/lowlevel/server.py: tg.start_soon(self._handle_message, ...)),
+# so N in-flight tool calls mean N threads inside get_header() at once.
+# Each provider must coalesce that into a single credential exchange.
+# ---------------------------------------------------------------------------
+class _Concurrently:
+    """Run ``fn`` on ``n`` threads that all start at the same instant.
+
+    The barrier is what makes these tests deterministic: without it a fast
+    first thread could finish its exchange before the others look at the
+    cache, and an unsynchronized provider would pass by luck.
+    """
+
+    def __init__(self, n: int = 8):
+        self.n = n
+
+    def __call__(self, fn):
+        import threading
+
+        barrier = threading.Barrier(self.n)
+        results: list[object] = [None] * self.n
+        errors: list[BaseException | None] = [None] * self.n
+
+        def worker(i: int) -> None:
+            try:
+                barrier.wait(timeout=10)
+                results[i] = fn()
+            except BaseException as e:  # noqa: BLE001 - re-raised below
+                errors[i] = e
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(self.n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+            assert not t.is_alive(), "worker thread did not finish — deadlock?"
+        for e in errors:
+            if e is not None:
+                raise e
+        return results
+
+
+class TestJWTAuthConcurrency:
+    @pytest.fixture(autouse=True)
+    def _set_secret(self, monkeypatch):
+        monkeypatch.setenv("ARMIS_CLIENT_SECRET", "secret")
+
+    def test_concurrent_get_header_exchanges_once(self):
+        # Every extra exchange is a wasted round trip against /auth/token, and
+        # enough of them trip the endpoint's rate limiter (HTTP 429) — which the
+        # scan path then reports as an auth failure.
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        fake_token = _make_jwt(exp=time.time() + 3600)
+
+        calls = []
+
+        def slow_post(*args, **kwargs):
+            calls.append(1)
+            time.sleep(0.05)  # widen the window a racing thread would exploit
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"token": fake_token, "region": "us1"}
+            mock_response.raise_for_status = MagicMock()
+            return mock_response
+
+        with patch("auth.httpx.post", side_effect=slow_post):
+            headers = _Concurrently(8)(jwt_auth.get_header)
+
+        assert len(calls) == 1, f"expected 1 token exchange, got {len(calls)}"
+        assert headers == [f"Bearer {fake_token}"] * 8
+
+    def test_concurrent_invalidate_and_get_header_never_returns_bare_bearer(self):
+        # invalidate() clears _token; an unsynchronized get_header() can observe
+        # that intermediate state and format "Bearer None" into a live request.
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        fake_token = _make_jwt(exp=time.time() + 3600)
+        jwt_auth._token = fake_token
+        jwt_auth._expires_at = time.time() + 3600
+
+        def slow_post(*args, **kwargs):
+            time.sleep(0.01)
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"token": fake_token, "region": "us1"}
+            mock_response.raise_for_status = MagicMock()
+            return mock_response
+
+        def churn():
+            for _ in range(20):
+                jwt_auth.invalidate()
+                header = jwt_auth.get_header()
+                assert header != "Bearer None", "handed out a header with no token"
+                assert header.startswith("Bearer ey")
+            return True
+
+        with patch("auth.httpx.post", side_effect=slow_post):
+            assert _Concurrently(4)(churn) == [True] * 4
+
+
+class TestSharedCacheAuthConcurrency:
+    ISSUER = "https://moose.armis.com"
+
+    def _make(self, tmp_path):
+        store = TokenStore(dir=str(tmp_path))
+        return SharedCacheAuth(self.ISSUER, store=store), store
+
+    def test_concurrent_refresh_grants_only_once(self, tmp_path):
+        # The refresh grant is rotated: the first refresh invalidates "r1", so a
+        # second concurrent refresh with the same token is reuse — the server's
+        # reuse detection revokes the whole token family (see CLAUDE.md).
+        provider, store = self._make(tmp_path)
+        store.save(
+            self.ISSUER,
+            StoredToken(
+                access_token="old",
+                refresh_token="r1",
+                expires_at=_future(-100),  # expired -> refresh path
+                client_id="armis-cli",
+            ),
+        )
+
+        calls = []
+
+        def slow_refresh(refresh_token, client_id):
+            calls.append(refresh_token)
+            time.sleep(0.05)
+            return StoredToken(access_token="new", refresh_token="r2", expires_at=_future())
+
+        with patch.object(provider._device, "refresh", side_effect=slow_refresh):
+            headers = _Concurrently(8)(provider.get_header)
+
+        assert calls == ["r1"], f"refresh token replayed {len(calls)} times: {calls}"
+        assert headers == ["Bearer new"] * 8
+
+    def test_concurrent_device_login_opens_one_browser(self, tmp_path, monkeypatch):
+        # Worst case of the race: N threads with an empty cache each start their
+        # own RFC 8628 flow, so the developer gets N browser windows and N codes.
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        provider, store = self._make(tmp_path)
+        da = DeviceAuthorization("dc", "UC", "https://v", "https://v?c=UC", 600, 5)
+        fresh = StoredToken(access_token="fresh", refresh_token="rn", expires_at=_future())
+
+        def slow_poll(*args, **kwargs):
+            time.sleep(0.05)
+            return fresh
+
+        with (
+            patch.object(provider._device, "request_device_code", return_value=da) as mock_req,
+            patch.object(provider._device, "poll_token", side_effect=slow_poll) as mock_poll,
+            patch("shared_cache_auth.open_browser", return_value=False) as mock_browser,
+        ):
+            headers = _Concurrently(8)(provider.get_header)
+
+        assert mock_req.call_count == 1, f"{mock_req.call_count} device flows started"
+        assert mock_poll.call_count == 1
+        assert mock_browser.call_count == 1
+        assert headers == ["Bearer fresh"] * 8
+        assert store.load(self.ISSUER).access_token == "fresh"
+
+
+class TestAuthFailureIsNotReplayed:
+    """A failed exchange must be shared with the threads that waited on it.
+
+    Coalescing the *success* path is not enough. The failure that matters is
+    HTTP 429 from /auth/token, and replaying the same request N more times is
+    the worst possible response to being rate limited -- measured live: 24
+    concurrent scans produced 24 POSTs and 23 of them 429, and each retry
+    extends the lockout window.
+
+    Single-flight semantics: threads that arrive while an exchange is in
+    flight share its outcome, success or failure. A caller arriving afterwards
+    gets a fresh attempt, so a transient failure is still retryable.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _set_secret(self, monkeypatch):
+        monkeypatch.setenv("ARMIS_CLIENT_SECRET", "secret")
+
+    def test_concurrent_429_posts_once(self):
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        calls = []
+
+        def rate_limited(*args, **kwargs):
+            calls.append(1)
+            time.sleep(0.05)
+            response = MagicMock()
+            response.status_code = 429
+            error = __import__("httpx").HTTPStatusError(
+                "429", request=MagicMock(), response=response
+            )
+            response.raise_for_status = MagicMock(side_effect=error)
+            return response
+
+        def attempt():
+            with pytest.raises(RuntimeError, match="429"):
+                jwt_auth.get_header()
+            return True
+
+        with patch("auth.httpx.post", side_effect=rate_limited):
+            assert _Concurrently(8)(attempt) == [True] * 8
+
+        assert len(calls) == 1, f"replayed a rate-limited exchange {len(calls)} times"
+
+    def test_later_call_retries_after_a_failure(self):
+        # The shared failure must not become a sticky error: a caller arriving
+        # after the failed attempt gets its own exchange.
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        fake_token = _make_jwt(exp=time.time() + 3600)
+
+        with patch("auth.httpx.post", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                jwt_auth.get_header()
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"token": fake_token, "region": "us1"}
+        mock_response.raise_for_status = MagicMock()
+        with patch("auth.httpx.post", return_value=mock_response) as mock_post:
+            assert jwt_auth.get_header() == f"Bearer {fake_token}"
+        mock_post.assert_called_once()
+
+    def test_concurrent_device_login_failure_asks_once(self, tmp_path, monkeypatch):
+        # Same rule for the SSO path: one failed sign-in, not N browser prompts.
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        store = TokenStore(dir=str(tmp_path))
+        provider = SharedCacheAuth("https://moose.armis.com", store=store)
+        da = DeviceAuthorization("dc", "UC", "https://v", "https://v?c=UC", 600, 5)
+
+        def slow_deny(*args, **kwargs):
+            time.sleep(0.05)
+            raise OAuthError("access_denied")
+
+        def attempt():
+            with pytest.raises(RuntimeError):
+                provider.get_header()
+            return True
+
+        with (
+            patch.object(provider._device, "request_device_code", return_value=da) as mock_req,
+            patch.object(provider._device, "poll_token", side_effect=slow_deny),
+            patch("shared_cache_auth.open_browser", return_value=False),
+        ):
+            assert _Concurrently(8)(attempt) == [True] * 8
+
+        assert mock_req.call_count == 1, f"{mock_req.call_count} sign-ins for one failure"
