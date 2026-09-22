@@ -4,6 +4,31 @@ VENV_DIR="$PLUGIN_DIR/.venv"
 REQS_FILE="$PLUGIN_DIR/requirements.txt"
 DEPS_SENTINEL="$VENV_DIR/.deps-installed"
 
+# venv layout differs by platform: POSIX puts the interpreter under bin/,
+# native Windows Python (e.g. via Git Bash) puts it under Scripts/.
+venv_python() {
+    if [ -f "$VENV_DIR/bin/python" ]; then
+        printf '%s\n' "$VENV_DIR/bin/python"
+    elif [ -f "$VENV_DIR/Scripts/python.exe" ]; then
+        printf '%s\n' "$VENV_DIR/Scripts/python.exe"
+    fi
+}
+
+venv_pip() {
+    if [ -f "$VENV_DIR/bin/pip" ]; then
+        printf '%s\n' "$VENV_DIR/bin/pip"
+    elif [ -f "$VENV_DIR/Scripts/pip.exe" ]; then
+        printf '%s\n' "$VENV_DIR/Scripts/pip.exe"
+    fi
+}
+
+# Native Windows Python installs commonly expose only "python", not "python3".
+PYTHON_BIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+if [ -z "$PYTHON_BIN" ]; then
+    echo "ERROR: no python3/python found on PATH." >&2
+    exit 1
+fi
+
 # Compute a hash of requirements.txt to detect changes.
 REQS_HASH=""
 if command -v sha256sum >/dev/null 2>&1; then
@@ -24,8 +49,9 @@ fi
 
 # Also reinstall if the venv's Python is broken (e.g. pyenv version switch, Homebrew upgrade).
 # Running `python -c ""` is a cheap probe — it fails if the interpreter binary is gone/stale.
-if [ "$NEEDS_INSTALL" -eq 0 ] && [ -f "$VENV_DIR/bin/python" ]; then
-    if ! "$VENV_DIR/bin/python" -c "" >/dev/null 2>&1; then
+if [ "$NEEDS_INSTALL" -eq 0 ]; then
+    VENV_PYTHON="$(venv_python)"
+    if [ -z "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c "" >/dev/null 2>&1; then
         NEEDS_INSTALL=1
     fi
 fi
@@ -33,10 +59,12 @@ fi
 if [ "$NEEDS_INSTALL" -eq 1 ]; then
     # Remove existing venv entirely before recreating — re-running venv against an existing
     # directory with a different Python grafts a second lib/pythonX.Y tree while leaving
-    # bin/python pointing at the original, causing ModuleNotFoundError at runtime.
+    # bin/python (or Scripts/python.exe) pointing at the original, causing
+    # ModuleNotFoundError at runtime.
     rm -rf "$VENV_DIR"
-    python3 -m venv "$VENV_DIR" || { echo "ERROR: python3 -m venv failed. Is python3 installed?" >&2; exit 1; }
-    "$VENV_DIR/bin/pip" install -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
+    "$PYTHON_BIN" -m venv "$VENV_DIR" || { echo "ERROR: $PYTHON_BIN -m venv failed." >&2; exit 1; }
+    VENV_PIP="$(venv_pip)"
+    "$VENV_PIP" install -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
     if [ -n "$REQS_HASH" ]; then
         printf '%s\n' "$REQS_HASH" > "$DEPS_SENTINEL"
     else
@@ -68,4 +96,5 @@ if [ -z "${ARMIS_CLIENT_ID:-}" ] || [ -z "${ARMIS_CLIENT_SECRET:-}" ]; then
     fi
 fi
 
-exec "$VENV_DIR/bin/python" "$PLUGIN_DIR/server.py"
+VENV_PYTHON="$(venv_python)"
+exec "$VENV_PYTHON" "$PLUGIN_DIR/server.py"

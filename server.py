@@ -228,7 +228,7 @@ mcp = FastMCP(
 # Security: path validation for scan_file
 # ---------------------------------------------------------------------------
 _BLOCKED_PREFIXES = ("/etc/", "/proc/", "/sys/", "/private/etc/")
-_BLOCKED_DOTDIRS = {".ssh", ".gnupg", ".aws", ".config/gcloud"}
+_BLOCKED_DOTDIRS = {".ssh", ".gnupg", ".aws", os.path.join(".config", "gcloud")}
 _MAX_CODE_CHARS = 90_000
 
 # Git ref validation: alphanumeric + common ref chars (branch, tag, SHA, HEAD~3)
@@ -256,7 +256,7 @@ def _validate_file_path(file_path: str) -> str:
 
     # Allowlist: path must be under HOME, /tmp, or /private/tmp
     allowed = _get_allowed_roots()
-    if not any(resolved == root or resolved.startswith(root + "/") for root in allowed):
+    if not any(resolved == root or resolved.startswith(root + os.sep) for root in allowed):
         raise ToolError(f"Path '{file_path}' is outside allowed directories (home, /tmp).")
 
     # Blocklist (defense-in-depth): system paths
