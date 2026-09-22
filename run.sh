@@ -24,8 +24,15 @@ venv_pip() {
 
 # Native Windows Python installs commonly expose only "python", not "python3".
 PYTHON_BIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+PYTHON_ARGS=""
+# Stock python.org Windows installs may register only the "py" launcher,
+# with neither "python3" nor "python" on PATH.
+if [ -z "$PYTHON_BIN" ] && command -v py >/dev/null 2>&1; then
+    PYTHON_BIN="py"
+    PYTHON_ARGS="-3"
+fi
 if [ -z "$PYTHON_BIN" ]; then
-    echo "ERROR: no python3/python found on PATH." >&2
+    echo "ERROR: no python3/python/py found on PATH." >&2
     exit 1
 fi
 
@@ -62,8 +69,12 @@ if [ "$NEEDS_INSTALL" -eq 1 ]; then
     # bin/python (or Scripts/python.exe) pointing at the original, causing
     # ModuleNotFoundError at runtime.
     rm -rf "$VENV_DIR"
-    "$PYTHON_BIN" -m venv "$VENV_DIR" || { echo "ERROR: $PYTHON_BIN -m venv failed." >&2; exit 1; }
+    "$PYTHON_BIN" $PYTHON_ARGS -m venv "$VENV_DIR" || { echo "ERROR: $PYTHON_BIN $PYTHON_ARGS -m venv failed." >&2; exit 1; }
     VENV_PIP="$(venv_pip)"
+    if [ -z "$VENV_PIP" ]; then
+        echo "ERROR: no pip found in $VENV_DIR (checked bin/pip and Scripts/pip.exe) after venv creation." >&2
+        exit 1
+    fi
     "$VENV_PIP" install -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
     if [ -n "$REQS_HASH" ]; then
         printf '%s\n' "$REQS_HASH" > "$DEPS_SENTINEL"

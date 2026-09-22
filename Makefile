@@ -28,6 +28,7 @@ install-hooks:
 	@git rev-parse --git-dir >/dev/null 2>&1 || { echo "ERROR: not a git repository. Run from the repo root." >&2; exit 1; }
 	@HOOKS_DIR=$$(git rev-parse --git-path hooks) && \
 	mkdir -p "$$HOOKS_DIR" && \
+	rm -f "$$HOOKS_DIR/pre-commit" && \
 	printf '#!/usr/bin/env bash\nexec "$$(git rev-parse --show-toplevel)/git-hooks/pre-commit" "$$@"\n' > "$$HOOKS_DIR/pre-commit" && \
 	chmod +x "$$HOOKS_DIR/pre-commit" git-hooks/pre-commit && \
 	echo "Pre-commit hook installed (fail-open). Set APPSEC_HOOK_STRICT=1 for strict mode."
