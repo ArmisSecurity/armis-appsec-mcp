@@ -25,15 +25,22 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 install-hooks:
-	@test -d .git || { echo "ERROR: not a git repository. Run from the repo root." >&2; exit 1; }
-	@mkdir -p .git/hooks
-	@ln -sf ../../git-hooks/pre-commit .git/hooks/pre-commit
-	@chmod +x git-hooks/pre-commit
-	@echo "Pre-commit hook installed (fail-open). Set APPSEC_HOOK_STRICT=1 for strict mode."
+	@git rev-parse --git-dir >/dev/null 2>&1 || { echo "ERROR: not a git repository. Run from the repo root." >&2; exit 1; }
+	@HOOKS_DIR=$$(git rev-parse --git-path hooks) && \
+	mkdir -p "$$HOOKS_DIR" && \
+	TARGET="$$(cd git-hooks && pwd)/pre-commit" && \
+	printf '#!/usr/bin/env bash\nexec "%s" "$$@"\n' "$$TARGET" > "$$HOOKS_DIR/pre-commit" && \
+	chmod +x "$$HOOKS_DIR/pre-commit" git-hooks/pre-commit && \
+	echo "Pre-commit hook installed (fail-open). Set APPSEC_HOOK_STRICT=1 for strict mode."
+# A generated wrapper (not a symlink) so this works without symlink privileges
+# on Windows, and --git-path resolves the *shared* hooks dir so it's correct
+# from any worktree (unlike --absolute-git-dir, used elsewhere for per-worktree
+# state).
 
 uninstall-hooks:
-	@rm -f .git/hooks/pre-commit
-	@echo "Pre-commit hook removed."
+	@HOOKS_DIR=$$(git rev-parse --git-path hooks 2>/dev/null || echo .git/hooks) && \
+	rm -f "$$HOOKS_DIR/pre-commit" && \
+	echo "Pre-commit hook removed."
 
 # ---------------------------------------------------------------------------
 # Local dev: point the installed plugin at THIS working tree so you can test
