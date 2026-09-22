@@ -3,9 +3,33 @@
 # Installed via: make install-hooks | Fails OPEN by default
 # Set APPSEC_HOOK_STRICT=1 for fail-closed behavior.
 
-HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Symlink: .git/hooks/pre-commit -> ../../git-hooks/pre-commit
-PLUGIN_DIR="$(cd "$HOOK_DIR/../.." && pwd)"
+# Resolve our own real location. This script may be invoked three ways:
+#   (a) directly, (b) via the legacy `.git/hooks/pre-commit -> ../../git-hooks/pre-commit`
+#   symlink, or (c) via the `make install-hooks`-generated wrapper, which `exec`s us by
+#   absolute path (so $0 is one directory level shallower than under the old symlink).
+# Following symlinks/`$0` by hand and normalizing depth is fragile (see PPSC-1478 history),
+# so instead we always resolve to OUR canonical on-disk path and derive PLUGIN_DIR as
+# exactly one level above the git-hooks/ directory that contains us — correct regardless
+# of how we were invoked.
+_self="$0"
+while [ -h "$_self" ]; do
+    _link_dir="$(cd -P "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    case "$_self" in
+        /*) ;;
+        *) _self="$_link_dir/$_self" ;;
+    esac
+done
+HOOK_DIR="$(cd -P "$(dirname "$_self")" && pwd)"
+PLUGIN_DIR="$(cd "$HOOK_DIR/.." && pwd)"
+
+# venv layout differs by platform: POSIX puts the interpreter under bin/,
+# native Windows Python (e.g. via Git Bash) puts it under Scripts/. Mirrors run.sh.
+VENV_PYTHON="$PLUGIN_DIR/.venv/bin/python"
+if [ ! -f "$VENV_PYTHON" ]; then
+    VENV_PYTHON="$PLUGIN_DIR/.venv/Scripts/python.exe"
+fi
+
 # Resolve scan-pass inside the git dir (matches hash_utils.resolve_scan_pass_path).
 # --absolute-git-dir is worktree-correct: it returns the per-worktree git dir
 # (.git is a *file* in a worktree, so a work-tree path would diverge).
@@ -25,12 +49,12 @@ fail_open() {
 if [ ! -f "$SCAN_PASS" ]; then
     echo "appsec: No scan pass found. Scan staged changes before committing." >&2
     echo "  Hint: ask your AI assistant to 'scan staged changes'" >&2
-    echo "  Or: $PLUGIN_DIR/.venv/bin/python $PLUGIN_DIR/git-hooks/scan-staged.py" >&2
+    echo "  Or: $VENV_PYTHON $PLUGIN_DIR/git-hooks/scan-staged.py" >&2
     fail_open "no .scan-pass"
 fi
 
 # Compute current staged hash using the SAME Python function as server.py
-CURRENT_HASH=$(APPSEC_PLUGIN_DIR="$PLUGIN_DIR" "$PLUGIN_DIR/.venv/bin/python" -c "
+CURRENT_HASH=$(APPSEC_PLUGIN_DIR="$PLUGIN_DIR" "$VENV_PYTHON" -c "
 import os, sys
 sys.path.insert(0, os.environ['APPSEC_PLUGIN_DIR'])
 from hash_utils import compute_staged_hash

@@ -28,14 +28,17 @@ install-hooks:
 	@git rev-parse --git-dir >/dev/null 2>&1 || { echo "ERROR: not a git repository. Run from the repo root." >&2; exit 1; }
 	@HOOKS_DIR=$$(git rev-parse --git-path hooks) && \
 	mkdir -p "$$HOOKS_DIR" && \
-	TARGET="$$(cd git-hooks && pwd)/pre-commit" && \
-	printf '#!/usr/bin/env bash\nexec "%s" "$$@"\n' "$$TARGET" > "$$HOOKS_DIR/pre-commit" && \
+	printf '#!/usr/bin/env bash\nexec "$$(git rev-parse --show-toplevel)/git-hooks/pre-commit" "$$@"\n' > "$$HOOKS_DIR/pre-commit" && \
 	chmod +x "$$HOOKS_DIR/pre-commit" git-hooks/pre-commit && \
 	echo "Pre-commit hook installed (fail-open). Set APPSEC_HOOK_STRICT=1 for strict mode."
-# A generated wrapper (not a symlink) so this works without symlink privileges
-# on Windows, and --git-path resolves the *shared* hooks dir so it's correct
-# from any worktree (unlike --absolute-git-dir, used elsewhere for per-worktree
-# state).
+# A generated wrapper (not a symlink) so this works without symlink privileges on Windows.
+# --git-path resolves the *shared* hooks dir, so this one wrapper serves every worktree.
+# The target path is resolved at COMMIT time via `git rev-parse --show-toplevel` (run
+# inside the wrapper), not baked in at install time: since the wrapper is shared across
+# worktrees but git-hooks/pre-commit is checked out separately in each one, baking in the
+# installing worktree's absolute path would break every other worktree the moment that
+# one worktree is removed/pruned. Resolving at run time always finds the currently
+# committing worktree's own copy.
 
 uninstall-hooks:
 	@HOOKS_DIR=$$(git rev-parse --git-path hooks 2>/dev/null || echo .git/hooks) && \

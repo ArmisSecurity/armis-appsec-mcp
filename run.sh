@@ -97,4 +97,8 @@ if [ -z "${ARMIS_CLIENT_ID:-}" ] || [ -z "${ARMIS_CLIENT_SECRET:-}" ]; then
 fi
 
 VENV_PYTHON="$(venv_python)"
+if [ -z "$VENV_PYTHON" ]; then
+    echo "ERROR: no python interpreter found in $VENV_DIR (checked bin/python and Scripts/python.exe)." >&2
+    exit 1
+fi
 exec "$VENV_PYTHON" "$PLUGIN_DIR/server.py"
