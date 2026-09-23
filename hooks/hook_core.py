@@ -118,9 +118,13 @@ _PUSH_PR_PATTERNS = [
 # so the commit would record content the scan never saw.
 # armis:ignore cwe:400 reason: same linear prefix as the shipping patterns; see TestRegexComplexity
 _INDEX_MUTATING_PATTERN = re.compile(
-    rf"{_GIT_PREFIX}(?P<sub>add|rm|mv|stash|checkout|switch|restore|reset|apply|am"
-    r"|update-index|read-tree|merge|pull|rebase|cherry-pick|revert)(?![-\w])"
+    rf"{_GIT_PREFIX}(?P<sub>add|stage|rm|mv|stash|checkout|switch|restore|reset|apply|am"
+    r"|update-index|read-tree|merge|mergetool|pull|rebase|cherry-pick|revert|submodule)(?![-\w])"
 )
+
+# Env vars that point git at a different index / repo than the one the gate
+# hashed (`GIT_INDEX_FILE=/tmp/idx git commit`, `export GIT_DIR=…`).
+_INDEX_REDIRECT_ENV = re.compile(r"(?<![\w])GIT_(?:INDEX_FILE|DIR|WORK_TREE|COMMON_DIR)=")
 
 _COMMIT_ALL_FLAG = re.compile(rf"{_GIT_PREFIX}commit(?![-\w]).*(?:\s-a\b|\s--all\b)")
 
@@ -606,6 +610,9 @@ def _index_changing_commit(cmd: str) -> str:
     m = _INDEX_MUTATING_PATTERN.search(cmd)
     if m:
         return f"'git {m.group('sub')}' in the same command"
+    m = _INDEX_REDIRECT_ENV.search(cmd)
+    if m:
+        return f"'{m.group(0)}' redirects git to a different index"
     words = _shell_words(cmd)
     if words is None:
         return "the command could not be parsed"

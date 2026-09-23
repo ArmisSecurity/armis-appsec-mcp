@@ -64,6 +64,12 @@ class TestIndexChangingCommit:
             "git checkout other -- f.py && git commit -m x",
             "git commit -m x\ngit add .",
             'git commit -m "$(git add -A; echo msg)"',
+            "git stage -A && git commit -m x",  # `stage` is a builtin synonym for add
+            "git submodule add https://example.com/r.git r && git commit -m x",
+            # env vars that point the commit at an index the gate never hashed
+            "GIT_INDEX_FILE=/tmp/idx git commit -m x",
+            "export GIT_INDEX_FILE=/tmp/idx; git commit -m x",
+            "env GIT_DIR=/other/.git git commit -m x",
             # commit stages working-tree content itself
             "git commit -a -m x",
             "git commit -am x",
