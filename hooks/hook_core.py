@@ -84,7 +84,9 @@ _ENV_PREFIX = (
     r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S*)"
     r"|env(?:\s+-\S+(?:\s+[^-\s]\S*)?)*)\s+)*"
 )
-_PATH_PREFIX = r"(?:\S*/)?"
+# Stops at shell operators (never part of an unquoted path) so each scan ends at
+# the next _CMD_SEP start — `\S*` here was quadratic on `$($($(…`.
+_PATH_PREFIX = r"(?:[^\s;&|()<>]*/)?"
 # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
 _GIT_GLOBAL_OPTS = (
     # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
