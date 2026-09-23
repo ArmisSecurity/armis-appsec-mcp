@@ -12,10 +12,12 @@ Usage:
 """
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -43,6 +45,7 @@ from hash_utils import (
     merge_or_rebase_in_progress,
     resolve_scan_pass_path,
 )
+from net_config import configure_ca_trust, configure_proxy
 from scanner_core import (
     APPSEC_API_URL,
     build_diff_line_map,
@@ -51,6 +54,7 @@ from scanner_core import (
     format_findings,
     parse_findings,
 )
+from server_log import install_exception_hooks, setup_logging
 from suppression import (
     ArmisIgnoreConfig,
     apply_inline_suppressions,
@@ -63,6 +67,33 @@ from suppression import (
 )
 
 logger = logging.getLogger("appsec-mcp")
+
+# Network/logging setup results, filled in by main() and reported by debug_config.
+_runtime: dict[str, str] = {
+    "ca_source": "not configured",
+    "proxy": "not configured",
+    "log_file": "none",
+}
+
+
+def _logged_tool(fn):
+    """Log each tool call's name, duration and outcome (never its arguments)."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        t0 = time.monotonic()
+        try:
+            result = await fn(*args, **kwargs)
+        except ToolError as e:
+            logger.warning("tool %s failed in %.2fs: %s", fn.__name__, time.monotonic() - t0, e)
+            raise
+        except Exception:
+            logger.exception("tool %s crashed in %.2fs", fn.__name__, time.monotonic() - t0)
+            raise
+        logger.info("tool %s ok in %.2fs", fn.__name__, time.monotonic() - t0)
+        return result
+
+    return wrapper
 
 
 async def _run_scan(
@@ -412,6 +443,17 @@ def run_git_diff(
     return diff_text, truncated
 
 
+def _plugin_version(plugin_root: str) -> str:
+    version_file = os.path.join(plugin_root, ".installed-version")
+    if os.path.isfile(version_file):
+        try:
+            with open(version_file) as vf:
+                return vf.read().strip() or "unknown"
+        except OSError:
+            pass
+    return "unknown"
+
+
 def get_debug_config() -> str:
     """Return masked configuration string for debugging."""
     api_url = os.environ.get("APPSEC_API_URL", "default")
@@ -435,14 +477,7 @@ def get_debug_config() -> str:
     has_tenant = "set" if os.environ.get("ARMIS_TENANT_ID") else "not set"
 
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir)
-    version_file = os.path.join(plugin_root, ".installed-version")
-    version = "unknown"
-    if os.path.isfile(version_file):
-        try:
-            with open(version_file) as vf:
-                version = vf.read().strip() or "unknown"
-        except OSError:
-            pass
+    version = _plugin_version(plugin_root)
 
     env_exists = os.path.isfile(os.path.join(plugin_root, ".env"))
     scan_pass_exists = os.path.isfile(resolve_scan_pass_path())
@@ -462,6 +497,9 @@ def get_debug_config() -> str:
         lines.append(f"Source dir: {_plugin_dir}")
     lines.append(f"Credentials file: {'present' if env_exists else 'missing'}")
     lines.append(f"Scan pass: {'present' if scan_pass_exists else 'none'}")
+    lines.append(f"CA source: {_runtime['ca_source']}")
+    lines.append(f"Proxy: {_runtime['proxy']}")
+    lines.append(f"Log file: {_runtime['log_file']}")
     return "\n".join(lines)
 
 
@@ -469,6 +507,7 @@ def get_debug_config() -> str:
 # MCP Tools (thin async wrappers over sync helpers)
 # ---------------------------------------------------------------------------
 @mcp.tool()
+@_logged_tool
 async def scan_code(
     code: str,
     filename: str = "snippet",
@@ -542,6 +581,7 @@ def _compute_scan_file_diff_lines(git_root: str | None, resolved_path: str) -> s
 
 
 @mcp.tool()
+@_logged_tool
 async def scan_file(
     file_path: str,
     ctx: Context | None = None,
@@ -620,6 +660,7 @@ def _shipping_decision(
 
 
 @mcp.tool()
+@_logged_tool
 async def scan_diff(
     repo_path: str = "",
     ref: str = "",
@@ -774,6 +815,7 @@ async def scan_diff(
 
 
 @mcp.tool()
+@_logged_tool
 async def debug_config() -> str:
     """Show current configuration for debugging.
 
@@ -921,6 +963,7 @@ def do_approve_findings(reason: str) -> str:
 
 
 @mcp.tool()
+@_logged_tool
 async def approve_findings(reason: str) -> str:
     """Approve HIGH/CRITICAL scan findings and allow commit to proceed.
 
@@ -1045,11 +1088,39 @@ def security_review(code: str, language: str = "auto") -> str:
     )
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+def main() -> None:
+    level = logging.DEBUG if os.environ.get("APPSEC_DEBUG") else logging.INFO
+    log_file = setup_logging(_plugin_dir, level)
+    install_exception_hooks()
+    _runtime["log_file"] = log_file or "none"
+
+    # Before any httpx client exists: every call site builds its client per
+    # request and reads the ssl module + env (trust_env) at that point.
+    _runtime["ca_source"] = configure_ca_trust()
+    _runtime["proxy"] = configure_proxy(APPSEC_API_URL).describe()
+
+    logger.info(
+        "Starting Armis AppSec MCP server %s (python %s at %s, %s)",
+        _plugin_version(os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir)),
+        platform.python_version(),
+        sys.executable,
+        platform.platform(),
+    )
+    logger.info("API URL: %s (env %s)", APPSEC_API_URL, os.environ.get("APPSEC_ENV", "prod"))
+    logger.info("CA source: %s", _runtime["ca_source"])
+    logger.info("Proxy: %s (PAC/WPAD auto-config not supported)", _runtime["proxy"])
+    logger.info("Log file: %s", _runtime["log_file"])
+
     try:
         init_auth(APPSEC_API_URL)
     except RuntimeError as e:
         logger.warning("Auth not configured: %s — scans will fail until credentials are set.", e)
+    logger.info("Auth method: %s", get_auth_method())
     transport = os.environ.get("APPSEC_TRANSPORT", "stdio")
+    # An exception escaping mcp.run() reaches the excepthook installed above.
     mcp.run(transport=transport)  # type: ignore[arg-type]
+    logger.info("MCP server stopped")
+
+
+if __name__ == "__main__":
+    main()

@@ -221,6 +221,28 @@ If HIGH/CRITICAL findings are found, the assistant will attempt to fix them. If 
 | `APPSEC_DEBUG` | (unset) | Set to any value to enable debug logging |
 | `APPSEC_TRANSPORT` | `stdio` | MCP transport (`stdio`, `sse`) |
 | `APPSEC_HOOK_STRICT` | (unset) | Set to `1` for fail-closed git hook |
+| `SSL_CERT_FILE` / `SSL_CERT_DIR` / `REQUESTS_CA_BUNDLE` | (unset) | Explicit CA bundle; overrides the OS certificate store |
+| `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | (unset) | Explicit proxy config; overrides the OS proxy settings |
+
+### Corporate networks (TLS inspection, proxies)
+
+The server trusts the OS certificate store (Windows cert store, macOS Keychain)
+via `truststore`, so TLS-inspecting proxies such as Zscaler or Netskope work
+without extra setup. CA precedence: `SSL_CERT_FILE` > `SSL_CERT_DIR` >
+`REQUESTS_CA_BUNDLE` > OS store > certifi (used if truststore is unavailable).
+
+With no proxy env vars set, the static system proxy (Windows Internet Options
+registry, macOS System Settings) is used, honoring `NO_PROXY` and the OS bypass
+list. PAC/WPAD auto-config scripts are not evaluated; on such networks set
+`HTTPS_PROXY` explicitly.
+
+### Logs
+
+The server logs to stderr and to `<plugin dir>/logs/server.log` (rotated at
+~1 MB, 3 backups): startup config (version, Python, CA source, proxy, API URL),
+each tool call with duration and outcome, and unhandled exceptions. Credentials,
+tokens, and proxy passwords are never logged. The `debug_config` tool reports
+the CA source, proxy, and log file path.
 
 ### SSE Transport (shared server)
 
