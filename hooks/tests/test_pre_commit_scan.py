@@ -229,19 +229,15 @@ class TestCommandSpecificMessages:
         data = json.loads(stderr)
         assert "scan_diff(staged=True, repo_path=" in data["systemMessage"]
 
-    def test_commit_a_gets_unstaged_scan(self, run_hook):
-        stdout, stderr, rc = run_hook("git commit -a -m 'msg'")
+    @pytest.mark.parametrize("cmd", ["git commit -a -m 'msg'", "git commit --all -m 'msg'"])
+    def test_commit_all_is_blocked_with_staged_scan(self, run_hook, cmd):
+        # -a stages working-tree content after the gate hashed the index, so it
+        # is denied outright; the agent is told to stage separately and scan.
+        stdout, stderr, rc = run_hook(cmd)
         assert rc == 2
         data = json.loads(stderr)
-        assert "scan_diff(repo_path=" in data["systemMessage"]
-        assert "staged=True" not in data["systemMessage"]
-
-    def test_commit_all_flag_gets_unstaged_scan(self, run_hook):
-        stdout, stderr, rc = run_hook("git commit --all -m 'msg'")
-        assert rc == 2
-        data = json.loads(stderr)
-        assert "scan_diff(repo_path=" in data["systemMessage"]
-        assert "staged=True" not in data["systemMessage"]
+        assert data["systemMessage"].startswith("BLOCKED: this git commit")
+        assert "scan_diff(staged=True, repo_path=" in data["systemMessage"]
 
     def test_push_gets_ref_scan(self, run_hook):
         stdout, stderr, rc = run_hook("git push")
