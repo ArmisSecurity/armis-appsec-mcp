@@ -158,3 +158,25 @@ class TestDebugConfigNetworkLines:
         assert "CA source: " in result
         assert "Proxy: " in result
         assert "Log file: " in result
+
+
+def test_failed_rollover_keeps_logging(tmp_path, monkeypatch):
+    """Windows: rename fails while another process holds the log open."""
+    import logging
+
+    handler = server_log._SafeRotatingFileHandler(
+        str(tmp_path / "server.log"), maxBytes=10, backupCount=2, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    def _deny(src, dst):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(handler, "rotate", _deny)
+    try:
+        for i in range(3):
+            handler.emit(logging.makeLogRecord({"msg": f"line-{i}-padding"}))
+    finally:
+        handler.close()
+    text = (tmp_path / "server.log").read_text()
+    assert "line-0" in text and "line-1" in text and "line-2" in text

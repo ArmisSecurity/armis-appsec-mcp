@@ -15,6 +15,7 @@ CA trust precedence (first match wins):
 2. ``SSL_CERT_DIR``   — same.
 3. ``REQUESTS_CA_BUNDLE`` — explicit user choice httpx does *not* read; exported
    as ``SSL_CERT_FILE`` (or ``SSL_CERT_DIR`` for a directory) so it takes effect.
+   A path that does not exist is ignored (httpx never read it before).
 4. OS certificate store via ``truststore.inject_into_ssl()`` (Windows cert store,
    macOS Keychain, system OpenSSL paths on Linux).
 5. certifi — the httpx default, used if truststore is missing or fails.
@@ -105,12 +106,12 @@ def configure_ca_trust(
 
     bundle = env.get("REQUESTS_CA_BUNDLE")
     if bundle:
-        if not os.path.exists(bundle):
-            logger.warning(
-                "REQUESTS_CA_BUNDLE=%s does not exist; TLS verification will fail.", bundle
-            )
-        env["SSL_CERT_DIR" if os.path.isdir(bundle) else "SSL_CERT_FILE"] = bundle
-        return f"REQUESTS_CA_BUNDLE={bundle}"
+        if os.path.exists(bundle):
+            env["SSL_CERT_DIR" if os.path.isdir(bundle) else "SSL_CERT_FILE"] = bundle
+            return f"REQUESTS_CA_BUNDLE={bundle}"
+        # httpx never read REQUESTS_CA_BUNDLE, so a stale value used to be harmless.
+        # Exporting a missing path as SSL_CERT_FILE would fail every request.
+        logger.warning("REQUESTS_CA_BUNDLE=%s does not exist; ignoring it.", bundle)
 
     try:
         inject()

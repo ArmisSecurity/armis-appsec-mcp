@@ -257,3 +257,11 @@ class TestPlatformReaders:
     def test_linux_has_no_system_bypass(self, monkeypatch):
         monkeypatch.setattr(net_config.sys, "platform", "linux")
         assert net_config._system_bypass("moose.armis.com") is False
+
+
+def test_missing_requests_ca_bundle_is_ignored(tmp_path, caplog):
+    missing = str(tmp_path / "nope.pem")
+    env = {"REQUESTS_CA_BUNDLE": missing}
+    assert configure_ca_trust(env, inject=lambda: None) == "truststore"
+    assert "SSL_CERT_FILE" not in env
+    assert "ignoring" in caplog.text

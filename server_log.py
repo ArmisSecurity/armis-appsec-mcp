@@ -48,6 +48,26 @@ class RedactingFormatter(logging.Formatter):
         return redact(super().format(record))
 
 
+class _SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler that keeps appending when rollover fails.
+
+    On Windows the rename in doRollover fails with PermissionError while another
+    server process (a second Claude Code session) holds server.log open. The stock
+    handler then leaves the stream closed, retries on every record, and drops
+    every record with a "Logging error" traceback on stderr. Here a failed
+    rollover reopens the stream and stops rotating for the rest of this process
+    (retrying per record would also shift the backups out one by one).
+    """
+
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+        except OSError:
+            self.maxBytes = 0
+            if self.stream is None:
+                self.stream = self._open()
+
+
 def setup_logging(plugin_dir: str, level: int = logging.INFO) -> str | None:
     """Configure root logging to stderr and ``<plugin_dir>/logs/server.log``.
 
@@ -65,7 +85,7 @@ def setup_logging(plugin_dir: str, level: int = logging.INFO) -> str | None:
     log_path = os.path.join(plugin_dir, "logs", "server.log")
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        file_handler = logging.handlers.RotatingFileHandler(
+        file_handler = _SafeRotatingFileHandler(
             log_path,
             maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT,
