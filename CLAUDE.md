@@ -52,6 +52,8 @@ python server.py
 - `auth.JWTAuth` → OAuth2 client-credentials against `/auth/token`. Token cached in memory, re-exchanged when within 5 minutes of `exp`. `_parse_jwt_exp` bounds-checks `exp` (must be future, ≤24h out).
 - `auth.SharedCacheAuth` → reuses the OAuth2 tokens armis-cli caches in `~/.armis/.sessions` (the cross-process contract in `token_cache.py`, a port of armis-cli's `tokenstore.go`). Lazy: no disk/network in `init_auth`. On the first scan that needs auth it (1) uses a valid cached access token, else (2) refreshes via the rotated-refresh grant (persisting the new pair — never keep a divergent second store, or reuse-detection revokes the token family), else (3) runs the RFC 8628 browser **Device Auth** flow (`device_auth.DeviceClient`, needs `ARMIS_TENANT_ID`) and writes the result back to the shared cache so armis-cli / knowledge-mcp reuse it. The OAuth2 device/token endpoints are root-mounted on the **issuer** (`{issuer}/oauth2/device|token`), where issuer = `APPSEC_API_URL` minus a trailing `/api/vN` (`token_cache.issuer_from_api_url`) — that stripped issuer is also the `.sessions` env key, matching how the CLI keys the cache. Fail-**closed** (can't scan without auth), same as `JWTAuth`.
 - `suppression` → two mechanisms, both deterministic local matching (no LLM involvement): (1) **`.armisignore`** at git root — `cwe:`, `severity:`, `category:`, `rule:` directives and path patterns (basename, glob, or `dir/` prefix); (2) **inline `armis:ignore`** source comments — `apply_inline_suppressions` (file scans, by source line) and `apply_inline_suppressions_to_diff` (diff scans, by blob line via `build_diff_line_map`). Fail-open on any parse/IO error.
+- `net_config` → runs once at startup (`server.main()`, `git-hooks/scan-staged.py`), before any httpx call. `configure_ca_trust()`: `SSL_CERT_FILE` > `SSL_CERT_DIR` > `REQUESTS_CA_BUNDLE` (re-exported as `SSL_CERT_FILE`/`SSL_CERT_DIR`, which httpx reads) > `truststore.inject_into_ssl()` (OS store) > certifi. `configure_proxy(api_url)`: any `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` env var → env is authoritative, untouched; else the OS proxy (registry / macOS sysconf, *not* `getproxies()`, which a lone `NO_PROXY` short-circuits) is exported as `HTTPS_PROXY` unless `NO_PROXY` or the OS bypass list covers the API host — then the host is appended to `NO_PROXY` so httpx's own registry fallback can't re-apply it. No PAC. All call sites use `httpx.post(...)` with default `trust_env=True`, which is why mutating `os.environ`/`ssl` works; keep it that way.
+- `server_log` → stderr + `<plugin dir>/logs/server.log` (RotatingFileHandler, 1 MB × 3). `RedactingFormatter` masks URL userinfo, bearer tokens, and token/secret fields in every formatted line (tracebacks included). Never add a stdout handler — stdout is the MCP stdio channel. Tool calls are logged via the `@_logged_tool` decorator in `server.py` (name, duration, outcome; never arguments).
 - `hash_utils.compute_staged_hash()` → SHA-256 of `git diff --cached --no-color --no-ext-diff`; used by both server and hook to agree on "same staged diff."
 
 ## The `.scan-pass` commit gate (critical invariant)
@@ -125,6 +127,8 @@ anchor on). Syntax:
 | `suppression.load_armisignore` | **Fail open** on IO/parse errors | Never lose findings due to a malformed ignore file |
 | `auth.JWTAuth` / `auth.SharedCacheAuth` | **Fail closed** | Can't scan without auth; errors propagate as `RuntimeError` → `ToolError` |
 | `token_cache.TokenStore.load` | **Fail open** (missing/corrupt/oversized → `None`) | A bad `.sessions` file must never break credential resolution — fall through to the next source |
+| `net_config` (CA / proxy setup) | **Fail open** (errors → httpx defaults: certifi, env-only proxies) | A broken OS store / registry read must not stop the server |
+| `server_log.setup_logging` | **Fail open** (can't create `logs/` → stderr only) | Logging must never block startup |
 | CI scanner (separate pipeline) | **Fail closed** | Second line of defense |
 
 When you edit either hook, preserve the outer `try: ... except Exception: print({}); sys.exit(0)` — it is load-bearing.
@@ -161,7 +165,9 @@ When you edit either hook, preserve the outer `try: ... except Exception: print(
 | `ARMIS_TENANT_ID` | optional | Tenant to authenticate against. Required **only** when the plugin itself starts the browser Device Auth flow (SSO path with an empty `~/.armis/.sessions`). Ignored by the client-credentials path. |
 | `APPSEC_ENV` | `prod` | Selects `moose.armis.com` (prod) or `moose-dev.armis.com` (dev) |
 | `APPSEC_API_URL` | auto | Full override; must be HTTPS unless hostname is localhost |
-| `APPSEC_DEBUG` | unset | Any truthy value enables debug logging |
+| `APPSEC_DEBUG` | unset | Any truthy value sets the server log level to DEBUG |
+| `SSL_CERT_FILE` / `SSL_CERT_DIR` / `REQUESTS_CA_BUNDLE` | unset | Explicit CA bundle; beats the OS store (see `net_config`) |
+| `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` / `NO_PROXY` | unset | If any proxy var is set the env is authoritative; otherwise the OS proxy is used |
 | `APPSEC_TRANSPORT` | `stdio` | MCP transport passed to `mcp.run()` |
 | `CLAUDE_PLUGIN_ROOT` | auto | Set by Claude Code; must resolve inside a git repo or it's ignored |
 

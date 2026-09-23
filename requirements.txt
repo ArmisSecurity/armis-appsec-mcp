@@ -1,3 +1,4 @@
 mcp[cli]==1.25.0
 httpx==0.28.1
 python-dotenv==1.2.2
+truststore==0.10.4

@@ -19,6 +19,7 @@ load_dotenv(os.path.join(_plugin_dir, ".env"))
 
 from auth import init_auth  # noqa: E402
 from hash_utils import cleanup_legacy_scan_pass, resolve_scan_pass_path  # noqa: E402
+from net_config import configure_ca_trust, configure_proxy  # noqa: E402
 from scanner_core import (  # noqa: E402
     APPSEC_API_URL,
     build_diff_line_map,
@@ -35,6 +36,9 @@ from suppression import (  # noqa: E402
 
 
 def main() -> None:
+    # Same OS CA store / system proxy handling as the MCP server (net_config).
+    configure_ca_trust()
+    configure_proxy(APPSEC_API_URL)
     try:
         init_auth(APPSEC_API_URL)
     except RuntimeError as e:
