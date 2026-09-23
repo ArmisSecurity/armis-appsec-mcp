@@ -228,7 +228,7 @@ mcp = FastMCP(
 # Security: path validation for scan_file
 # ---------------------------------------------------------------------------
 _BLOCKED_PREFIXES = ("/etc/", "/proc/", "/sys/", "/private/etc/")
-_BLOCKED_DOTDIRS = {".ssh", ".gnupg", ".aws", ".config/gcloud"}
+_BLOCKED_DOTDIRS = {".ssh", ".gnupg", ".aws", os.path.join(".config", "gcloud")}
 _MAX_CODE_CHARS = 90_000
 
 # Git ref validation: alphanumeric + common ref chars (branch, tag, SHA, HEAD~3)
@@ -238,10 +238,15 @@ _VALID_GIT_REF = re.compile(r"^[a-zA-Z0-9_./\-~^@{}]+$")
 _ALLOWED_ROOTS: list[str] = []
 
 
+def _home_dir() -> str:
+    """Resolve the user's home directory (single source of truth for both callers below)."""
+    return os.path.realpath(os.path.expanduser("~"))
+
+
 def _get_allowed_roots() -> list[str]:
     """Lazily compute allowed root directories for path validation."""
     if not _ALLOWED_ROOTS:
-        home = os.path.realpath(os.path.expanduser("~"))
+        home = _home_dir()
         # Include /tmp, macOS /private/tmp, and the system temp directory
         # (on macOS, tempfile.gettempdir() returns /var/folders/... -> /private/var/folders/...)
         sys_tmp = os.path.realpath(tempfile.gettempdir())
@@ -250,26 +255,38 @@ def _get_allowed_roots() -> list[str]:
     return _ALLOWED_ROOTS
 
 
+def _is_under(resolved: str, base: str) -> bool:
+    """True if `resolved` equals `base` or is nested under it.
+
+    Compares via os.path.normcase so this is correct on case-insensitive
+    filesystems (Windows, default macOS) without weakening case-sensitive
+    POSIX filesystems, where normcase is a no-op.
+    """
+    resolved_cf = os.path.normcase(resolved)
+    base_cf = os.path.normcase(base)
+    return resolved_cf == base_cf or resolved_cf.startswith(base_cf + os.path.normcase(os.sep))
+
+
 def _validate_file_path(file_path: str) -> str:
     """Resolve and validate a file path. Returns the resolved path or raises ToolError."""
     resolved = os.path.realpath(file_path)
 
     # Allowlist: path must be under HOME, /tmp, or /private/tmp
     allowed = _get_allowed_roots()
-    if not any(resolved == root or resolved.startswith(root + "/") for root in allowed):
+    if not any(_is_under(resolved, root) for root in allowed):
         raise ToolError(f"Path '{file_path}' is outside allowed directories (home, /tmp).")
 
     # Blocklist (defense-in-depth): system paths
     for prefix in _BLOCKED_PREFIXES:
         normalized = prefix.rstrip("/")
-        if resolved == normalized or resolved.startswith(normalized + "/"):
+        if _is_under(resolved, normalized):
             raise ToolError(f"Scanning system path '{resolved}' is not allowed.")
 
     # Blocklist (defense-in-depth): sensitive dotdirs under HOME
-    home = os.path.realpath(os.path.expanduser("~"))
+    home = _home_dir()
     for dotdir in _BLOCKED_DOTDIRS:
         blocked_dir = os.path.join(home, dotdir)
-        if resolved == blocked_dir or resolved.startswith(blocked_dir + os.sep):
+        if _is_under(resolved, blocked_dir):
             raise ToolError(f"Scanning '{resolved}' is blocked (sensitive directory).")
 
     return resolved
