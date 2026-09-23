@@ -84,7 +84,9 @@ _ENV_PREFIX = (
     r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S*)"
     r"|env(?:\s+-\S+(?:\s+[^-\s]\S*)?)*)\s+)*"
 )
-_PATH_PREFIX = r"(?:\S*/)?"
+# Stops at shell operators (never part of an unquoted path) so each scan ends at
+# the next _CMD_SEP start — `\S*` here was quadratic on `$($($(…`.
+_PATH_PREFIX = r"(?:[^\s;&|()<>]*/)?"
 # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
 _GIT_GLOBAL_OPTS = (
     # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
@@ -106,10 +108,25 @@ GIT_SHIPPING_PATTERNS = [
     re.compile(rf"{_GH_PREFIX}pr\s+create(?![-\w])"),
 ]
 
+_COMMIT_PATTERN = GIT_SHIPPING_PATTERNS[0]
+
 _PUSH_PR_PATTERNS = [
     re.compile(rf"{_GIT_PREFIX}push(?![-\w])"),
     re.compile(rf"{_GH_PREFIX}pr\s+create(?![-\w])"),
 ]
+
+# git subcommands that change the index (or HEAD + index). One of these in the
+# same command line as a commit runs *after* the gate hashed the staged diff,
+# so the commit would record content the scan never saw.
+# armis:ignore cwe:400 reason: same linear prefix as the shipping patterns; see TestRegexComplexity
+_INDEX_MUTATING_PATTERN = re.compile(
+    rf"{_GIT_PREFIX}(?P<sub>add|stage|rm|mv|stash|checkout|switch|restore|reset|apply|am"
+    r"|update-index|read-tree|merge|mergetool|pull|rebase|cherry-pick|revert|submodule)(?![-\w])"
+)
+
+# Env vars that point git at a different index / repo than the one the gate
+# hashed (`GIT_INDEX_FILE=/tmp/idx git commit`, `export GIT_DIR=…`).
+_INDEX_REDIRECT_ENV = re.compile(r"(?<![\w])GIT_(?:INDEX_FILE|DIR|WORK_TREE|COMMON_DIR)=")
 
 _COMMIT_ALL_FLAG = re.compile(rf"{_GIT_PREFIX}commit(?![-\w]).*(?:\s-a\b|\s--all\b)")
 
@@ -170,6 +187,11 @@ _SCAN_PASS_WRITE_PATTERN = re.compile(
 def _is_shipping_command(cmd: str) -> bool:
     """Check if the command matches any git shipping pattern."""
     return any(p.search(cmd) for p in GIT_SHIPPING_PATTERNS)
+
+
+def _is_commit(cmd: str) -> bool:
+    """Check if the command contains a git commit."""
+    return bool(_COMMIT_PATTERN.search(cmd))
 
 
 def _is_push_or_pr(cmd: str) -> bool:
@@ -241,6 +263,372 @@ def _has_scan_pass_for_push() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Index-changing commits
+# ---------------------------------------------------------------------------
+#
+# The hook runs BEFORE the Bash command, so _has_matching_scan_pass hashes the
+# index as it is at that moment. Anything in the same command that changes what
+# the commit records defeats the hash match:
+#
+#   - `git add -A && git commit …`: the add runs after the check.
+#   - `git commit -a` / `-i` / `-o` / `-p` / `<pathspec>`: commit stages
+#     working-tree content itself.
+#
+# So a commit is allowed only when it records the index exactly as scanned:
+# no index-mutating git subcommand anywhere in the command line, and only
+# allowlisted commit options (message/author/amend/signing/…) with no
+# positional arguments. Unknown options (including git's abbreviated long
+# options, e.g. `--al` for `--all`) are denied rather than guessed at. If the
+# command can't be tokenized, or the commit isn't a direct `git … commit`
+# invocation (`eval 'git commit -a'`), the gate fails closed.
+#
+# The tokenizer is a small subset of POSIX shell word splitting: quotes,
+# backslash escapes, `$(…)` / backticks / `${…}` (kept whole, heredocs inside
+# them skipped), top-level heredoc bodies, and `#` comments. It exists to parse
+# the commit's argv, not to be a shell; the durable fix is re-checking the
+# final index at commit time (git-level pre-commit hook).
+
+_SHELL_OPERATOR_CHARS = frozenset("();<>|&")
+_HEREDOC_START = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([^\s;&|<>()]+))")
+_MAX_SUBST_DEPTH = 32
+
+_COMMIT_VALUE_SHORT = frozenset("mFCct")  # value attached or in the next word
+_COMMIT_OPTIONAL_VALUE_SHORT = frozenset("Su")  # value only when attached
+_COMMIT_FLAG_SHORT = frozenset("sneqvz")
+_COMMIT_VALUE_LONG = frozenset(
+    {
+        "message",
+        "file",
+        "reuse-message",
+        "reedit-message",
+        "template",
+        "author",
+        "date",
+        "cleanup",
+        "fixup",
+        "squash",
+        "trailer",
+    }
+)
+_COMMIT_OPTIONAL_VALUE_LONG = frozenset({"gpg-sign", "untracked-files"})
+_COMMIT_FLAG_LONG = frozenset(
+    {
+        "signoff",
+        "no-signoff",
+        "no-verify",
+        "verify",
+        "no-post-rewrite",
+        "allow-empty",
+        "allow-empty-message",
+        "amend",
+        "no-edit",
+        "edit",
+        "quiet",
+        "verbose",
+        "dry-run",
+        "status",
+        "no-status",
+        "no-gpg-sign",
+        "reset-author",
+        "short",
+        "porcelain",
+        "long",
+        "null",
+        "branch",
+    }
+    | _COMMIT_OPTIONAL_VALUE_LONG
+)
+# git global options that take a separate-word value (`git -C dir commit`).
+_GIT_GLOBAL_VALUE_OPTS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"}
+)
+
+
+def _skip_heredoc_bodies(cmd: str, pos: int, pending: list[tuple[str, bool]]) -> int:
+    """Skip heredoc bodies starting at ``pos`` (just past a newline)."""
+    n = len(cmd)
+    for delim, strip_tabs in pending:
+        while pos < n:
+            nl = cmd.find("\n", pos)
+            end = n if nl < 0 else nl
+            line = cmd[pos:end]
+            pos = end + 1
+            if (line.lstrip("\t") if strip_tabs else line) == delim:
+                break
+    pending.clear()
+    return min(pos, n)
+
+
+def _skip_dquote(cmd: str, i: int, depth: int) -> int:
+    """``cmd[i] == '"'``. Return the index past the closing quote, or -1."""
+    n = len(cmd)
+    i += 1
+    while i < n:
+        c = cmd[i]
+        if c == '"':
+            return i + 1
+        if c == "\\":
+            i += 2
+        elif cmd.startswith("$(", i) or c == "`":
+            i = _skip_subst(cmd, i, depth + 1)
+            if i < 0:
+                return -1
+        else:
+            i += 1
+    return -1
+
+
+def _skip_subst(cmd: str, i: int, depth: int) -> int:
+    """Skip a ``$(…)``, backtick, or ``${…}`` expansion starting at ``cmd[i]``.
+
+    Returns the index just past it, or -1 if it is unterminated or nested too
+    deeply (the callers fail closed on -1).
+    """
+    if depth > _MAX_SUBST_DEPTH:
+        return -1
+    n = len(cmd)
+    if cmd[i] == "`":
+        j = i + 1
+        while j < n and cmd[j] != "`":
+            j += 2 if cmd[j] == "\\" else 1
+        return j + 1 if j < n else -1
+    if cmd.startswith("${", i):
+        j = cmd.find("}", i + 2)
+        return j + 1 if j >= 0 else -1
+    # $( … ): count parens, skipping quotes, nested expansions and heredocs.
+    i += 2
+    parens = 1
+    pending: list[tuple[str, bool]] = []
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                return -1
+            i = j + 1
+        elif c == '"':
+            i = _skip_dquote(cmd, i, depth)
+            if i < 0:
+                return -1
+        elif cmd.startswith("$(", i) or cmd.startswith("${", i) or c == "`":
+            i = _skip_subst(cmd, i, depth + 1)
+            if i < 0:
+                return -1
+        elif cmd.startswith("<<", i) and not cmd.startswith("<<<", i):
+            m = _HEREDOC_START.match(cmd, i)
+            if m:
+                delim = m.group(2) or m.group(3) or m.group(4) or ""
+                pending.append((delim, bool(m.group(1))))
+                i = m.end()
+            else:
+                i += 2
+        elif c == "\n" and pending:
+            i = _skip_heredoc_bodies(cmd, i + 1, pending)
+        elif c == "(":
+            parens += 1
+            i += 1
+        elif c == ")":
+            parens -= 1
+            i += 1
+            if parens == 0:
+                return i
+        else:
+            i += 1
+    return -1
+
+
+def _shell_words(cmd: str) -> list[tuple[str, bool]] | None:
+    """Split a shell command into ``(text, is_operator)`` tokens.
+
+    Operators are runs of ``();<>|&`` and single newlines. Returns None when
+    the command can't be tokenized (unbalanced quotes / expansions).
+    """
+    words: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    in_word = False
+    pending_heredocs: list[tuple[str, bool]] = []
+    expect_delim = False
+    strip_tabs = False
+    n = len(cmd)
+    i = 0
+
+    def flush() -> None:
+        nonlocal in_word, expect_delim
+        if not in_word:
+            return
+        text = "".join(buf)
+        buf.clear()
+        in_word = False
+        if expect_delim:
+            pending_heredocs.append((text, strip_tabs))
+            expect_delim = False
+        words.append((text, False))
+
+    while i < n:
+        c = cmd[i]
+        if c in " \t\r":
+            flush()
+            i += 1
+        elif c == "\n":
+            flush()
+            words.append(("\n", True))
+            i += 1
+            if pending_heredocs:
+                i = _skip_heredoc_bodies(cmd, i, pending_heredocs)
+        elif c == "#" and not in_word:
+            nl = cmd.find("\n", i)
+            i = n if nl < 0 else nl
+        elif c in _SHELL_OPERATOR_CHARS:
+            j = i
+            while j < n and cmd[j] in _SHELL_OPERATOR_CHARS:
+                j += 1
+            op = cmd[i:j]
+            if in_word and ("<" in op or ">" in op) and "".join(buf).isdigit():
+                buf.clear()  # fd number of a redirect (`2>&1`), not an argument
+                in_word = False
+            flush()
+            words.append((op, True))
+            if "<<" in op and "<<<" not in op:
+                expect_delim = True
+                strip_tabs = cmd.startswith("-", j)
+                if strip_tabs:
+                    j += 1
+            i = j
+        elif c == "\\":
+            if i + 1 < n and cmd[i + 1] != "\n":
+                buf.append(cmd[i + 1])
+                in_word = True
+            i += 2
+        elif c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                return None
+            buf.append(cmd[i + 1 : j])
+            in_word = True
+            i = j + 1
+        elif cmd.startswith("$'", i):
+            j = i + 2
+            while j < n and cmd[j] != "'":
+                j += 2 if cmd[j] == "\\" else 1
+            if j >= n:
+                return None
+            buf.append(cmd[i + 2 : j])
+            in_word = True
+            i = j + 1
+        elif c == '"':
+            j = _skip_dquote(cmd, i, 0)
+            if j < 0:
+                return None
+            buf.append(cmd[i + 1 : j - 1])
+            in_word = True
+            i = j
+        elif cmd.startswith("$(", i) or cmd.startswith("${", i) or c == "`":
+            j = _skip_subst(cmd, i, 0)
+            if j < 0:
+                return None
+            buf.append(cmd[i:j])
+            in_word = True
+            i = j
+        else:
+            buf.append(c)
+            in_word = True
+            i += 1
+    flush()
+    return words
+
+
+def _commit_invocations(words: list[tuple[str, bool]]) -> list[list[str]]:
+    """Return the argument list of every direct ``git … commit`` invocation."""
+    invocations: list[list[str]] = []
+    n = len(words)
+    i = 0
+    while i < n:
+        text, is_op = words[i]
+        i += 1
+        if is_op or text.rsplit("/", 1)[-1] != "git":
+            continue
+        while i < n and not words[i][1] and words[i][0].startswith("-"):
+            i += 2 if words[i][0] in _GIT_GLOBAL_VALUE_OPTS else 1
+        if i >= n or words[i] != ("commit", False):
+            continue
+        i += 1
+        args: list[str] = []
+        while i < n:
+            text, is_op = words[i]
+            if is_op:
+                if "<" not in text and ">" not in text:
+                    break  # command separator ends the commit's argv
+                i += 1
+                if i < n and not words[i][1]:
+                    i += 1  # redirect target
+                continue
+            args.append(text)
+            i += 1
+        invocations.append(args)
+    return invocations
+
+
+def _commit_arg_problem(args: list[str]) -> str:
+    """Return a description of the first argument that changes what the commit
+    records (or isn't recognized), or "" if the commit records the index as-is.
+    """
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            return f"pathspec {args[i]!r}" if i < len(args) else ""
+        if arg.startswith("--"):
+            name, eq, _ = arg[2:].partition("=")
+            if eq:
+                if name not in _COMMIT_VALUE_LONG | _COMMIT_OPTIONAL_VALUE_LONG:
+                    return f"option {arg!r}"
+            elif name in _COMMIT_VALUE_LONG:
+                i += 1
+            elif name not in _COMMIT_FLAG_LONG:
+                return f"option {arg!r}"
+        elif arg.startswith("-") and len(arg) > 1:
+            for k in range(1, len(arg)):
+                ch = arg[k]
+                if ch in _COMMIT_VALUE_SHORT:
+                    if k == len(arg) - 1:
+                        i += 1
+                    break
+                if ch in _COMMIT_OPTIONAL_VALUE_SHORT:
+                    break
+                if ch not in _COMMIT_FLAG_SHORT:
+                    return f"option '-{ch}'"
+        else:
+            return f"pathspec {arg!r}"
+    return ""
+
+
+def _index_changing_commit(cmd: str) -> str:
+    """Return why this commit command would record more than the scanned
+    index, or "" if it records the index exactly as the gate hashed it.
+    """
+    m = _INDEX_MUTATING_PATTERN.search(cmd)
+    if m:
+        return f"'git {m.group('sub')}' in the same command"
+    m = _INDEX_REDIRECT_ENV.search(cmd)
+    if m:
+        return f"'{m.group(0)}' redirects git to a different index"
+    words = _shell_words(cmd)
+    if words is None:
+        return "the command could not be parsed"
+    invocations = _commit_invocations(words)
+    if not invocations:
+        return "git commit is not invoked directly"
+    for args in invocations:
+        problem = _commit_arg_problem(args)
+        if problem:
+            return problem
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # System message builder
 # ---------------------------------------------------------------------------
 
@@ -255,10 +643,11 @@ def _scan_call(cmd: str, repo_path: str | None) -> str:
     without this argument the server would write the scan-pass into the wrong
     git dir and the gate (reading from here) would never see it.
     """
-    if _is_push_or_pr(cmd):
+    # A commit is only ever allowed against the staged diff (check_gate denies
+    # -a/--all and friends), so it takes precedence over a push/PR in the same
+    # command: a ref scan's pass would never match the commit's staged hash.
+    if _is_push_or_pr(cmd) and not _is_commit(cmd):
         args = ["ref='origin/HEAD'"]
-    elif _has_all_flag(cmd):
-        args = []
     else:
         args = ["staged=True"]
 
@@ -321,6 +710,22 @@ def build_system_message(
     return base
 
 
+def build_index_change_message(problem: str, repo_path: str | None = None) -> str:
+    """Deny message for a commit that would record more than the scanned index."""
+    if repo_path is None:
+        repo_path = resolve_repo_toplevel()
+    return (
+        f"BLOCKED: this git commit could record changes the security scan never "
+        f"saw ({problem}). The gate checks the staged diff before the command "
+        f"runs, so staging in the same command (git add/rm/mv/stash/checkout/"
+        f"reset/...), commit -a/--all, -i/--include, -o/--only, -p/--patch, "
+        f"pathspecs, and unrecognized commit options are not allowed. Stage your "
+        f"changes in a separate command, call {_scan_call('git commit', repo_path)}, "
+        f"then run git commit with only message/author/amend options "
+        f"(e.g. git commit -m '...')."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main gate logic
 # ---------------------------------------------------------------------------
@@ -339,10 +744,17 @@ def check_gate(cmd: str) -> GateResult:
     if not _is_shipping_command(cmd):
         return GateResult("allow", "")
 
-    if _is_push_or_pr(cmd):
-        if _has_scan_pass_for_push():
-            return GateResult("allow", "")
-    elif _has_matching_scan_pass():
-        return GateResult("allow", "")
+    # A commit in the command is checked even when a push/PR follows it
+    # (`git add -A && git commit … && git push`): the push branch only checks
+    # that a pass exists, which would wave through an unscanned commit.
+    if _is_commit(cmd):
+        problem = _index_changing_commit(cmd)
+        if problem:
+            return GateResult("deny", build_index_change_message(problem))
+        if not _has_matching_scan_pass():
+            return GateResult("deny", build_system_message(cmd))
 
-    return GateResult("deny", build_system_message(cmd))
+    if _is_push_or_pr(cmd) and not _has_scan_pass_for_push():
+        return GateResult("deny", build_system_message(cmd))
+
+    return GateResult("allow", "")

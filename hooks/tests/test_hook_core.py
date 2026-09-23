@@ -392,9 +392,15 @@ class TestBuildSystemMessage:
         msg = hook_core.build_system_message("git commit -m 'x'", repo_path="/wt")
         assert "scan_diff(staged=True, repo_path='/wt')" in msg
 
-    def test_commit_a_gets_unstaged(self):
+    def test_commit_a_gets_staged(self):
+        """check_gate denies `commit -a` outright, so the only scan that can
+        ever authorize a commit is the staged one."""
         msg = hook_core.build_system_message("git commit -a -m 'x'", repo_path="/wt")
-        assert "scan_diff(repo_path='/wt')" in msg
+        assert "scan_diff(staged=True, repo_path='/wt')" in msg
+
+    def test_commit_and_push_gets_staged(self):
+        msg = hook_core.build_system_message("git commit -m 'x' && git push", repo_path="/wt")
+        assert "scan_diff(staged=True, repo_path='/wt')" in msg
 
     def test_push_gets_ref(self):
         msg = hook_core.build_system_message("git push", repo_path="/wt")
