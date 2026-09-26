@@ -30,6 +30,7 @@ import urllib.parse
 import httpx
 
 from shared_cache_auth import SharedCacheAuth
+from single_flight import SingleFlight
 from token_cache import issuer_from_api_url
 
 __all__ = [
@@ -53,8 +54,10 @@ _LOCALHOST_HOSTS = {"localhost", "127.0.0.1", "::1"}
 class JWTAuth:
     """In-memory JWT token manager.
 
-    Not thread-safe. The MCP plugin processes tool calls sequentially,
-    so concurrent access is not a concern.
+    Thread-safe: concurrent ``get_header`` calls are coalesced into a single
+    ``exchange()`` by ``single_flight.SingleFlight``, which also documents why
+    (N threads reach this object per scan batch, and N POSTs to
+    ``/auth/token`` trip its rate limiter).
     """
 
     def __init__(self, api_url: str, client_id: str):
@@ -62,6 +65,8 @@ class JWTAuth:
         self._client_id = client_id
         self._token: str | None = None
         self._expires_at: float = 0.0  # epoch seconds
+        # Coalesces concurrent exchanges and guards _token/_expires_at.
+        self._flight = SingleFlight()
 
     # ------------------------------------------------------------------
     # Token lifecycle
@@ -124,10 +129,20 @@ class JWTAuth:
         return self._token is not None and time.time() < self._expires_at - _REFRESH_BUFFER_SECONDS
 
     def get_header(self) -> str:
-        """Return 'Bearer <token>', exchanging/refreshing if needed."""
-        if not self._is_valid():
+        """Return 'Bearer <token>', exchanging/refreshing if needed.
+
+        Concurrent callers share one exchange, and one failure -- see
+        ``single_flight.SingleFlight``.
+        """
+
+        def cached() -> str | None:
+            return f"Bearer {self._token}" if self._is_valid() else None
+
+        def exchange_once() -> str:
             self.exchange()
-        return f"Bearer {self._token}"
+            return f"Bearer {self._token}"
+
+        return self._flight.run(cached, exchange_once)
 
     def invalidate(self) -> None:
         """Drop the cached token so the next call re-exchanges credentials.
@@ -135,8 +150,12 @@ class JWTAuth:
         Called after the scan API rejects the token with 401 (e.g. the token was
         revoked server-side before its local expiry).
         """
-        self._token = None
-        self._expires_at = 0.0
+        with self._flight.lock:
+            self._token = None
+            self._expires_at = 0.0
+        # A 401 is new information: let the next caller attempt again rather
+        # than inherit the previous attempt's error.
+        self._flight.clear_error()
 
     # ------------------------------------------------------------------
     # JWT payload parsing
@@ -175,9 +194,10 @@ class JWTAuth:
 
     def status(self) -> str:
         """Human-readable token status."""
-        if self._token is None:
-            return "not yet exchanged"
-        remaining = self._expires_at - time.time()
+        with self._flight.lock:
+            if self._token is None:
+                return "not yet exchanged"
+            remaining = self._expires_at - time.time()
         if remaining <= 0:
             return "expired"
         minutes = int(remaining / 60)
