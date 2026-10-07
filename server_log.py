@@ -78,6 +78,12 @@ def setup_logging(plugin_dir: str, level: int = logging.INFO) -> str | None:
     root.setLevel(level)
     formatter = RedactingFormatter(_FORMAT)
 
+    # FastMCP installs its own rich handler on the root logger at import time;
+    # keeping it duplicates every line (once pretty, once in our format).
+    for handler in list(root.handlers):
+        if type(handler).__name__ == "RichHandler":
+            root.removeHandler(handler)
+
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setFormatter(formatter)
     root.addHandler(stderr_handler)

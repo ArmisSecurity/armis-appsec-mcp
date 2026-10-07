@@ -469,6 +469,36 @@ class TestSharedCacheAuth:
         mock_poll.assert_called_once()
         assert store.load(self.ISSUER).access_token == "fresh"
 
+    def test_pending_signin_set_while_polling_then_cleared(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        provider, _ = self._make(tmp_path)
+        da = DeviceAuthorization("dc", "UC", "https://v", "https://v?c=UC", 600, 5)
+        fresh = StoredToken(access_token="fresh", expires_at=_future())
+        seen = {}
+
+        def poll(*a, **k):
+            seen["during"] = provider.pending_signin
+            return fresh
+
+        with (
+            patch.object(provider._device, "request_device_code", return_value=da),
+            patch.object(provider._device, "poll_token", side_effect=poll),
+            patch("shared_cache_auth.open_browser", return_value=False),
+        ):
+            provider.get_header()
+
+        assert "https://v?c=UC" in seen["during"] and "UC" in seen["during"]
+        assert provider.pending_signin == ""
+
+    def test_second_device_login_while_pending_fails_fast(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        provider, _ = self._make(tmp_path)
+        provider.pending_signin = "Armis sign-in is waiting for you: open U and confirm code C."
+        with patch.object(provider._device, "request_device_code") as mock_req:
+            with pytest.raises(RuntimeError, match="waiting for you"):
+                provider.get_header()
+        mock_req.assert_not_called()
+
     def test_device_flow_uses_public_client_id(self, tmp_path, monkeypatch):
         # The device flow is a public client (no secret); it identifies with the
         # hardcoded public client_id armis-cli defaults to, not a per-install env var.

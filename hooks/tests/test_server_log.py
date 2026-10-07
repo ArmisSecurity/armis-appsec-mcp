@@ -180,3 +180,13 @@ def test_failed_rollover_keeps_logging(tmp_path, monkeypatch):
         handler.close()
     text = (tmp_path / "server.log").read_text()
     assert "line-0" in text and "line-1" in text and "line-2" in text
+
+
+def test_setup_logging_removes_rich_handler(clean_root_logger, tmp_path):
+    class RichHandler(logging.StreamHandler):
+        pass
+
+    rich = RichHandler()
+    clean_root_logger.addHandler(rich)
+    server_log.setup_logging(str(tmp_path))
+    assert rich not in clean_root_logger.handlers

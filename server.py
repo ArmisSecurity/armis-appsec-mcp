@@ -29,7 +29,7 @@ _plugin_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _plugin_dir)
 
 # Load .env from plugin directory if it exists (for ARMIS_CLIENT_ID etc.)
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 _env_file = os.path.join(_plugin_dir, ".env")
 if os.path.isfile(_env_file):
@@ -38,7 +38,7 @@ if os.path.isfile(_env_file):
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
-from auth import get_auth_method, get_auth_status, init_auth
+from auth import get_auth_method, get_auth_status, get_pending_signin, init_auth
 from hash_utils import (
     cleanup_legacy_scan_pass,
     compute_staged_hash,
@@ -48,9 +48,11 @@ from hash_utils import (
 from net_config import configure_ca_trust, configure_proxy
 from scanner_core import (
     APPSEC_API_URL,
+    ScanStage,
     build_diff_line_map,
     call_appsec_api,
     changed_lines_for_file,
+    current_stage,
     format_findings,
     parse_findings,
 )
@@ -76,6 +78,34 @@ _runtime: dict[str, str] = {
 }
 
 
+def _credential_report() -> list[str]:
+    """Where each credential came from (presence only, never values), plus a fix hint."""
+    file_values = dotenv_values(_env_file) if os.path.isfile(_env_file) else {}
+
+    def source(name: str) -> str:
+        value = os.environ.get(name, "")
+        if not value:
+            return "not set"
+        return "set (.env)" if file_values.get(name) == value else "set (process env)"
+
+    client_id = source("ARMIS_CLIENT_ID")
+    client_key = source("ARMIS_CLIENT_SECRET")
+    tenant = source("ARMIS_TENANT_ID")
+    env_state = "found" if os.path.isfile(_env_file) else "missing"
+    lines = [
+        f"Credential sources: client id {client_id}, client secret {client_key}, "
+        f"tenant id {tenant}",
+        f".env file: {_env_file} ({env_state})",
+    ]
+    if client_id == "not set" and client_key == "not set":
+        lines.append(
+            "No API credentials: scans use the shared sign-in cache or browser sign-in. "
+            f"To use an API key, add ARMIS_CLIENT_ID and ARMIS_CLIENT_SECRET to {_env_file}; "
+            "variables exported in a shell are not inherited by editor-launched servers."
+        )
+    return lines
+
+
 def _logged_tool(fn):
     """Log each tool call's name, duration and outcome (never its arguments)."""
 
@@ -94,6 +124,77 @@ def _logged_tool(fn):
         return result
 
     return wrapper
+
+
+_DEFAULT_SCAN_DEADLINE_SECONDS = 180.0
+_HEARTBEAT_SECONDS = 10.0
+
+
+def _scan_deadline() -> float:
+    """Total seconds one scan may take (auth + API); override with APPSEC_SCAN_TIMEOUT."""
+    try:
+        value = float(os.environ.get("APPSEC_SCAN_TIMEOUT", ""))
+    except ValueError:
+        return _DEFAULT_SCAN_DEADLINE_SECONDS
+    return value if value > 0 else _DEFAULT_SCAN_DEADLINE_SECONDS
+
+
+async def _heartbeat(ctx: Context, stage: ScanStage, deadline: float) -> None:
+    """Tell the client the scan is alive, and surface a pending browser sign-in.
+
+    Best effort: clients that don't render progress ignore it, and any failure
+    here must never fail the scan.
+    """
+    t0 = time.monotonic()
+    announced = ""
+    while True:
+        await asyncio.sleep(_HEARTBEAT_SECONDS)
+        elapsed = time.monotonic() - t0
+        try:
+            pending = get_pending_signin()
+            if pending and pending != announced:
+                announced = pending
+                await ctx.info(pending)
+            await ctx.report_progress(elapsed, deadline, f"{stage.name} ({int(elapsed)}s)")
+        except Exception as e:
+            logger.debug("heartbeat failed: %s", e)
+
+
+async def _call_api(code: str, ctx: Context | None) -> str:
+    """Run ``call_appsec_api`` in a worker thread under one overall deadline.
+
+    The per-request httpx timeouts are per phase, so auth + scan + a 401 retry
+    could otherwise stay silent for 5+ minutes. On timeout the error names the
+    step that was running (the worker thread itself runs on until its own httpx
+    timeout fires).
+    """
+    stage = ScanStage()
+    token = current_stage.set(stage)
+    deadline = _scan_deadline()
+    beat = asyncio.create_task(_heartbeat(ctx, stage, deadline)) if ctx else None
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(call_appsec_api, code), deadline)
+    except TimeoutError:
+        waited = time.monotonic() - stage.since
+        logger.error(
+            "Scan timed out after %.0fs while %s (%.0fs in that step)",
+            deadline,
+            stage.name,
+            waited,
+        )
+        msg = (
+            f"Scan timed out after {deadline:.0f}s while {stage.name}. "
+            f"See the log ({_runtime['log_file']}) and run debug_config. "
+            "Set APPSEC_SCAN_TIMEOUT (seconds) if scans are legitimately slower."
+        )
+        pending = get_pending_signin()
+        if pending:
+            msg += f" {pending} Then retry the scan."
+        raise RuntimeError(msg) from None
+    finally:
+        if beat:
+            beat.cancel()
+        current_stage.reset(token)
 
 
 async def _run_scan(
@@ -117,7 +218,7 @@ async def _run_scan(
     """
     t0 = time.monotonic()
     try:
-        raw = await asyncio.to_thread(call_appsec_api, code)
+        raw = await _call_api(code, ctx)
     except RuntimeError as e:
         raise ToolError(str(e)) from e
     except Exception as e:
@@ -496,6 +597,8 @@ def get_debug_config() -> str:
     if plugin_root != _plugin_dir:
         lines.append(f"Source dir: {_plugin_dir}")
     lines.append(f"Credentials file: {'present' if env_exists else 'missing'}")
+    lines.extend(_credential_report())
+    lines.append(f"Scan timeout: {_scan_deadline():.0f}s")
     lines.append(f"Scan pass: {'present' if scan_pass_exists else 'none'}")
     lines.append(f"CA source: {_runtime['ca_source']}")
     lines.append(f"Proxy: {_runtime['proxy']}")
@@ -777,7 +880,7 @@ async def scan_diff(
 
     t0 = time.monotonic()
     try:
-        raw = await asyncio.to_thread(call_appsec_api, diff_text)
+        raw = await _call_api(diff_text, ctx)
     except RuntimeError as e:
         raise ToolError(str(e)) from e
     except Exception as e:
@@ -1158,6 +1261,8 @@ def main() -> None:
     logger.info("CA source: %s", _runtime["ca_source"])
     logger.info("Proxy: %s (PAC/WPAD auto-config not supported)", _runtime["proxy"])
     logger.info("Log file: %s", _runtime["log_file"])
+    for line in _credential_report():
+        logger.info("%s", line)
 
     try:
         init_auth(APPSEC_API_URL)

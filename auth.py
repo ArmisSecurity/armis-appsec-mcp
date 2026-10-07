@@ -258,6 +258,11 @@ def invalidate_auth() -> None:
         _auth.invalidate()
 
 
+def get_pending_signin() -> str:
+    """Return the browser sign-in instructions if a device login is waiting, else ''."""
+    return getattr(_auth, "pending_signin", "") or ""
+
+
 def get_auth_status() -> str:
     """Return human-readable auth status for debug_config."""
     if _auth is None:

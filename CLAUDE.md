@@ -165,6 +165,7 @@ When you edit either hook, preserve the outer `try: ... except Exception: print(
 | `ARMIS_TENANT_ID` | optional | Tenant to authenticate against. Required **only** when the plugin itself starts the browser Device Auth flow (SSO path with an empty `~/.armis/.sessions`). Ignored by the client-credentials path. |
 | `APPSEC_ENV` | `prod` | Selects `moose.armis.com` (prod) or `moose-dev.armis.com` (dev) |
 | `APPSEC_API_URL` | auto | Full override; must be HTTPS unless hostname is localhost |
+| `APPSEC_SCAN_TIMEOUT` | `180` | Overall seconds per scan (`server._call_api`): auth + API. On expiry the error names the stage (`scanner_core.ScanStage`, carried to the worker thread via a ContextVar) and any pending device sign-in URL. |
 | `APPSEC_DEBUG` | unset | Any truthy value sets the server log level to DEBUG |
 | `SSL_CERT_FILE` / `SSL_CERT_DIR` / `REQUESTS_CA_BUNDLE` | unset | Explicit CA bundle; beats the OS store (see `net_config`) |
 | `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` / `NO_PROXY` | unset | If any proxy var is set the env is authoritative; otherwise the OS proxy is used |

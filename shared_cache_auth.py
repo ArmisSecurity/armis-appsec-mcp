@@ -50,6 +50,9 @@ class SharedCacheAuth:
         self._issuer = issuer
         self._store = store if store is not None else TokenStore()
         self._device = DeviceClient(issuer)
+        # Set while a browser sign-in is waiting on the user, so the server can
+        # surface the URL/code in the chat instead of only on stderr.
+        self.pending_signin: str = ""
         self._token: StoredToken | None = None
         # Access tokens the server rejected (401). A token can be unexpired
         # locally yet killed server-side (session revoked/logged out), so we
@@ -130,6 +133,10 @@ class SharedCacheAuth:
 
     def _device_login(self) -> StoredToken:
         """Run the RFC 8628 browser device flow and persist the result."""
+        if self.pending_signin:
+            # A previous scan timed out while this flow was still polling in its
+            # worker thread. Re-prompt instead of starting a second device code.
+            raise RuntimeError(self.pending_signin)
         tenant_id = os.environ.get("ARMIS_TENANT_ID", "")
         if not tenant_id:
             raise RuntimeError(
@@ -140,6 +147,7 @@ class SharedCacheAuth:
         # The device-flow client_id is a public, non-secret identifier (RFC 8628
         # public client) -- no client_secret is ever involved. Use the same
         # hardcoded value armis-cli defaults to so the server recognizes it.
+        # armis:ignore cwe:798 reason:public RFC 8628 client id, not a secret
         client_id = DEFAULT_DEVICE_CLIENT_ID
 
         try:
@@ -150,11 +158,17 @@ class SharedCacheAuth:
         browse_url = da.verification_uri_complete or da.verification_uri
         opened = open_browser(browse_url) if browse_url else False
         self._print_verification_instructions(da, browse_url, opened)
+        self.pending_signin = (
+            f"Armis sign-in is waiting for you: open {browse_url or da.verification_uri} "
+            f"and confirm code {da.user_code}."
+        )
 
         try:
             token = self._device.poll_token(da.device_code, client_id, da.interval, da.expires_in)
         except OAuthError as e:
             raise RuntimeError(f"Armis sign-in did not complete: {e}") from e
+        finally:
+            self.pending_signin = ""
 
         token.issuer = token.issuer or self._issuer
         self._token = token
