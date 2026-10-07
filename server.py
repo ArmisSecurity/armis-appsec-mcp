@@ -775,7 +775,7 @@ async def scan_files(
                 logger.debug("progress report failed: %s", e)
         try:
             reports.append(await _scan_one_file(file_path, ctx))
-        except ToolError as e:
+        except Exception as e:
             logger.warning("scan_files: %s failed: %s", file_path, e)
             reports.append(f"SCAN {os.path.basename(file_path)}: ERROR {e}")
     return "\n\n".join(reports)

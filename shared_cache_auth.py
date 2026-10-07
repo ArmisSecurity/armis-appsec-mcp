@@ -165,14 +165,15 @@ class SharedCacheAuth:
 
         try:
             token = self._device.poll_token(da.device_code, client_id, da.interval, da.expires_in)
+            token.issuer = token.issuer or self._issuer
+            self._token = token
+            self._persist(token)
         except OAuthError as e:
             raise RuntimeError(f"Armis sign-in did not complete: {e}") from e
         finally:
+            # Cleared only after the token is stored, so a retry arriving mid-way
+            # cannot start a second device flow.
             self.pending_signin = ""
-
-        token.issuer = token.issuer or self._issuer
-        self._token = token
-        self._persist(token)
         logger.info("Signed in via device flow; identity=%s", token.subject or "?")
         return token
 
