@@ -6,6 +6,7 @@ AI-powered security scanning for [Claude Code](https://claude.ai/code), [Cursor]
 
 - **`scan_code`** — Scan a code snippet for vulnerabilities
 - **`scan_file`** — Scan a file on disk
+- **`scan_files`** — Scan up to 20 files in one call (one approval prompt in editors that confirm each tool call)
 - **`scan_diff`** — Scan git changes (staged, unstaged, or diff against a branch)
 - **`approve_findings`** — Approve findings after user consent (for shipping with known risks)
 - **`debug_config`** — Check scanner configuration status
@@ -218,11 +219,31 @@ If HIGH/CRITICAL findings are found, the assistant will attempt to fix them. If 
 | `ARMIS_CLIENT_SECRET` | (required) | Client secret for authentication |
 | `APPSEC_ENV` | `prod` | `dev` or `prod` — selects API endpoint |
 | `APPSEC_API_URL` | (auto) | Override the API base URL |
+| `APPSEC_SCAN_TIMEOUT` | `180` | Seconds one scan may take (auth + API) before it fails with the step that stalled |
 | `APPSEC_DEBUG` | (unset) | Set to any value to enable debug logging |
 | `APPSEC_TRANSPORT` | `stdio` | MCP transport (`stdio`, `sse`) |
 | `APPSEC_HOOK_STRICT` | (unset) | Set to `1` for fail-closed git hook |
 | `SSL_CERT_FILE` / `SSL_CERT_DIR` / `REQUESTS_CA_BUNDLE` | (unset) | Explicit CA bundle; overrides the OS certificate store |
 | `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | (unset) | Explicit proxy config; overrides the OS proxy settings |
+
+### Where credentials must live
+
+Put `ARMIS_CLIENT_ID` / `ARMIS_CLIENT_SECRET` in the plugin's `.env`. Variables
+exported in a terminal are **not** inherited by servers an editor launches
+(VS Code started from the Start menu or Dock never sees them), and the server
+then falls back to browser sign-in. Run `debug_config` to see which credentials
+were found and from where, and check `logs/server.log` in the plugin directory
+for the startup report.
+
+### Slow starts and long scans
+
+- Antivirus real-time scanning of the plugin's `.venv` can add several seconds
+  to startup. If your editor gives up before the server is ready, ask IT to
+  exclude the plugin directory.
+- A scan that does not finish within `APPSEC_SCAN_TIMEOUT` fails with a message
+  naming the stage (obtaining a token, waiting for the API, or a pending browser
+  sign-in, including its URL and code). `logs/server.log` records each stage with
+  timings.
 
 ### Corporate networks (TLS inspection, proxies)
 

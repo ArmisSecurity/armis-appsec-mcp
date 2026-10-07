@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.parse
+from contextvars import ContextVar
 
 import httpx
 
@@ -42,6 +44,34 @@ SCAN_MODE = "fast"
 # ---------------------------------------------------------------------------
 # API call
 # ---------------------------------------------------------------------------
+class ScanStage:
+    """Names the step a scan call is currently in, so a timeout can say where it hung."""
+
+    def __init__(self) -> None:
+        self.name = "starting"
+        self.since = time.monotonic()
+
+    def set(self, name: str) -> None:
+        self.name = name
+        self.since = time.monotonic()
+
+
+# ContextVar (not a parameter) so ``call_appsec_api(code)`` keeps its signature;
+# ``asyncio.to_thread`` copies the context, so the worker thread sees the same
+# ScanStage object the async caller is watching.
+current_stage: ContextVar[ScanStage | None] = ContextVar("scan_stage", default=None)
+
+# Fail fast when the API host is unreachable; the 120s read budget is for the scan itself.
+_CONNECT_TIMEOUT = 60.0
+_SCAN_READ_TIMEOUT = 120.0
+
+
+def _enter_stage(name: str) -> None:
+    stage = current_stage.get()
+    if stage is not None:
+        stage.set(name)
+
+
 def call_appsec_api(code: str) -> str:
     """Send code to the AppSec scanning API and return raw LLM response.
 
@@ -57,17 +87,28 @@ def call_appsec_api(code: str) -> str:
         raise RuntimeError("APPSEC_API_URL must use HTTPS (except localhost).")
 
     for attempt in range(2):
+        _enter_stage("obtaining an auth token")
+        t_auth = time.monotonic()
+        auth_header = get_auth_header()
+        logger.info("Auth token ready in %.2fs", time.monotonic() - t_auth)
+
+        _enter_stage(f"waiting for the scan API to respond ({len(code)} chars)")
+        logger.info("POST %s (%d chars, attempt %d)", url, len(code), attempt + 1)
+        t_post = time.monotonic()
         response = httpx.post(
             url,
             json={"code": code, "mode": SCAN_MODE},
-            headers={"Authorization": get_auth_header()},
-            timeout=120.0,
+            headers={"Authorization": auth_header},
+            timeout=httpx.Timeout(_SCAN_READ_TIMEOUT, connect=_CONNECT_TIMEOUT),
+        )
+        logger.info(
+            "Scan API responded HTTP %d in %.2fs", response.status_code, time.monotonic() - t_post
         )
         if response.status_code == 401 and attempt == 0:
             # Token rejected server-side (expired/revoked session) despite
             # passing local checks. Drop it and re-authenticate, then retry once.
             logger.info("Scan API returned 401; re-authenticating and retrying once.")
-            invalidate_auth()
+            invalidate_auth(auth_header)
             continue
         response.raise_for_status()
         return response.json()["raw_response"]

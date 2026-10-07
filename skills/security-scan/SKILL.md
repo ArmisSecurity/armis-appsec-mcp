@@ -23,6 +23,7 @@ The MCP server is named `scanner`. All tools are prefixed `mcp__scanner__`.
 |------|-------------|
 | `mcp__scanner__scan_diff` | Default. Scan git changes (staged, unstaged, or vs a ref) |
 | `mcp__scanner__scan_file` | User provides a file path to scan. Auto-scopes findings to lines changed vs HEAD when run inside a git repo (falls open on a clean file or non-repo path) |
+| `mcp__scanner__scan_files` | User asks to scan several named files. One call, max 20 paths, same per-file behavior as `scan_file` |
 | `mcp__scanner__scan_code` | User pastes code inline or asks about a snippet |
 
 ### Tool Parameters

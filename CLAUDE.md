@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Claude Code **plugin** (not a library) that exposes Armis's AI-powered SAST scanner through three surfaces:
 
-1. **MCP server** (`server.py`) — tools `scan_code`, `scan_file`, `scan_diff`, `approve_findings`, `debug_config` and the `appsec://last-scan` resource.
+1. **MCP server** (`server.py`) — tools `scan_code`, `scan_file`, `scan_files`, `scan_diff`, `approve_findings`, `debug_config` and the `appsec://last-scan` resource.
 2. **PreToolUse hooks** (`hooks/`) — a commit gate that blocks `git commit` / `git push` / `gh pr create` until a scan has passed, plus a guard that prevents Write/Edit from forging `.scan-pass`.
 3. **Slash command** (`skills/security-scan/SKILL.md`) — on-demand `/security-scan` invocation.
 
@@ -165,6 +165,7 @@ When you edit either hook, preserve the outer `try: ... except Exception: print(
 | `ARMIS_TENANT_ID` | optional | Tenant to authenticate against. Required **only** when the plugin itself starts the browser Device Auth flow (SSO path with an empty `~/.armis/.sessions`). Ignored by the client-credentials path. |
 | `APPSEC_ENV` | `prod` | Selects `moose.armis.com` (prod) or `moose-dev.armis.com` (dev) |
 | `APPSEC_API_URL` | auto | Full override; must be HTTPS unless hostname is localhost |
+| `APPSEC_SCAN_TIMEOUT` | `180` | Overall seconds per scan (`server._call_api`): auth + API. On expiry the error names the stage (`scanner_core.ScanStage`, carried to the worker thread via a ContextVar) and any pending device sign-in URL. |
 | `APPSEC_DEBUG` | unset | Any truthy value sets the server log level to DEBUG |
 | `SSL_CERT_FILE` / `SSL_CERT_DIR` / `REQUESTS_CA_BUNDLE` | unset | Explicit CA bundle; beats the OS store (see `net_config`) |
 | `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` / `NO_PROXY` | unset | If any proxy var is set the env is authoritative; otherwise the OS proxy is used |
