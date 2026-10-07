@@ -39,6 +39,16 @@ class TestScanDeadline:
             with pytest.raises(RuntimeError, match="timed out after 0s while waiting for the scan"):
                 asyncio.run(server._call_api("abc", None))
 
+    def test_worker_timeout_error_is_not_reported_as_deadline(self, monkeypatch):
+        monkeypatch.setenv("APPSEC_SCAN_TIMEOUT", "30")
+
+        def boom(code):
+            raise TimeoutError("socket timed out")
+
+        with patch.object(server, "call_appsec_api", boom):
+            with pytest.raises(TimeoutError, match="socket timed out"):
+                asyncio.run(server._call_api("abc", None))
+
     def test_timeout_includes_pending_signin(self, monkeypatch):
         monkeypatch.setenv("APPSEC_SCAN_TIMEOUT", "0.2")
 
@@ -152,8 +162,21 @@ class TestCredentialReport:
 
     def test_hint_when_no_credentials(self, monkeypatch, tmp_path):
         monkeypatch.setattr(server, "_env_file", str(tmp_path / ".env"))
-        for name in ("ARMIS_CLIENT_ID", "ARMIS_CLIENT_SECRET", "ARMIS_TENANT_ID"):
+        for name in (
+            "ARMIS_CLIENT_ID",
+            "ARMIS_CLIENT_SECRET",
+            "ARMIS_TENANT_ID",
+            "ARMIS_DEFAULT_AUTH_METHOD",
+        ):
             monkeypatch.delenv(name, raising=False)
         text = "\n".join(server._credential_report())
         assert "missing" in text
         assert "not inherited by editor-launched servers" in text
+
+    def test_sso_note_when_credentials_are_ignored(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(server, "_env_file", str(tmp_path / ".env"))
+        monkeypatch.setenv("ARMIS_CLIENT_ID", "id")
+        monkeypatch.setenv("ARMIS_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("ARMIS_DEFAULT_AUTH_METHOD", "SSO")
+        text = "\n".join(server._credential_report())
+        assert "client credentials are ignored" in text

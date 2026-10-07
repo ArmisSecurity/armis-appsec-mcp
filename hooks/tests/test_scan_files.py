@@ -33,3 +33,25 @@ class TestScanFiles:
         assert "nope.py: ERROR" in out
         assert "a.py" in out
         assert out.count("\n\n") >= 1
+
+    def test_timeout_skips_remaining_files(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("APPSEC_SCAN_TIMEOUT", "0.2")
+        files = []
+        for name in ("a.py", "b.py", "c.py"):
+            f = tmp_path / name
+            f.write_text("x = 1\n")
+            files.append(str(f))
+        calls = []
+
+        def hang(code):
+            calls.append(1)
+            import time
+
+            time.sleep(0.6)
+            return _EMPTY
+
+        with patch.object(server, "call_appsec_api", hang):
+            out = self._run(files)
+        assert len(calls) == 1
+        assert "a.py: ERROR" in out and "timed out" in out
+        assert "b.py: SKIPPED" in out and "c.py: SKIPPED" in out

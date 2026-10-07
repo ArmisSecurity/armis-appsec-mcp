@@ -12,6 +12,7 @@ Usage:
 """
 
 import asyncio
+import contextvars
 import functools
 import hashlib
 import json
@@ -97,7 +98,12 @@ def _credential_report() -> list[str]:
         f"tenant id {tenant}",
         f".env file: {_env_file} ({env_state})",
     ]
-    if client_id == "not set" and client_key == "not set":
+    if os.environ.get("ARMIS_DEFAULT_AUTH_METHOD", "").strip().lower() == "sso":
+        lines.append(
+            "ARMIS_DEFAULT_AUTH_METHOD=sso: client credentials are ignored; scans use "
+            "the shared sign-in cache or browser sign-in."
+        )
+    elif client_id == "not set" and client_key == "not set":
         lines.append(
             "No API credentials: scans use the shared sign-in cache or browser sign-in. "
             f"To use an API key, add ARMIS_CLIENT_ID and ARMIS_CLIENT_SECRET to {_env_file}; "
@@ -125,6 +131,14 @@ def _logged_tool(fn):
 
     return wrapper
 
+
+class ScanTimeoutError(ToolError, RuntimeError):
+    """A scan exceeded its overall deadline (``scan_files`` stops the batch on it)."""
+
+
+# Set by scan_files so per-file heartbeats don't emit progress that restarts at
+# zero for every file (progress must increase within one request).
+_in_batch: contextvars.ContextVar[bool] = contextvars.ContextVar("_in_batch", default=False)
 
 _DEFAULT_SCAN_DEADLINE_SECONDS = 180.0
 _HEARTBEAT_SECONDS = 10.0
@@ -155,7 +169,8 @@ async def _heartbeat(ctx: Context, stage: ScanStage, deadline: float) -> None:
             if pending and pending != announced:
                 announced = pending
                 await ctx.info(pending)
-            await ctx.report_progress(elapsed, deadline, f"{stage.name} ({int(elapsed)}s)")
+            if not _in_batch.get():
+                await ctx.report_progress(elapsed, deadline, f"{stage.name} ({int(elapsed)}s)")
         except Exception as e:
             logger.debug("heartbeat failed: %s", e)
 
@@ -171,10 +186,14 @@ async def _call_api(code: str, ctx: Context | None) -> str:
     stage = ScanStage()
     token = current_stage.set(stage)
     deadline = _scan_deadline()
+    started = time.monotonic()
     beat = asyncio.create_task(_heartbeat(ctx, stage, deadline)) if ctx else None
     try:
         return await asyncio.wait_for(asyncio.to_thread(call_appsec_api, code), deadline)
     except TimeoutError:
+        if time.monotonic() - started < deadline - 1:
+            # A TimeoutError raised inside the worker, not our deadline expiring.
+            raise
         waited = time.monotonic() - stage.since
         logger.error(
             "Scan timed out after %.0fs while %s (%.0fs in that step)",
@@ -190,7 +209,7 @@ async def _call_api(code: str, ctx: Context | None) -> str:
         pending = get_pending_signin()
         if pending:
             msg += f" {pending} Then retry the scan."
-        raise RuntimeError(msg) from None
+        raise ScanTimeoutError(msg) from None
     finally:
         if beat:
             beat.cancel()
@@ -219,6 +238,8 @@ async def _run_scan(
     t0 = time.monotonic()
     try:
         raw = await _call_api(code, ctx)
+    except ScanTimeoutError:
+        raise
     except RuntimeError as e:
         raise ToolError(str(e)) from e
     except Exception as e:
@@ -767,17 +788,32 @@ async def scan_files(
         )
 
     reports: list[str] = []
-    for index, file_path in enumerate(file_paths, start=1):
-        if ctx:
+    batch_token = _in_batch.set(True)
+    try:
+        for index, file_path in enumerate(file_paths, start=1):
+            if ctx:
+                try:
+                    await ctx.report_progress(index - 1, len(file_paths), f"Scanning {file_path}")
+                except Exception as e:
+                    logger.debug("progress report failed: %s", e)
             try:
-                await ctx.report_progress(index - 1, len(file_paths), f"Scanning {file_path}")
+                reports.append(await _scan_one_file(file_path, ctx))
+            except ScanTimeoutError as e:
+                # The API or sign-in is stuck; trying the remaining files would
+                # wait out a full deadline each. Report what finished and stop.
+                logger.warning("scan_files: %s timed out; skipping the rest: %s", file_path, e)
+                reports.append(f"SCAN {os.path.basename(file_path)}: ERROR {e}")
+                skipped = file_paths[index:]
+                reports.extend(
+                    f"SCAN {os.path.basename(p)}: SKIPPED (an earlier scan timed out)"
+                    for p in skipped
+                )
+                break
             except Exception as e:
-                logger.debug("progress report failed: %s", e)
-        try:
-            reports.append(await _scan_one_file(file_path, ctx))
-        except Exception as e:
-            logger.warning("scan_files: %s failed: %s", file_path, e)
-            reports.append(f"SCAN {os.path.basename(file_path)}: ERROR {e}")
+                logger.warning("scan_files: %s failed: %s", file_path, e)
+                reports.append(f"SCAN {os.path.basename(file_path)}: ERROR {e}")
+    finally:
+        _in_batch.reset(batch_token)
     return "\n\n".join(reports)
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 
 from device_auth import (
     DEFAULT_DEVICE_CLIENT_ID,
@@ -43,7 +44,9 @@ class SharedCacheAuth:
     Fail-closed: a terminal failure raises ``RuntimeError`` (can't scan without
     auth), matching the fail-open/closed policy table in CLAUDE.md.
 
-    Not thread-safe -- the MCP plugin processes tool calls sequentially.
+    State is guarded by a re-entrant lock: a timed-out scan leaves its worker
+    thread running, so a retry can overlap with it. A retry arriving during a
+    browser sign-in waits for it and then reuses the resulting token.
     """
 
     def __init__(self, issuer: str, store: TokenStore | None = None):
@@ -58,15 +61,17 @@ class SharedCacheAuth:
         # locally yet killed server-side (session revoked/logged out), so we
         # must not keep handing it back from the in-memory or on-disk cache.
         self._rejected: set[str] = set()
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Token lifecycle
     # ------------------------------------------------------------------
     def get_header(self) -> str:
         """Return 'Bearer <token>', resolving/refreshing/logging-in as needed."""
-        return f"Bearer {self._ensure_access_token()}"
+        with self._lock:
+            return f"Bearer {self._ensure_access_token()}"
 
-    def invalidate(self) -> None:
+    def invalidate(self, header: str = "") -> None:
         """Mark the last-issued access token as bad so the next call re-auths.
 
         Called after the scan API rejects the token with 401: the session was
@@ -74,10 +79,17 @@ class SharedCacheAuth:
         locally. Recording it in ``_rejected`` forces ``_ensure_access_token``
         past the in-memory/cache hits into refresh → device login, and prevents
         an infinite loop of re-reading the same dead token from ``.sessions``.
+
+        ``header`` is the one the server rejected. If the current token has
+        since changed (a late 401 from an abandoned scan), nothing is dropped.
         """
-        if self._token is not None and self._token.access_token:
-            self._rejected.add(self._token.access_token)
-        self._token = None
+        with self._lock:
+            current = self._token.access_token if self._token is not None else ""
+            if header and header != f"Bearer {current}":
+                return
+            if current:
+                self._rejected.add(current)
+            self._token = None
 
     def _usable(self, token: StoredToken | None) -> bool:
         """True when ``token`` is present, unexpired, and not server-rejected."""

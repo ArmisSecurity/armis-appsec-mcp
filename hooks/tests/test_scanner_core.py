@@ -517,7 +517,7 @@ class TestCallAppsecApiHappyPath:
             }
             assert call_args.kwargs["headers"] == {"Authorization": "Bearer test-token"}
             timeout = call_args.kwargs["timeout"]
-            assert (timeout.connect, timeout.read) == (15.0, 120.0)
+            assert (timeout.connect, timeout.read) == (60.0, 120.0)
             assert "scan/fast" in call_args.args[0]
             assert result == "```json\n[]\n```"
         finally:

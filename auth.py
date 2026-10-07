@@ -24,6 +24,7 @@ import base64
 import json
 import logging
 import os
+import threading
 import time
 import urllib.parse
 
@@ -53,8 +54,8 @@ _LOCALHOST_HOSTS = {"localhost", "127.0.0.1", "::1"}
 class JWTAuth:
     """In-memory JWT token manager.
 
-    Not thread-safe. The MCP plugin processes tool calls sequentially,
-    so concurrent access is not a concern.
+    Token state is guarded by a lock: a timed-out scan leaves its worker thread
+    running, so a retry can overlap with it.
     """
 
     def __init__(self, api_url: str, client_id: str):
@@ -62,6 +63,7 @@ class JWTAuth:
         self._client_id = client_id
         self._token: str | None = None
         self._expires_at: float = 0.0  # epoch seconds
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Token lifecycle
@@ -125,18 +127,24 @@ class JWTAuth:
 
     def get_header(self) -> str:
         """Return 'Bearer <token>', exchanging/refreshing if needed."""
-        if not self._is_valid():
-            self.exchange()
-        return f"Bearer {self._token}"
+        with self._lock:
+            if not self._is_valid():
+                self.exchange()
+            return f"Bearer {self._token}"
 
-    def invalidate(self) -> None:
+    def invalidate(self, header: str = "") -> None:
         """Drop the cached token so the next call re-exchanges credentials.
 
         Called after the scan API rejects the token with 401 (e.g. the token was
-        revoked server-side before its local expiry).
+        revoked server-side before its local expiry). When ``header`` (the one
+        that was rejected) is given and the cached token has since changed, a
+        late 401 from an abandoned scan must not wipe the newer token.
         """
-        self._token = None
-        self._expires_at = 0.0
+        with self._lock:
+            if header and header != f"Bearer {self._token}":
+                return
+            self._token = None
+            self._expires_at = 0.0
 
     # ------------------------------------------------------------------
     # JWT payload parsing
@@ -246,7 +254,7 @@ def get_auth_header() -> str:
     return _auth.get_header()
 
 
-def invalidate_auth() -> None:
+def invalidate_auth(header: str = "") -> None:
     """Invalidate the current token so the next ``get_auth_header`` re-authenticates.
 
     Called by the scan path on an HTTP 401: the token the server rejected was
@@ -255,7 +263,7 @@ def invalidate_auth() -> None:
     ``JWTAuth``; refresh or device login for ``SharedCacheAuth``).
     """
     if _auth is not None:
-        _auth.invalidate()
+        _auth.invalidate(header)
 
 
 def get_pending_signin() -> str:

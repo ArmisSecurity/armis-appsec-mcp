@@ -579,3 +579,14 @@ class TestSharedCacheAuth:
             header = provider.get_header()
 
         assert header == "Bearer fresh"  # fell through to device login, not the killed token
+
+
+class TestLateInvalidate:
+    def test_jwt_late_401_does_not_wipe_newer_token(self):
+        auth = JWTAuth("https://example.com/api/v1", "cid")
+        auth._token = "new"
+        auth._expires_at = time.time() + 3600
+        auth.invalidate("Bearer old")
+        assert auth._token == "new"
+        auth.invalidate("Bearer new")
+        assert auth._token is None

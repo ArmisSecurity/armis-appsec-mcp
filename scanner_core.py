@@ -62,7 +62,7 @@ class ScanStage:
 current_stage: ContextVar[ScanStage | None] = ContextVar("scan_stage", default=None)
 
 # Fail fast when the API host is unreachable; the 120s read budget is for the scan itself.
-_CONNECT_TIMEOUT = 15.0
+_CONNECT_TIMEOUT = 60.0
 _SCAN_READ_TIMEOUT = 120.0
 
 
@@ -108,7 +108,7 @@ def call_appsec_api(code: str) -> str:
             # Token rejected server-side (expired/revoked session) despite
             # passing local checks. Drop it and re-authenticate, then retry once.
             logger.info("Scan API returned 401; re-authenticating and retrying once.")
-            invalidate_auth()
+            invalidate_auth(auth_header)
             continue
         response.raise_for_status()
         return response.json()["raw_response"]
