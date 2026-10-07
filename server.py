@@ -580,6 +580,37 @@ def _compute_scan_file_diff_lines(git_root: str | None, resolved_path: str) -> s
     return changed_lines_for_file(diff_text, rel_path)
 
 
+async def _scan_one_file(file_path: str, ctx: Context | None) -> str:
+    resolved = _validate_file_path(file_path)
+
+    # Load .armisignore and check path exclusion before reading file or calling API
+    git_root = find_git_root(from_path=resolved)
+    config = load_armisignore(git_root)
+    if git_root and is_path_excluded(resolved, config, git_root):
+        logger.info("scan_file: %s excluded by .armisignore", file_path)
+        return f"SCAN {os.path.basename(file_path)}: skipped (excluded by .armisignore)"
+
+    # armis:ignore cwe:22 cwe:23 cwe:73 cwe:770 reason:path-validated and size-capped in the reader
+    code, filename, resolved_path = read_and_validate_file(file_path)
+
+    if ctx:
+        await ctx.info(f"Scanning {filename} ({len(code)} chars)")
+    logger.info(f"Scanning file: {file_path} ({len(code)} chars)")
+
+    diff_lines = await asyncio.to_thread(_compute_scan_file_diff_lines, git_root, resolved_path)
+
+    source_lines = code.splitlines()
+    return await _run_scan(
+        code,
+        filename,
+        ctx,
+        config=config,
+        file_path=resolved_path,
+        source_lines=source_lines,
+        diff_lines=diff_lines,
+    )
+
+
 @mcp.tool()
 @_logged_tool
 async def scan_file(
@@ -601,33 +632,50 @@ async def scan_file(
     Returns:
         A formatted report of any vulnerabilities found.
     """
-    resolved = _validate_file_path(file_path)
+    return await _scan_one_file(file_path, ctx)
 
-    # Load .armisignore and check path exclusion before reading file or calling API
-    git_root = find_git_root(from_path=resolved)
-    config = load_armisignore(git_root)
-    if git_root and is_path_excluded(resolved, config, git_root):
-        logger.info("scan_file: %s excluded by .armisignore", file_path)
-        return f"SCAN {os.path.basename(file_path)}: skipped (excluded by .armisignore)"
 
-    code, filename, resolved_path = read_and_validate_file(file_path)
+_MAX_SCAN_FILES = 20
 
-    if ctx:
-        await ctx.info(f"Scanning {filename} ({len(code)} chars)")
-    logger.info(f"Scanning file: {file_path} ({len(code)} chars)")
 
-    diff_lines = _compute_scan_file_diff_lines(git_root, resolved_path)
+@mcp.tool()
+@_logged_tool
+async def scan_files(
+    file_paths: list[str],
+    ctx: Context | None = None,
+) -> str:
+    """Scan several files on disk in one call (one approval prompt instead of one per file).
 
-    source_lines = code.splitlines()
-    return await _run_scan(
-        code,
-        filename,
-        ctx,
-        config=config,
-        file_path=resolved_path,
-        source_lines=source_lines,
-        diff_lines=diff_lines,
-    )
+    Each file is scanned exactly like ``scan_file``, one after another. A file
+    that fails (missing, binary, blocked path, API error) is reported inline and
+    does not stop the rest.
+
+    Args:
+        file_paths: Absolute paths to scan (at most 20 per call).
+
+    Returns:
+        One report per file, separated by blank lines.
+    """
+    if not file_paths:
+        raise ToolError("file_paths must contain at least one path.")
+    if len(file_paths) > _MAX_SCAN_FILES:
+        raise ToolError(
+            f"Too many files ({len(file_paths)}); scan at most {_MAX_SCAN_FILES} per call."
+        )
+
+    reports: list[str] = []
+    for index, file_path in enumerate(file_paths, start=1):
+        if ctx:
+            try:
+                await ctx.report_progress(index - 1, len(file_paths), f"Scanning {file_path}")
+            except Exception as e:
+                logger.debug("progress report failed: %s", e)
+        try:
+            reports.append(await _scan_one_file(file_path, ctx))
+        except ToolError as e:
+            logger.warning("scan_files: %s failed: %s", file_path, e)
+            reports.append(f"SCAN {os.path.basename(file_path)}: ERROR {e}")
+    return "\n\n".join(reports)
 
 
 def _shipping_decision(

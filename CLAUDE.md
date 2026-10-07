@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Claude Code **plugin** (not a library) that exposes Armis's AI-powered SAST scanner through three surfaces:
 
-1. **MCP server** (`server.py`) — tools `scan_code`, `scan_file`, `scan_diff`, `approve_findings`, `debug_config` and the `appsec://last-scan` resource.
+1. **MCP server** (`server.py`) — tools `scan_code`, `scan_file`, `scan_files`, `scan_diff`, `approve_findings`, `debug_config` and the `appsec://last-scan` resource.
 2. **PreToolUse hooks** (`hooks/`) — a commit gate that blocks `git commit` / `git push` / `gh pr create` until a scan has passed, plus a guard that prevents Write/Edit from forging `.scan-pass`.
 3. **Slash command** (`skills/security-scan/SKILL.md`) — on-demand `/security-scan` invocation.
 

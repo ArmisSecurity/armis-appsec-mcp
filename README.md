@@ -6,6 +6,7 @@ AI-powered security scanning for [Claude Code](https://claude.ai/code), [Cursor]
 
 - **`scan_code`** — Scan a code snippet for vulnerabilities
 - **`scan_file`** — Scan a file on disk
+- **`scan_files`** — Scan up to 20 files in one call (one approval prompt in editors that confirm each tool call)
 - **`scan_diff`** — Scan git changes (staged, unstaged, or diff against a branch)
 - **`approve_findings`** — Approve findings after user consent (for shipping with known risks)
 - **`debug_config`** — Check scanner configuration status
