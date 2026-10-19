@@ -9,6 +9,7 @@ call server-side.  Authenticates via JWT (ARMIS_CLIENT_ID / ARMIS_CLIENT_SECRET)
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -51,6 +52,9 @@ class ScanStage:
     def __init__(self) -> None:
         self.name = "starting"
         self.since = time.monotonic()
+        # Set by the async caller once it stops waiting (deadline hit or cancelled),
+        # so the orphaned worker thread stops retrying and frees its scan slot.
+        self.abandoned = False
 
     def set(self, name: str) -> None:
         self.name = name
@@ -76,7 +80,8 @@ def _max_concurrent_scans() -> int:
 
 # Caps in-flight scan requests: an agent that fires a dozen scan_file calls at once
 # otherwise trips the API's rate limit (HTTP 429) and every scan in the burst fails.
-_SCAN_SLOTS = threading.BoundedSemaphore(_max_concurrent_scans())
+MAX_CONCURRENT_SCANS = _max_concurrent_scans()
+_SCAN_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_SCANS)
 
 # Transient statuses worth retrying with backoff. 401 has its own re-auth retry.
 _RETRY_STATUSES = frozenset({429, 502, 503, 504})
@@ -91,6 +96,8 @@ def _retry_delay(response: httpx.Response, retries_so_far: int) -> float:
     try:
         delay = float(header)
     except (TypeError, ValueError):
+        delay = math.nan
+    if math.isnan(delay):
         delay = _BACKOFF_BASE_SECONDS * (2**retries_so_far)
     return min(max(delay, 0.0), _MAX_BACKOFF_SECONDS)
 
@@ -98,6 +105,8 @@ def _retry_delay(response: httpx.Response, retries_so_far: int) -> float:
 def _enter_stage(name: str) -> None:
     stage = current_stage.get()
     if stage is not None:
+        if stage.abandoned:
+            raise TimeoutError("Scan abandoned by the caller; not retrying.")
         stage.set(name)
 
 
@@ -120,7 +129,9 @@ def call_appsec_api(code: str) -> str:
 
     reauthed = False
     transient_retries = 0
+    attempt = 0
     while True:
+        attempt += 1
         _enter_stage("obtaining an auth token")
         t_auth = time.monotonic()
         auth_header = get_auth_header()
@@ -129,7 +140,7 @@ def call_appsec_api(code: str) -> str:
         _enter_stage("waiting for a free scan slot")
         with _SCAN_SLOTS:
             _enter_stage(f"waiting for the scan API to respond ({len(code)} chars)")
-            logger.info("POST %s (%d chars)", url, len(code))
+            logger.info("POST %s (%d chars, attempt %d)", url, len(code), attempt)
             t_post = time.monotonic()
             response = httpx.post(
                 url,

@@ -21,6 +21,7 @@ Supports two credential paths, resolved in ``init_auth``:
 """
 
 import base64
+import datetime
 import json
 import logging
 import os
@@ -51,6 +52,30 @@ _REFRESH_BUFFER_SECONDS = 300
 _CLOCK_SKEW_WARN_SECONDS = 60
 
 _LOCALHOST_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _warn_clock_skew(response: httpx.Response) -> None:
+    """Warn when the local clock is far from the server's ``Date`` header.
+
+    A skewed clock makes valid tokens look expired (or not yet due for refresh)
+    and server-side 401s look like an auth bug. Diagnostic only; never raises.
+    """
+    try:
+        date_header = response.headers.get("Date")
+        if not date_header:
+            return
+        server_time = parsedate_to_datetime(date_header)
+        if server_time.tzinfo is None:  # "-0000" zone: RFC 5322 says UTC
+            server_time = server_time.replace(tzinfo=datetime.UTC)
+        skew = time.time() - server_time.timestamp()
+        if abs(skew) > _CLOCK_SKEW_WARN_SECONDS:
+            logger.warning(
+                "Local clock differs from the auth server's by %+.0fs. "
+                "Sync the system clock (Windows: w32tm /resync).",
+                skew,
+            )
+    except Exception as e:  # diagnostics must never break authentication
+        logger.debug("clock skew check failed: %s", e)
 
 
 class JWTAuth:
@@ -116,6 +141,9 @@ class JWTAuth:
         if "token" not in data:
             raise RuntimeError("Authentication failed: unexpected response (missing token)")
 
+        # Before parsing: a clock far ahead makes the token look expired, and that
+        # is exactly when the skew warning is needed.
+        _warn_clock_skew(response)
         self._token = data["token"]
         try:
             self._expires_at = self._parse_jwt_exp(self._token)
@@ -123,36 +151,22 @@ class JWTAuth:
             self._token = None
             raise RuntimeError(f"Authentication failed: invalid JWT payload ({e})") from e
         logger.info("JWT token obtained, expires at %.0f", self._expires_at)
-        self._log_token_lifetime(response)
+        self._log_token_lifetime()
 
-    def _log_token_lifetime(self, response: httpx.Response) -> None:
-        """Warn when the token looks too short-lived or the local clock is off.
+    def _log_token_lifetime(self) -> None:
+        """Warn when the token's remaining life is under the refresh buffer.
 
-        A token whose remaining life is under the refresh buffer is re-exchanged
-        on every call, and a local clock far from the server's makes that (and
-        server-side 401s) look like an auth bug. Diagnostic only; never raises.
+        Such a token is re-exchanged on every call. Diagnostic only; never raises.
         """
-        try:
-            ttl = self._expires_at - time.time()
-            logger.info("JWT lifetime: %.0fs remaining", ttl)
-            if ttl < _REFRESH_BUFFER_SECONDS:
-                logger.warning(
-                    "JWT has only %.0fs left (< %ds refresh buffer): it will be re-exchanged "
-                    "on every call. Check the system clock and timezone.",
-                    ttl,
-                    _REFRESH_BUFFER_SECONDS,
-                )
-            date_header = response.headers.get("Date")
-            if date_header:
-                skew = time.time() - parsedate_to_datetime(date_header).timestamp()
-                if abs(skew) > _CLOCK_SKEW_WARN_SECONDS:
-                    logger.warning(
-                        "Local clock differs from the auth server's by %+.0fs. "
-                        "Sync the system clock (Windows: w32tm /resync).",
-                        skew,
-                    )
-        except Exception as e:  # diagnostics must never break authentication
-            logger.debug("token lifetime check failed: %s", e)
+        ttl = self._expires_at - time.time()
+        logger.info("JWT lifetime: %.0fs remaining", ttl)
+        if ttl < _REFRESH_BUFFER_SECONDS:
+            logger.warning(
+                "JWT has only %.0fs left (< %ds refresh buffer): it will be re-exchanged "
+                "on every call. Check the system clock and timezone.",
+                ttl,
+                _REFRESH_BUFFER_SECONDS,
+            )
 
     def _is_valid(self) -> bool:
         return self._token is not None and time.time() < self._expires_at - _REFRESH_BUFFER_SECONDS

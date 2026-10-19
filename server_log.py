@@ -114,11 +114,8 @@ def _is_client_disconnect(exc: BaseException | None) -> bool:
     Editors kill the stdio server mid-request on reload; anyio then raises these
     from the stdin reader. That is a normal shutdown, not a crash.
     """
-    if exc is None:
-        return False
-    children = getattr(exc, "exceptions", None)
-    if children:
-        return all(_is_client_disconnect(c) for c in children)
+    if isinstance(exc, BaseExceptionGroup):
+        return all(_is_client_disconnect(c) for c in exc.exceptions)
     return type(exc).__name__ in _DISCONNECT_ERRORS
 
 
@@ -136,6 +133,9 @@ def install_exception_hooks() -> None:
 
     def _thread_excepthook(args):
         if args.exc_type is SystemExit:
+            return
+        if _is_client_disconnect(args.exc_value):
+            logger.info("MCP client closed the connection (%s)", args.exc_type.__name__)
             return
         logger.critical(
             "Unhandled exception in thread %s",

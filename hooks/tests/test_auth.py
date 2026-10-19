@@ -164,6 +164,16 @@ class TestJWTAuthExchange:
             self._exchange(jwt_auth, exp=time.time() + 3600, headers={"Date": server_now})
         assert "Local clock differs" in caplog.text
 
+    def test_clock_skew_warns_even_when_token_looks_expired(self, caplog):
+        from email.utils import formatdate
+
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        server_now = formatdate(time.time() - 7200, usegmt=True)  # local clock 2h ahead
+        with caplog.at_level("WARNING", logger="appsec-mcp"):
+            with pytest.raises(RuntimeError, match="in the past"):
+                self._exchange(jwt_auth, exp=time.time() - 3600, headers={"Date": server_now})
+        assert "Local clock differs" in caplog.text
+
     def test_bad_date_header_is_ignored(self):
         jwt_auth = JWTAuth("https://example.com/api/v1", "id")
         self._exchange(jwt_auth, exp=time.time() + 3600, headers={"Date": "garbage"})

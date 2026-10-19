@@ -650,6 +650,32 @@ class TestCallAppsecApiTransientRetry:
         assert result is None  # HTTPStatusError propagated
         assert post.call_count == 4  # first try + 3 retries
 
+    def test_nan_retry_after_falls_back_to_backoff(self):
+        _, _, sleep = self._call([self._resp(429, "nan"), self._resp(200)])
+        assert [c.args[0] for c in sleep.call_args_list] == [2.0]
+
+    def test_abandoned_scan_stops_retrying(self):
+        import scanner_core
+
+        stage = scanner_core.ScanStage()
+        token = scanner_core.current_stage.set(stage)
+
+        def abandon(_delay):
+            stage.abandoned = True  # caller's deadline fires during the backoff
+
+        try:
+            with (
+                patch.object(scanner_core, "APPSEC_API_URL", "https://moose.armis.com/api/v1"),
+                patch("scanner_core.get_auth_header", return_value="Bearer t"),
+                patch("scanner_core.httpx.post", return_value=self._resp(429)) as post,
+                patch("scanner_core.time.sleep", side_effect=abandon),
+            ):
+                with pytest.raises(TimeoutError):
+                    scanner_core.call_appsec_api("code")
+        finally:
+            scanner_core.current_stage.reset(token)
+        assert post.call_count == 1
+
     def test_non_retryable_status_is_not_retried(self):
         result, post, sleep = self._call([self._resp(400)])
         assert result is None
