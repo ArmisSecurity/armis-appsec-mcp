@@ -220,6 +220,7 @@ If HIGH/CRITICAL findings are found, the assistant will attempt to fix them. If 
 | `APPSEC_ENV` | `prod` | `dev` or `prod` — selects API endpoint |
 | `APPSEC_API_URL` | (auto) | Override the API base URL |
 | `APPSEC_SCAN_TIMEOUT` | `180` | Seconds one scan may take (auth + API) before it fails with the step that stalled |
+| `APPSEC_MAX_CONCURRENT_SCANS` | `3` | Scan requests in flight at once; extra scans wait. Rate-limit (429) and 5xx responses are retried with backoff |
 | `APPSEC_DEBUG` | (unset) | Set to any value to enable debug logging |
 | `APPSEC_TRANSPORT` | `stdio` | MCP transport (`stdio`, `sse`) |
 | `APPSEC_HOOK_STRICT` | (unset) | Set to `1` for fail-closed git hook |

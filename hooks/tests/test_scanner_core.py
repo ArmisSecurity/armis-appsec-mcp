@@ -2,8 +2,10 @@
 
 import os
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 # Add plugin dir to path so we can import scanner_core
@@ -601,3 +603,89 @@ class TestCallAppsecApi401Retry:
             mock_invalidate.assert_not_called()
         finally:
             scanner_core.APPSEC_API_URL = original_url
+
+
+# ---------------------------------------------------------------------------
+# call_appsec_api transient retry (429/5xx) + concurrency cap
+# ---------------------------------------------------------------------------
+class TestCallAppsecApiTransientRetry:
+    def _resp(self, status, retry_after=None):
+        r = MagicMock()
+        r.status_code = status
+        r.headers = {"Retry-After": retry_after} if retry_after else {}
+        r.json.return_value = {"raw_response": "ok"}
+        if status >= 400:
+            r.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "err", request=MagicMock(), response=r
+            )
+        return r
+
+    def _call(self, responses):
+        import scanner_core
+
+        with (
+            patch.object(scanner_core, "APPSEC_API_URL", "https://moose.armis.com/api/v1"),
+            patch("scanner_core.get_auth_header", return_value="Bearer t"),
+            patch("scanner_core.httpx.post", side_effect=responses) as mock_post,
+            patch("scanner_core.time.sleep") as mock_sleep,
+        ):
+            try:
+                result = scanner_core.call_appsec_api("code")
+            except httpx.HTTPStatusError:
+                result = None
+        return result, mock_post, mock_sleep
+
+    def test_429_retries_with_backoff_then_succeeds(self):
+        result, post, sleep = self._call([self._resp(429), self._resp(429), self._resp(200)])
+        assert result == "ok"
+        assert post.call_count == 3
+        assert [c.args[0] for c in sleep.call_args_list] == [2.0, 4.0]
+
+    def test_retry_after_header_is_honored_and_capped(self):
+        _, _, sleep = self._call([self._resp(429, "5"), self._resp(429, "999"), self._resp(200)])
+        assert [c.args[0] for c in sleep.call_args_list] == [5.0, 20.0]
+
+    def test_gives_up_after_max_retries(self):
+        result, post, _ = self._call([self._resp(429)] * 4)
+        assert result is None  # HTTPStatusError propagated
+        assert post.call_count == 4  # first try + 3 retries
+
+    def test_non_retryable_status_is_not_retried(self):
+        result, post, sleep = self._call([self._resp(400)])
+        assert result is None
+        assert post.call_count == 1
+        sleep.assert_not_called()
+
+    def test_scan_slots_cap_concurrency(self):
+        import threading
+
+        import scanner_core
+
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def fake_post(*_a, **_k):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return self._resp(200)
+
+        with (
+            patch.object(scanner_core, "APPSEC_API_URL", "https://moose.armis.com/api/v1"),
+            patch.object(scanner_core, "_SCAN_SLOTS", threading.BoundedSemaphore(2)),
+            patch("scanner_core.get_auth_header", return_value="Bearer t"),
+            patch("scanner_core.httpx.post", side_effect=fake_post),
+        ):
+            threads = [
+                threading.Thread(target=scanner_core.call_appsec_api, args=("c",)) for _ in range(6)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        assert peak == 2

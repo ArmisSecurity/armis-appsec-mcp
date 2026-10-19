@@ -105,12 +105,32 @@ def setup_logging(plugin_dir: str, level: int = logging.INFO) -> str | None:
     return log_path
 
 
+_DISCONNECT_ERRORS = {"BrokenResourceError", "ClosedResourceError"}
+
+
+def _is_client_disconnect(exc: BaseException | None) -> bool:
+    """True if ``exc`` (or every leaf of an exception group) is a closed-stream error.
+
+    Editors kill the stdio server mid-request on reload; anyio then raises these
+    from the stdin reader. That is a normal shutdown, not a crash.
+    """
+    if exc is None:
+        return False
+    children = getattr(exc, "exceptions", None)
+    if children:
+        return all(_is_client_disconnect(c) for c in children)
+    return type(exc).__name__ in _DISCONNECT_ERRORS
+
+
 def install_exception_hooks() -> None:
     """Route uncaught exceptions (main thread and worker threads) to the log."""
 
     def _excepthook(exc_type, exc, tb):
         if issubclass(exc_type, KeyboardInterrupt):
             sys.__excepthook__(exc_type, exc, tb)
+            return
+        if _is_client_disconnect(exc):
+            logger.info("MCP client closed the connection (%s)", exc_type.__name__)
             return
         logger.critical("Unhandled exception", exc_info=(exc_type, exc, tb))
 

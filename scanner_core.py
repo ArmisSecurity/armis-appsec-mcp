@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 from contextvars import ContextVar
@@ -66,6 +67,34 @@ _CONNECT_TIMEOUT = 60.0
 _SCAN_READ_TIMEOUT = 120.0
 
 
+def _max_concurrent_scans() -> int:
+    try:
+        return max(1, int(os.environ.get("APPSEC_MAX_CONCURRENT_SCANS", "3")))
+    except ValueError:
+        return 3
+
+
+# Caps in-flight scan requests: an agent that fires a dozen scan_file calls at once
+# otherwise trips the API's rate limit (HTTP 429) and every scan in the burst fails.
+_SCAN_SLOTS = threading.BoundedSemaphore(_max_concurrent_scans())
+
+# Transient statuses worth retrying with backoff. 401 has its own re-auth retry.
+_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+_MAX_TRANSIENT_RETRIES = 3
+_BACKOFF_BASE_SECONDS = 2.0
+_MAX_BACKOFF_SECONDS = 20.0
+
+
+def _retry_delay(response: httpx.Response, retries_so_far: int) -> float:
+    """Seconds to wait before retrying: ``Retry-After`` if given, else 2s, 4s, 8s."""
+    header = response.headers.get("Retry-After", "")
+    try:
+        delay = float(header)
+    except (TypeError, ValueError):
+        delay = _BACKOFF_BASE_SECONDS * (2**retries_so_far)
+    return min(max(delay, 0.0), _MAX_BACKOFF_SECONDS)
+
+
 def _enter_stage(name: str) -> None:
     stage = current_stage.get()
     if stage is not None:
@@ -79,6 +108,9 @@ def call_appsec_api(code: str) -> str:
     cached token can pass local expiry checks yet be rejected server-side
     (session revoked/logged out), so we re-authenticate (re-exchange, refresh,
     or device login) rather than fail the scan. A second 401 propagates.
+
+    HTTP 429/502/503/504 are retried up to ``_MAX_TRANSIENT_RETRIES`` times with
+    backoff, and concurrent calls are capped by ``_SCAN_SLOTS``.
     """
     url = f"{APPSEC_API_URL.rstrip('/')}/scan/fast"
 
@@ -86,35 +118,50 @@ def call_appsec_api(code: str) -> str:
     if parsed.scheme != "https" and parsed.hostname not in _LOCALHOST_HOSTS:
         raise RuntimeError("APPSEC_API_URL must use HTTPS (except localhost).")
 
-    for attempt in range(2):
+    reauthed = False
+    transient_retries = 0
+    while True:
         _enter_stage("obtaining an auth token")
         t_auth = time.monotonic()
         auth_header = get_auth_header()
         logger.info("Auth token ready in %.2fs", time.monotonic() - t_auth)
 
-        _enter_stage(f"waiting for the scan API to respond ({len(code)} chars)")
-        logger.info("POST %s (%d chars, attempt %d)", url, len(code), attempt + 1)
-        t_post = time.monotonic()
-        response = httpx.post(
-            url,
-            json={"code": code, "mode": SCAN_MODE},
-            headers={"Authorization": auth_header},
-            timeout=httpx.Timeout(_SCAN_READ_TIMEOUT, connect=_CONNECT_TIMEOUT),
-        )
+        _enter_stage("waiting for a free scan slot")
+        with _SCAN_SLOTS:
+            _enter_stage(f"waiting for the scan API to respond ({len(code)} chars)")
+            logger.info("POST %s (%d chars)", url, len(code))
+            t_post = time.monotonic()
+            response = httpx.post(
+                url,
+                json={"code": code, "mode": SCAN_MODE},
+                headers={"Authorization": auth_header},
+                timeout=httpx.Timeout(_SCAN_READ_TIMEOUT, connect=_CONNECT_TIMEOUT),
+            )
         logger.info(
             "Scan API responded HTTP %d in %.2fs", response.status_code, time.monotonic() - t_post
         )
-        if response.status_code == 401 and attempt == 0:
+        if response.status_code == 401 and not reauthed:
             # Token rejected server-side (expired/revoked session) despite
             # passing local checks. Drop it and re-authenticate, then retry once.
+            reauthed = True
             logger.info("Scan API returned 401; re-authenticating and retrying once.")
             invalidate_auth(auth_header)
             continue
+        if response.status_code in _RETRY_STATUSES and transient_retries < _MAX_TRANSIENT_RETRIES:
+            delay = _retry_delay(response, transient_retries)
+            transient_retries += 1
+            logger.warning(
+                "Scan API returned HTTP %d; retrying in %.0fs (%d/%d)",
+                response.status_code,
+                delay,
+                transient_retries,
+                _MAX_TRANSIENT_RETRIES,
+            )
+            _enter_stage(f"backing off {delay:.0f}s after HTTP {response.status_code}")
+            time.sleep(delay)
+            continue
         response.raise_for_status()
         return response.json()["raw_response"]
-
-    # Unreachable: the loop either returns or raises. Satisfies the type checker.
-    raise RuntimeError("Scan authentication failed after retry.")
 
 
 def parse_findings(raw: str) -> list[dict]:

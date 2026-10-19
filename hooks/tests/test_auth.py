@@ -136,6 +136,39 @@ class TestJWTAuthExchange:
         assert jwt_auth._expires_at > time.time()
         mock_post.assert_called_once()
 
+    def _exchange(self, jwt_auth, exp, headers=None):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"token": _make_jwt(exp=exp)}
+        mock_response.headers = headers or {}
+        with patch("auth.httpx.post", return_value=mock_response):
+            jwt_auth.exchange()
+
+    def test_short_lived_token_warns(self, caplog):
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        with caplog.at_level("WARNING", logger="appsec-mcp"):
+            self._exchange(jwt_auth, exp=time.time() + 30)
+        assert "re-exchanged on every call" in caplog.text
+
+    def test_normal_token_does_not_warn(self, caplog):
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        with caplog.at_level("WARNING", logger="appsec-mcp"):
+            self._exchange(jwt_auth, exp=time.time() + 3600)
+        assert caplog.text == ""
+
+    def test_clock_skew_against_date_header_warns(self, caplog):
+        from email.utils import formatdate
+
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        server_now = formatdate(time.time() - 7200, usegmt=True)  # local clock 2h ahead
+        with caplog.at_level("WARNING", logger="appsec-mcp"):
+            self._exchange(jwt_auth, exp=time.time() + 3600, headers={"Date": server_now})
+        assert "Local clock differs" in caplog.text
+
+    def test_bad_date_header_is_ignored(self):
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        self._exchange(jwt_auth, exp=time.time() + 3600, headers={"Date": "garbage"})
+        assert jwt_auth._token is not None
+
     def test_401_raises_clear_error(self):
         jwt_auth = JWTAuth("https://example.com/api/v1", "id")
         mock_response = MagicMock()

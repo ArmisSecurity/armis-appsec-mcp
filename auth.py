@@ -27,6 +27,7 @@ import os
 import threading
 import time
 import urllib.parse
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -47,6 +48,7 @@ logger = logging.getLogger("appsec-mcp")
 
 # Refresh when less than 5 minutes remain (matches armis-cli)
 _REFRESH_BUFFER_SECONDS = 300
+_CLOCK_SKEW_WARN_SECONDS = 60
 
 _LOCALHOST_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -121,6 +123,36 @@ class JWTAuth:
             self._token = None
             raise RuntimeError(f"Authentication failed: invalid JWT payload ({e})") from e
         logger.info("JWT token obtained, expires at %.0f", self._expires_at)
+        self._log_token_lifetime(response)
+
+    def _log_token_lifetime(self, response: httpx.Response) -> None:
+        """Warn when the token looks too short-lived or the local clock is off.
+
+        A token whose remaining life is under the refresh buffer is re-exchanged
+        on every call, and a local clock far from the server's makes that (and
+        server-side 401s) look like an auth bug. Diagnostic only; never raises.
+        """
+        try:
+            ttl = self._expires_at - time.time()
+            logger.info("JWT lifetime: %.0fs remaining", ttl)
+            if ttl < _REFRESH_BUFFER_SECONDS:
+                logger.warning(
+                    "JWT has only %.0fs left (< %ds refresh buffer): it will be re-exchanged "
+                    "on every call. Check the system clock and timezone.",
+                    ttl,
+                    _REFRESH_BUFFER_SECONDS,
+                )
+            date_header = response.headers.get("Date")
+            if date_header:
+                skew = time.time() - parsedate_to_datetime(date_header).timestamp()
+                if abs(skew) > _CLOCK_SKEW_WARN_SECONDS:
+                    logger.warning(
+                        "Local clock differs from the auth server's by %+.0fs. "
+                        "Sync the system clock (Windows: w32tm /resync).",
+                        skew,
+                    )
+        except Exception as e:  # diagnostics must never break authentication
+            logger.debug("token lifetime check failed: %s", e)
 
     def _is_valid(self) -> bool:
         return self._token is not None and time.time() < self._expires_at - _REFRESH_BUFFER_SECONDS

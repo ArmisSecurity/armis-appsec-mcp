@@ -100,6 +100,31 @@ class TestSetupLogging:
         assert "Traceback" in text
         assert "ValueError: kaboom" in text
 
+    def test_client_disconnect_group_logged_as_info(self, tmp_path, clean_root_logger, monkeypatch):
+        class BrokenResourceError(Exception):
+            pass
+
+        monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+        monkeypatch.setattr(server_log.threading, "excepthook", server_log.threading.excepthook)
+        path = server_log.setup_logging(str(tmp_path))
+        server_log.install_exception_hooks()
+        try:
+            raise ExceptionGroup("unhandled errors in a TaskGroup", [BrokenResourceError()])
+        except ExceptionGroup:
+            sys.excepthook(*sys.exc_info())
+        for h in clean_root_logger.handlers:
+            h.flush()
+        text = open(path, encoding="utf-8").read()
+        assert "MCP client closed the connection" in text
+        assert "CRITICAL" not in text
+
+    def test_mixed_group_still_critical(self):
+        class BrokenResourceError(Exception):
+            pass
+
+        group = ExceptionGroup("g", [BrokenResourceError(), ValueError("real bug")])
+        assert not server_log._is_client_disconnect(group)
+
 
 class TestLoggedTool:
     def test_success_logged(self, caplog):
