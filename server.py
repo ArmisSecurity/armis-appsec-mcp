@@ -49,6 +49,7 @@ from hash_utils import (
 from net_config import configure_ca_trust, configure_proxy
 from scanner_core import (
     APPSEC_API_URL,
+    MAX_CONCURRENT_SCANS,
     ScanStage,
     build_diff_line_map,
     call_appsec_api,
@@ -180,8 +181,8 @@ async def _call_api(code: str, ctx: Context | None) -> str:
 
     The per-request httpx timeouts are per phase, so auth + scan + a 401 retry
     could otherwise stay silent for 5+ minutes. On timeout the error names the
-    step that was running (the worker thread itself runs on until its own httpx
-    timeout fires).
+    step that was running. The worker thread runs on until its current httpx
+    call returns, then sees ``stage.abandoned`` and stops instead of retrying.
     """
     stage = ScanStage()
     token = current_stage.set(stage)
@@ -211,6 +212,7 @@ async def _call_api(code: str, ctx: Context | None) -> str:
             msg += f" {pending} Then retry the scan."
         raise ScanTimeoutError(msg) from None
     finally:
+        stage.abandoned = True  # an orphaned worker must not keep retrying
         if beat:
             beat.cancel()
         current_stage.reset(token)
@@ -620,6 +622,7 @@ def get_debug_config() -> str:
     lines.append(f"Credentials file: {'present' if env_exists else 'missing'}")
     lines.extend(_credential_report())
     lines.append(f"Scan timeout: {_scan_deadline():.0f}s")
+    lines.append(f"Max concurrent scans: {MAX_CONCURRENT_SCANS}")
     lines.append(f"Scan pass: {'present' if scan_pass_exists else 'none'}")
     lines.append(f"CA source: {_runtime['ca_source']}")
     lines.append(f"Proxy: {_runtime['proxy']}")
