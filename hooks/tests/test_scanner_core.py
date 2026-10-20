@@ -715,3 +715,14 @@ class TestCallAppsecApiTransientRetry:
             for t in threads:
                 t.join()
         assert peak == 2
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("5", 5), ("0", 1), ("-4", 1), ("abc", 3), ("100000", 16)],
+)
+def test_max_concurrent_scans_is_clamped(monkeypatch, raw, expected):
+    monkeypatch.setenv("APPSEC_MAX_CONCURRENT_SCANS", raw)
+    from scanner_core import _max_concurrent_scans
+
+    assert _max_concurrent_scans() == expected

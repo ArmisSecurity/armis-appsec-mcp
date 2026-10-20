@@ -166,7 +166,7 @@ When you edit either hook, preserve the outer `try: ... except Exception: print(
 | `APPSEC_ENV` | `prod` | Selects `moose.armis.com` (prod) or `moose-dev.armis.com` (dev) |
 | `APPSEC_API_URL` | auto | Full override; must be HTTPS unless hostname is localhost |
 | `APPSEC_SCAN_TIMEOUT` | `180` | Overall seconds per scan (`server._call_api`): auth + API. On expiry the error names the stage (`scanner_core.ScanStage`, carried to the worker thread via a ContextVar) and any pending device sign-in URL. |
-| `APPSEC_MAX_CONCURRENT_SCANS` | `3` | Caps in-flight `/scan/fast` requests (`scanner_core._SCAN_SLOTS`). 429/502/503/504 are retried ≤3× with 2/4/8s backoff (`Retry-After` honored, capped 20s). |
+| `APPSEC_MAX_CONCURRENT_SCANS` | `3` | Caps (clamped to 1–16) in-flight `/scan/fast` requests (`scanner_core._SCAN_SLOTS`). 429/502/503/504 are retried ≤3× with 2/4/8s backoff (`Retry-After` honored, capped 20s). |
 | `APPSEC_DEBUG` | unset | Any truthy value sets the server log level to DEBUG |
 | `SSL_CERT_FILE` / `SSL_CERT_DIR` / `REQUESTS_CA_BUNDLE` | unset | Explicit CA bundle; beats the OS store (see `net_config`) |
 | `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` / `NO_PROXY` | unset | If any proxy var is set the env is authoritative; otherwise the OS proxy is used |

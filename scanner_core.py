@@ -71,11 +71,15 @@ _CONNECT_TIMEOUT = 60.0
 _SCAN_READ_TIMEOUT = 120.0
 
 
+_MAX_CONCURRENT_SCANS_CEILING = 16
+
+
 def _max_concurrent_scans() -> int:
     try:
-        return max(1, int(os.environ.get("APPSEC_MAX_CONCURRENT_SCANS", "3")))
+        value = int(os.environ.get("APPSEC_MAX_CONCURRENT_SCANS", "3"))
     except ValueError:
         return 3
+    return min(max(1, value), _MAX_CONCURRENT_SCANS_CEILING)
 
 
 # Caps in-flight scan requests: an agent that fires a dozen scan_file calls at once
