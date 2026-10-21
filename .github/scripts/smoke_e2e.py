@@ -296,6 +296,7 @@ def check_line_endings(plugin_dir: Path) -> None:
 def server_env(plugin_dir: Path, api_url: str) -> dict[str, str]:
     env = {
         **os.environ,
+        # armis:ignore cwe:798 cwe:259 reason: dummy value, only the localhost stub reads it
         "ARMIS_CLIENT_ID": "ci-smoke",
         # armis:ignore cwe:798 cwe:259 reason: dummy value, only the localhost stub reads it
         "ARMIS_CLIENT_SECRET": "ci-smoke",
