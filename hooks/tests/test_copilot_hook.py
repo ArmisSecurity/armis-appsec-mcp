@@ -71,6 +71,10 @@ class TestNonShippingAllow:
 
 
 class TestWriteToolGuard:
+    def test_write_to_uppercase_scan_pass_denied(self, run_copilot_hook):
+        result = run_copilot_hook(tool_name="create", file_path="/project/.git/ARMIS-SCAN-PASS")
+        assert json.loads(result.stdout)["permissionDecision"] == "deny"
+
     def test_write_to_scan_pass_denied(self, run_copilot_hook):
         result = run_copilot_hook(tool_name="create", file_path="/project/.scan-pass")
         assert result.returncode == 0

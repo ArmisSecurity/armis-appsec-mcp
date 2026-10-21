@@ -195,6 +195,14 @@ class TestScanPassWriteForgery:
             "echo x | sponge .git/armis-scan-pass",  # sponge (moreutils)
             "gawk 'BEGIN{print}' .git/armis-scan-pass",  # gawk
             "php -r x .git/armis-scan-pass",  # php interpreter
+            # Case-insensitive FS (APFS / NTFS): same file, different case.
+            "echo x > .git/ARMIS-SCAN-PASS",
+            "echo x > .git/Armis-Scan-Pass",
+            "echo x >> .git/.SCAN-PASS",
+            "echo x >| .git/ARMIS-SCAN-PASS",
+            "echo x | tee .git/ARMIS-SCAN-PASS",
+            "cp /tmp/h .git/Armis-Scan-Pass",
+            "F=.git/ARMIS-SCAN-PASS; echo x > $F",
         ],
     )
     def test_forgery_vectors_denied(self, cmd):
@@ -216,6 +224,11 @@ class TestScanPassWriteForgery:
             "cat .git/armis-scan-pass",  # read-only inspection
             "rm .git/armis-scan-pass",  # delete to force a re-scan (not a forgery)
             "pytest -k armis-scan-pass",  # test selector
+            # Upper-case mentions are still mere mentions.
+            "cat .git/ARMIS-SCAN-PASS",
+            "grep ARMIS-SCAN-PASS hooks/hook_core.py",
+            "rm .git/ARMIS-SCAN-PASS",
+            "git commit -m 'fix ARMIS-SCAN-PASS path'",
         ],
     )
     def test_no_false_positives(self, cmd):
@@ -301,7 +314,21 @@ class TestIsScanPassFile:
         assert hook_core.is_scan_pass_file("/some/path/.scan-pass")
         assert hook_core.is_scan_pass_file(".scan-pass")
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            ".git/ARMIS-SCAN-PASS",
+            "/repo/.git/Armis-Scan-Pass",
+            ".SCAN-PASS",
+            "/repo/.Scan-Pass",
+            "C:\\repo\\.git\\ARMIS-SCAN-PASS",  # Windows separators
+        ],
+    )
+    def test_case_insensitive_and_windows_separators(self, path):
+        assert hook_core.is_scan_pass_file(path)
+
     def test_not_scan_pass(self):
+        assert not hook_core.is_scan_pass_file("/repo/ARMIS-SCAN-PASSPORT")
         assert not hook_core.is_scan_pass_file("/some/path/file.py")
         assert not hook_core.is_scan_pass_file("scan-pass")
         assert not hook_core.is_scan_pass_file("")
