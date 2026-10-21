@@ -36,7 +36,9 @@ import importlib
 
 if "server" in sys.modules:
     importlib.reload(sys.modules["server"])
+import hash_utils
 import server
+import suppression
 
 
 @pytest.fixture(autouse=True)
@@ -375,9 +377,9 @@ class TestCacheScanRefScanPass:
     "call",
     [
         lambda: server.run_git_diff(staged=True),
-        lambda: __import__("hash_utils").resolve_scan_pass_path(),
-        lambda: __import__("hash_utils").compute_staged_hash(),
-        lambda: __import__("suppression").find_git_root(),
+        lambda: hash_utils.resolve_scan_pass_path(),
+        lambda: hash_utils.compute_staged_hash(),
+        lambda: suppression.find_git_root(),
     ],
     ids=["run_git_diff", "resolve_scan_pass_path", "compute_staged_hash", "find_git_root"],
 )
@@ -400,9 +402,6 @@ def test_debug_config_reports_git_timing():
 
 
 def test_git_timeout_is_logged(caplog):
-    import hash_utils
-    import suppression
-
     with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5)):
         with caplog.at_level("WARNING", logger="appsec-mcp"):
             assert hash_utils.resolve_scan_pass_path() is not None
