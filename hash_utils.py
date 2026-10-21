@@ -5,8 +5,11 @@ locate the scan-pass commit-gate file.
 """
 
 import hashlib
+import logging
 import os
 import subprocess
+
+logger = logging.getLogger("appsec-mcp")
 
 _MAX_DIFF_BYTES = 50 * 1024 * 1024  # 50 MB — safety limit for hashing
 _plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -30,11 +33,18 @@ def _git_output(args: list[str], cwd: str | None = None) -> str | None:
         result = subprocess.run(
             ["git", *args],
             cwd=cwd,
+            # The MCP server's stdin is the client's JSON-RPC pipe, with a read
+            # pending on it. On Windows a child that inherits that handle blocks
+            # until the read completes (the next client message), so git hangs.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=5,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired:
+        logger.warning("git %s timed out after 5s in %s", " ".join(args), cwd or os.getcwd())
+        return None
+    except OSError:
         return None
     if result.returncode != 0:
         return None
@@ -164,6 +174,7 @@ def compute_staged_hash(repo_path: str | None = None) -> str:
         result = subprocess.run(
             ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
             cwd=repo_path,
+            stdin=subprocess.DEVNULL,  # see _git_output
             capture_output=True,
             timeout=10,
         )
@@ -172,5 +183,8 @@ def compute_staged_hash(repo_path: str | None = None) -> str:
         if len(result.stdout) > _MAX_DIFF_BYTES:
             return ""  # Too large to hash safely
         return hashlib.sha256(result.stdout).hexdigest()
-    except (subprocess.TimeoutExpired, OSError, ValueError):
+    except subprocess.TimeoutExpired:
+        logger.warning("git diff --cached timed out after 10s in %s", repo_path or os.getcwd())
+        return ""
+    except (OSError, ValueError):
         return ""

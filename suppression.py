@@ -37,6 +37,7 @@ def find_git_root(from_path: str | None = None) -> str | None:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
+            stdin=subprocess.DEVNULL,  # see hash_utils._git_output
             capture_output=True,
             text=True,
             timeout=5,
@@ -44,7 +45,9 @@ def find_git_root(from_path: str | None = None) -> str | None:
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired:
+        logger.warning("git rev-parse --show-toplevel timed out after 5s in %s", cwd or os.getcwd())
+    except OSError:
         pass
     return None
 

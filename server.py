@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -544,7 +545,10 @@ def run_git_diff(
     logger.info("Running: %s in %s", " ".join(cmd), cwd)
 
     try:
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=30)
+        # stdin=DEVNULL: see hash_utils._git_output.
+        result = subprocess.run(
+            cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, timeout=30
+        )
     except subprocess.TimeoutExpired as e:
         raise ToolError(
             "git diff timed out after 30 seconds. Try a narrower ref or smaller repo."
@@ -604,7 +608,10 @@ def get_debug_config() -> str:
     version = _plugin_version(plugin_root)
 
     env_exists = os.path.isfile(os.path.join(plugin_root, ".env"))
+    # Timed because every tool runs git: a slow git here means slow scans.
+    t0 = time.monotonic()
     scan_pass_exists = os.path.isfile(resolve_scan_pass_path())
+    git_seconds = time.monotonic() - t0
 
     lines = [
         f"Auth: {auth_status}",
@@ -624,6 +631,9 @@ def get_debug_config() -> str:
     lines.append(f"Scan timeout: {_scan_deadline():.0f}s")
     lines.append(f"Max concurrent scans: {MAX_CONCURRENT_SCANS}")
     lines.append(f"Scan pass: {'present' if scan_pass_exists else 'none'}")
+    lines.append(
+        f"Git: {shutil.which('git') or 'not found on PATH'} (rev-parse {git_seconds:.2f}s)"
+    )
     lines.append(f"CA source: {_runtime['ca_source']}")
     lines.append(f"Proxy: {_runtime['proxy']}")
     lines.append(f"Log file: {_runtime['log_file']}")
@@ -1012,7 +1022,8 @@ async def debug_config() -> str:
     Returns the current API URL, token status, and environment configuration.
     Use this to troubleshoot connection issues or verify configuration.
     """
-    return get_debug_config()
+    # Off the event loop: a stalled git call must not block the whole server.
+    return await asyncio.to_thread(get_debug_config)
 
 
 # ---------------------------------------------------------------------------
@@ -1289,9 +1300,14 @@ def main() -> None:
     _runtime["ca_source"] = configure_ca_trust()
     _runtime["proxy"] = configure_proxy(APPSEC_API_URL).describe()
 
+    version = _plugin_version(os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir))
+    if version != "unknown":
+        # FastMCP has no version argument; without this, initialize reports
+        # the MCP SDK's version as the server's.
+        mcp._mcp_server.version = version
     logger.info(
         "Starting Armis AppSec MCP server %s (python %s at %s, %s)",
-        _plugin_version(os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir)),
+        version,
         platform.python_version(),
         sys.executable,
         platform.platform(),
