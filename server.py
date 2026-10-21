@@ -44,10 +44,17 @@ from auth import get_auth_method, get_auth_status, get_pending_signin, init_auth
 from hash_utils import (
     cleanup_legacy_scan_pass,
     compute_staged_hash,
-    merge_or_rebase_in_progress,
     resolve_scan_pass_path,
 )
 from net_config import configure_ca_trust, configure_proxy
+from scan_gate import (
+    DIFF_CONTEXT_LINES,
+    DIFF_FILTER_ARGS,
+    MAX_CODE_CHARS,
+    clip_diff,
+    shipping_decision,
+    write_or_clear_scan_pass,
+)
 from scanner_core import (
     APPSEC_API_URL,
     MAX_CONCURRENT_SCANS,
@@ -385,7 +392,7 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 _BLOCKED_PREFIXES = ("/etc/", "/proc/", "/sys/", "/private/etc/")
 _BLOCKED_DOTDIRS = {".ssh", ".gnupg", ".aws", os.path.join(".config", "gcloud")}
-_MAX_CODE_CHARS = 90_000
+_MAX_CODE_CHARS = MAX_CODE_CHARS
 
 # Git ref validation: alphanumeric + common ref chars (branch, tag, SHA, HEAD~3)
 _VALID_GIT_REF = re.compile(r"^[a-zA-Z0-9_./\-~^@{}]+$")
@@ -498,7 +505,7 @@ def run_git_diff(
     ref: str = "",
     staged: bool = False,
     paths: list[str] | None = None,
-    context_lines: int = 10,
+    context_lines: int = DIFF_CONTEXT_LINES,
 ) -> tuple[str, bool]:
     """Run git diff and return ``(diff_text, truncated)``. Raises ToolError on failure.
 
@@ -538,7 +545,7 @@ def run_git_diff(
         cmd.append(ref)
     elif staged:
         cmd.append("--cached")
-    cmd.extend(["--diff-filter=d", "--no-ext-diff", f"-U{context_lines}", "--"])
+    cmd.extend([*DIFF_FILTER_ARGS, f"-U{context_lines}", "--"])
     if paths:
         cmd.extend(paths)
 
@@ -563,9 +570,8 @@ def run_git_diff(
     # UnicodeDecodeError out of the scan path. Capturing bytes (no text=True)
     # also avoids universal-newline translation.
     diff_text = result.stdout.decode("utf-8", errors="replace").strip()
-    truncated = len(diff_text) > _MAX_CODE_CHARS
+    diff_text, truncated = clip_diff(diff_text, _MAX_CODE_CHARS)
     if truncated:
-        diff_text = diff_text[:_MAX_CODE_CHARS]
         logger.warning("Truncated diff to %d chars", _MAX_CODE_CHARS)
 
     return diff_text, truncated
@@ -835,28 +841,11 @@ def _shipping_decision(
 ) -> tuple[bool, bool]:
     """Decide (is_shipping_scan, require_approval) for a scan_diff run.
 
-    Extracted as a sync helper so it is unit-testable without the async MCP
-    wrapper (which tests replace with a MagicMock).
-
-    Both staged and ref-based scans are shipping-eligible so they can write
-    .scan-pass (fixes push/PR gate loop — comments #8+#9). BUT a truncated diff
-    means the scanner saw less than the scan-pass hash vouches for, so normally
-    it is NOT shipping-eligible — refuse to gate it (#6).
-
-    EXCEPTION (ticket.md): a merge/rebase in progress. Its staged diff is mostly
-    already-landed, CI-scanned upstream code — the only newly authored content
-    is the conflict resolution. When such a diff is truncated, blunt refusal
-    paralyzes the developer: auto-pass is blocked AND approve_findings is blocked,
-    with no in-band escape. So for a mid-merge truncated diff we keep the scan
-    shipping-eligible (so approve_findings stays live) but flag require_approval —
-    _cache_scan never auto-writes the pass, so the ONLY way through is an explicit
-    human approve_findings. A human stays accountable for the un-scannable
-    content; the hook's hash logic is unchanged.
+    Thin wrapper over ``scan_gate.shipping_decision`` (shared with
+    git-hooks/scan-staged.py); kept as a sync helper so it is unit-testable
+    without the async MCP wrapper.
     """
-    shipping_kind = bool(ref) or staged
-    merge_in_progress = truncated and shipping_kind and merge_or_rebase_in_progress(scan_repo)
-    is_shipping_scan = shipping_kind and (not truncated or merge_in_progress)
-    return is_shipping_scan, merge_in_progress
+    return shipping_decision(ref, staged, truncated, scan_repo)
 
 
 @mcp.tool()
@@ -1238,39 +1227,20 @@ def _cache_scan(
     if not is_staged_scan:
         return
 
-    # A require_approval scan is shipping-eligible but must never auto-pass:
-    # the only route through the gate is an explicit human approve_findings.
-    # Remove any stale pass so a prior clean scan can't vouch for this diff.
-    if require_approval:
-        scan_pass_path = _scan_pass_path(repo_path)
-        cleanup_legacy_scan_pass(repo_path)
-        try:
-            if os.path.isfile(scan_pass_path):
-                os.remove(scan_pass_path)
-        except OSError:
-            pass
-        return
-
-    # Write/remove .scan-pass for the PreToolUse hook
-    # Design: suppressed CRITICAL blocks .scan-pass (requires approve_findings).
-    # Suppressed HIGH does NOT block — .armisignore is a deliberate team decision
-    # to accept HIGH-severity findings, so no per-commit approval is needed.
-    has_critical = any(f.get("severity", "").upper() in ("CRITICAL", "HIGH") for f in findings)
-    has_suppressed_critical = any(
-        f.get("severity", "").upper() == "CRITICAL" for f in (suppressed or [])
+    # Write/remove the scan-pass for the PreToolUse hook. Rules live in
+    # scan_gate (shared with git-hooks/scan-staged.py): a require_approval scan
+    # never auto-passes; suppressed CRITICAL blocks, suppressed HIGH does not.
+    # The resolvers are passed by name so they are looked up (and patchable) here.
+    write_or_clear_scan_pass(
+        findings,
+        suppressed,
+        scan_hash=scan_hash,
+        repo_path=repo_path,
+        require_approval=require_approval,
+        pass_path=_scan_pass_path,
+        cleanup_legacy=cleanup_legacy_scan_pass,
+        hash_fn=compute_staged_hash,
     )
-    scan_pass_path = _scan_pass_path(repo_path)
-    cleanup_legacy_scan_pass(repo_path)  # remove any stale working-tree .scan-pass
-    try:
-        if not has_critical and not has_suppressed_critical:
-            effective_hash = scan_hash or compute_staged_hash(repo_path)
-            if effective_hash:
-                with open(scan_pass_path, "w") as f:
-                    f.write(effective_hash)
-        elif os.path.isfile(scan_pass_path):
-            os.remove(scan_pass_path)
-    except OSError:
-        pass
 
 
 @mcp.resource("appsec://last-scan")
