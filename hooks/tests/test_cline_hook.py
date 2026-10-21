@@ -71,6 +71,12 @@ class TestNonShippingAllow:
 
 
 class TestWriteToolGuard:
+    def test_write_to_uppercase_scan_pass_denied(self, run_cline_hook):
+        result = run_cline_hook(
+            tool_name="write_to_file", file_path="/project/.git/ARMIS-SCAN-PASS"
+        )
+        assert json.loads(result.stdout)["cancel"] is True
+
     def test_write_to_scan_pass_denied(self, run_cline_hook):
         result = run_cline_hook(tool_name="write_to_file", file_path="/project/.scan-pass")
         assert result.returncode == 0

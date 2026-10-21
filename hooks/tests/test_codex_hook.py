@@ -71,6 +71,13 @@ class TestNonShippingAllow:
 
 
 class TestWriteToolGuard:
+    def test_write_to_uppercase_scan_pass_denied(self, run_codex_hook):
+        result = run_codex_hook(tool_name="write_file", file_path="/project/.git/ARMIS-SCAN-PASS")
+        assert result.returncode == 2
+        assert (
+            "BLOCKED" in json.loads(result.stderr)["hookSpecificOutput"]["permissionDecisionReason"]
+        )
+
     def test_write_to_scan_pass_denied(self, run_codex_hook):
         result = run_codex_hook(tool_name="write_file", file_path="/project/.scan-pass")
         assert result.returncode == 2
