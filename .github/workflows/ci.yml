@@ -43,7 +43,14 @@ jobs:
           path: coverage.xml
 
       - name: End-to-end smoke (run.sh, MCP stdio, commit gate)
-        run: python .github/scripts/smoke_e2e.py
+        run: python .github/scripts/smoke_e2e.py --log-dir smoke-logs
+
+      - name: Upload server log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log-linux
+          path: smoke-logs/
 
   windows:
     name: windows-${{ matrix.arch }} (Git Bash)
@@ -81,7 +88,7 @@ jobs:
 
       - name: End-to-end smoke (run.sh, MCP stdio, commit gate)
         timeout-minutes: 15
-        run: python .github/scripts/smoke_e2e.py
+        run: python .github/scripts/smoke_e2e.py --log-dir smoke-logs
 
       - name: Tests
         if: ${{ !cancelled() }}
@@ -92,4 +99,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: server-log-windows-${{ matrix.arch }}
-          path: logs/
+          path: |
+            smoke-logs/
+            logs/
