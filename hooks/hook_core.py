@@ -86,7 +86,14 @@ _ENV_PREFIX = (
 )
 # Stops at shell operators (never part of an unquoted path) so each scan ends at
 # the next _CMD_SEP start — `\S*` here was quadratic on `$($($(…`.
-_PATH_PREFIX = r"(?:[^\s;&|()<>]*/)?"
+#
+# Windows (Git Bash / PowerShell): either separator, a quoted path that may hold
+# spaces (`"C:/Program Files/Git/cmd/git.exe" commit`), and an optional `.exe`
+# on the binary (matched below, case-insensitively: `GIT.EXE`).
+_PATH_PREFIX = r"(?:\"[^\"]*[/\\]|'[^']*[/\\]|[^\s;&|()<>\"']*[/\\])?"
+# `git` / `gh`, optionally `.exe`, optionally closing a quote opened before it.
+_GIT_BIN = r"(?i:git(?:\.exe)?)['\"]?"
+_GH_BIN = r"(?i:gh(?:\.exe)?)['\"]?"
 # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
 _GIT_GLOBAL_OPTS = (
     # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
@@ -94,11 +101,13 @@ _GIT_GLOBAL_OPTS = (
 )
 
 _GIT_PREFIX = (
-    rf"{_CMD_SEP}\s*{_CMD_WRAP}{_ENV_PREFIX}{_PATH_PREFIX}['\"]?\\?git\s+{_GIT_GLOBAL_OPTS}"
+    rf"{_CMD_SEP}\s*{_CMD_WRAP}{_ENV_PREFIX}{_PATH_PREFIX}['\"]?\\?{_GIT_BIN}\s+{_GIT_GLOBAL_OPTS}"
 )
 # gh gets the same global-options segment as git, so `gh --repo o/r pr create`
 # (and `gh -R o/r pr create`) is gated, not just a bare `gh pr create`.
-_GH_PREFIX = rf"{_CMD_SEP}\s*{_CMD_WRAP}{_ENV_PREFIX}{_PATH_PREFIX}['\"]?\\?gh\s+{_GIT_GLOBAL_OPTS}"
+_GH_PREFIX = (
+    rf"{_CMD_SEP}\s*{_CMD_WRAP}{_ENV_PREFIX}{_PATH_PREFIX}['\"]?\\?{_GH_BIN}\s+{_GIT_GLOBAL_OPTS}"
+)
 
 # `commit(?![-\w])` / `push(?![-\w])` exclude hyphenated plumbing subcommands
 # (git commit-tree, commit-graph, push-cert) that are NOT shipping commands.
@@ -126,12 +135,16 @@ _INDEX_MUTATING_PATTERN = re.compile(
 
 # Env vars that point git at a different index / repo than the one the gate
 # hashed (`GIT_INDEX_FILE=/tmp/idx git commit`, `export GIT_DIR=…`).
-_INDEX_REDIRECT_ENV = re.compile(r"(?<![\w])GIT_(?:INDEX_FILE|DIR|WORK_TREE|COMMON_DIR)=")
+#   POSIX `GIT_DIR=…` and PowerShell `$env:GIT_DIR = "…"` (spaces around `=`).
+_INDEX_REDIRECT_ENV = re.compile(r"(?<![\w])GIT_(?:INDEX_FILE|DIR|WORK_TREE|COMMON_DIR)\s*=")
 
 _COMMIT_ALL_FLAG = re.compile(rf"{_GIT_PREFIX}commit(?![-\w]).*(?:\s-a\b|\s--all\b)")
 
 # Matches both the current "armis-scan-pass" and the legacy ".scan-pass".
-_SCAN_PASS_NAMES = r"(?:\.scan-pass|armis-scan-pass)"  # noqa: S105 — filenames, not a secret
+# Case-insensitive: on a case-insensitive filesystem (default macOS APFS, Windows
+# NTFS) `.git/ARMIS-SCAN-PASS` is the same file, so an exact-case match is a bypass.
+# Scoped `(?i:...)` so the write verbs and `git` patterns elsewhere keep their case.
+_SCAN_PASS_NAMES = r"(?i:\.scan-pass|armis-scan-pass|armis-~[0-9]+|scan-p~[0-9]+)"  # noqa: S105 — filenames (+ NTFS 8.3 aliases), not a secret
 # Anti-forgery: the scan-pass content is just
 # SHA-256(git diff --cached), which an agent can compute with read-only
 # commands the gate allows — so the file must be unforgeable via shell. We deny
@@ -159,23 +172,54 @@ _SP_WRITE_VERBS = (
     r"(?:tee|cp|mv|dd|install|ln|truncate|sed|ex|vi|vim|nano|emacs|sponge"
     r"|python[0-9.]*|perl|ruby|node|awk|gawk|mawk|php)"
 )
+# Windows shells. PowerShell cmdlets are case-insensitive and can follow a pipe
+# (`'x' | Out-File <pass>`), so they match anywhere. `[IO.File]::WriteAllText(…)`
+# is caught by its method name.
+_SP_WIN_WRITE_VERBS = (
+    r"(?i:set-content|add-content|out-file|new-item|copy-item|move-item|rename-item"
+    r"|clear-content|set-itemproperty|writeall\w+|appendall\w+)"
+)
+# Where a command can start: line/segment start, or the script argument of a
+# shell launcher (`bash -c "cmd /c …"`).
+_SP_CMD_POS = r"(?:^|[;&|(\n]|\s-c\s+['\"]?)\s*"
+# cmd builtins and PowerShell aliases that are ordinary English words (`copy`,
+# `move`) or two letters (`sc`, `ni`): only a write when they START a command,
+# so `git commit -m "copy armis-scan-pass"` stays a mere mention.
+_SP_CMD_START_VERBS = r"(?i:copy|move|xcopy|robocopy|ren|rename|sc|ac|ni|cpi|mi)"
+# Windows launchers: everything after them (`cmd //c copy NUL <pass>`,
+# `powershell -Command "Set-Content …"`) is a write context we cannot parse.
+# `cmd`/`powershell` appear in commit messages, so like the builtins above they
+# count only at command position (optionally with a path prefix, `C:\…\cmd.exe`).
+_SP_WIN_LAUNCHERS = r"(?i:powershell|pwsh|cmd)(?:\.exe)?"
+_SP_LAUNCHER_PATH = r"(?:[^\s;&|]*[/\\])?"
 # The name as a bounded token (path component, quoted arg, or assignment value).
-_SP_TOKEN = rf"(?:^|[\s/'\"=(]){_SCAN_PASS_NAMES}\b"
+# `\\` so a Windows separator (`.git\armis-scan-pass`) bounds it too.
+_SP_TOKEN = rf"(?:^|[\s/\\'\"=(]){_SCAN_PASS_NAMES}\b"
+# Optional directory part of a path: either separator, quoted (spaces allowed
+# inside quotes) or bare, or just an opening quote before the bare name.
+_SP_PATH = r"(?:\"[^\"\n]*[/\\]|'[^'\n]*[/\\]|['\"]?[^\s;&|<>\"']*?[/\\]|['\"])?"
 # armis:ignore cwe:400 reason: provably linear (anchored); see TestRegexComplexity
 _SCAN_PASS_WRITE_PATTERN = re.compile(
     # 1. redirect (truncate/append) targeting the file. `\d*` allows an fd prefix
     #    (`1>`), `\|?` allows bash's noclobber-override `>|` (and `1>|`) — both
     #    were missed by the older `>>?` form and let `echo h >| <pass>` forge.
     # armis:ignore cwe:400 reason: provably linear (anchored); see TestRegexComplexity
-    rf"\d*>>?\|?\s*(?:[^\s;&|>]*?/)?{_SCAN_PASS_NAMES}\b"
-    # 2. a write-capable command naming the file in its arguments
+    rf"\d*>>?\|?\s*{_SP_PATH}{_SCAN_PASS_NAMES}\b"
+    # 2. a write-capable command naming the file in its arguments. `py` (the
+    #    Windows launcher) needs a lookbehind so `app.py <pass>` is not a verb.
     rf"|\b{_SP_WRITE_VERBS}\b[^\n;&|]*{_SP_TOKEN}"
+    rf"|(?<![\w.\-])py\b[^\n;&|]*{_SP_TOKEN}"
+    rf"|\b{_SP_WIN_WRITE_VERBS}\b[^\n;&|]*{_SP_TOKEN}"
+    rf"|{_SP_CMD_POS}{_SP_CMD_START_VERBS}\b[^\n;&|]*{_SP_TOKEN}"
+    rf"|{_SP_CMD_POS}['\"]?{_SP_LAUNCHER_PATH}{_SP_WIN_LAUNCHERS}\b[^\n;&|]*{_SP_TOKEN}"
     # 3. assigning the file's path to a shell variable (laundering setup).
     #    Anchor the assignment start (`(?:^|[\s;&|(])`) so `\w*` cannot begin at
     #    every interior word-char — an unanchored `[A-Za-z_]\w*=` backtracks
     #    quadratically on a long word-char token (a benign 60K-char arg blew the
     #    hook's 10s timeout); anchoring keeps it linear with identical matches.
-    rf"|(?:^|[\s;&|(])[A-Za-z_]\w*=(?:[^\s;&|]*?/)?{_SCAN_PASS_NAMES}\b"
+    rf"|(?:^|[\s;&|(])[A-Za-z_]\w*={_SP_PATH}{_SCAN_PASS_NAMES}\b"
+    #    PowerShell: `$f = '.git\armis-scan-pass'` (`$`-prefixed, spaces allowed).
+    rf"|(?:^|[\s;&|(])\$[\w:]+\s*=\s*{_SP_PATH}{_SCAN_PASS_NAMES}\b"
 )
 
 
@@ -209,14 +253,29 @@ def _is_scan_pass_write_bash(cmd: str) -> bool:
     return bool(_SCAN_PASS_WRITE_PATTERN.search(cmd))
 
 
+_SHORT_NAME_ALIAS = re.compile(r"^(?:armis-|scan-p)~\d+(?:\.\w*)?$")
+
+
 def is_scan_pass_file(file_path: str) -> bool:
     """Check if a file path targets the scan-pass file (for Write/Edit guard).
 
-    Matches both the current "armis-scan-pass" and the legacy ".scan-pass".
+    Matches both the current "armis-scan-pass" and the legacy ".scan-pass",
+    case-insensitively (same file on APFS / NTFS), and with either path
+    separator (a Windows path reaching a POSIX-hosted hook).
+
+    Also the NTFS aliases of the same file: Win32 strips trailing dots and
+    spaces (`armis-scan-pass.`), a stream suffix names the same file
+    (`armis-scan-pass::$DATA`, `:stream`), and the 8.3 short name
+    (`ARMIS-~1`, `SCAN-P~1`). The 8.3 form can't be derived textually for every
+    directory, so the two names this file gets in practice are matched by
+    shape; a different alias still has to produce the right hash, which the
+    gate's hash match backstops.
     """
     if not isinstance(file_path, str) or not file_path.strip():
         return False
-    return os.path.basename(file_path) in ("armis-scan-pass", ".scan-pass")
+    name = file_path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    name = name.split(":", 1)[0].rstrip(" .").casefold()
+    return name in ("armis-scan-pass", ".scan-pass") or bool(_SHORT_NAME_ALIAS.match(name))
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +598,12 @@ def _shell_words(cmd: str) -> list[tuple[str, bool]] | None:
     return words
 
 
+def _is_git_binary(word: str) -> bool:
+    """True for `git`, `/usr/bin/git`, `C:\\...\\git.exe`, `GIT.EXE` (any case)."""
+    name = word.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    return name in ("git", "git.exe")
+
+
 def _commit_invocations(words: list[tuple[str, bool]]) -> list[list[str]]:
     """Return the argument list of every direct ``git … commit`` invocation."""
     invocations: list[list[str]] = []
@@ -547,7 +612,7 @@ def _commit_invocations(words: list[tuple[str, bool]]) -> list[list[str]]:
     while i < n:
         text, is_op = words[i]
         i += 1
-        if is_op or text.rsplit("/", 1)[-1] != "git":
+        if is_op or not _is_git_binary(text):
             continue
         while i < n and not words[i][1] and words[i][0].startswith("-"):
             i += 2 if words[i][0] in _GIT_GLOBAL_VALUE_OPTS else 1

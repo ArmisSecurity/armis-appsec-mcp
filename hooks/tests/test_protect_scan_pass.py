@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 HOOK_PATH = os.path.join(os.path.dirname(__file__), "..", "protect_scan_pass.py")
 
 
@@ -60,6 +62,17 @@ class TestBlocksScanPass:
         assert rc == 2
         data = json.loads(stderr)
         assert data["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.parametrize("tool", ["Write", "Edit"])
+    @pytest.mark.parametrize(
+        "path", [".git/ARMIS-SCAN-PASS", "/repo/.git/Armis-Scan-Pass", "/repo/.SCAN-PASS"]
+    )
+    def test_case_variants_blocked(self, tmp_path, tool, path):
+        """Same file on a case-insensitive FS (APFS / NTFS)."""
+        stdin = {"tool_name": tool, "tool_input": {"file_path": path}}
+        stdout, stderr, rc = _run_hook(stdin, tmp_path)
+        assert rc == 2
+        assert json.loads(stderr)["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     def test_edit_armis_scan_pass_blocked(self, tmp_path):
         stdin = {"tool_name": "Edit", "tool_input": {"file_path": "armis-scan-pass"}}

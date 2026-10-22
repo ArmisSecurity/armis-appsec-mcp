@@ -22,8 +22,6 @@ _WRITE_TOOLS = {"write_file", "replace", "create_file"}
 
 _COMMAND_FIELDS = ("command", "cmd")
 
-_SCAN_PASS_NAMES = ("armis-scan-pass", ".scan-pass")  # noqa: S105
-
 _DEBUG = bool(os.environ.get("APPSEC_DEBUG"))
 
 
@@ -67,11 +65,15 @@ def main():
         if not isinstance(tool_input, dict):
             tool_input = {}
 
-        # Fast path: write-tool anti-forgery (pure string check, no imports needed)
+        # Shared helper, so the match (case-insensitive: the file is the same on
+        # APFS / NTFS) cannot drift from the other adapters.
+        from hook_core import check_gate, is_scan_pass_file  # noqa: E402
+
+        # Write-tool anti-forgery
         if tool_name in _WRITE_TOOLS:
             file_path = tool_input.get("file_path", tool_input.get("path", ""))
             _debug(f"write-tool check: tool={tool_name}, path={file_path}")
-            if os.path.basename(file_path) in _SCAN_PASS_NAMES:
+            if is_scan_pass_file(file_path):
                 _deny(
                     "BLOCKED: Direct writes to the scan-pass file are not allowed. "
                     "Run scan_diff() to scan your code instead."
@@ -92,8 +94,6 @@ def main():
         # the shell collapses — so unscanned commits slipped through. check_gate
         # uses the canonical \s+ regexes and only runs git for real shipping
         # commands, so the prefilter saved nothing but an import.
-        from hook_core import check_gate  # noqa: E402
-
         result = check_gate(cmd)
         if result.decision == "deny":
             _debug(f"DENY: {result.system_message[:100]}")
