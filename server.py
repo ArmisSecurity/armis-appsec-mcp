@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -251,7 +252,7 @@ async def _run_scan(
 
     # Apply .armisignore suppression
     if config is None:
-        git_root = find_git_root()
+        git_root = await asyncio.to_thread(find_git_root)
         config = load_armisignore(git_root)
     active, suppressed, suppression_summary = apply_suppressions(findings, config)
 
@@ -544,7 +545,10 @@ def run_git_diff(
     logger.info("Running: %s in %s", " ".join(cmd), cwd)
 
     try:
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=30)
+        # stdin=DEVNULL: see hash_utils._git_output.
+        result = subprocess.run(
+            cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, timeout=30
+        )
     except subprocess.TimeoutExpired as e:
         raise ToolError(
             "git diff timed out after 30 seconds. Try a narrower ref or smaller repo."
@@ -604,7 +608,10 @@ def get_debug_config() -> str:
     version = _plugin_version(plugin_root)
 
     env_exists = os.path.isfile(os.path.join(plugin_root, ".env"))
+    # Timed because every tool runs git: a slow git here means slow scans.
+    t0 = time.monotonic()
     scan_pass_exists = os.path.isfile(resolve_scan_pass_path())
+    git_seconds = time.monotonic() - t0
 
     lines = [
         f"Auth: {auth_status}",
@@ -624,6 +631,9 @@ def get_debug_config() -> str:
     lines.append(f"Scan timeout: {_scan_deadline():.0f}s")
     lines.append(f"Max concurrent scans: {MAX_CONCURRENT_SCANS}")
     lines.append(f"Scan pass: {'present' if scan_pass_exists else 'none'}")
+    lines.append(
+        f"Git: {shutil.which('git') or 'not found on PATH'} (rev-parse {git_seconds:.2f}s)"
+    )
     lines.append(f"CA source: {_runtime['ca_source']}")
     lines.append(f"Proxy: {_runtime['proxy']}")
     lines.append(f"Log file: {_runtime['log_file']}")
@@ -711,7 +721,7 @@ async def _scan_one_file(file_path: str, ctx: Context | None) -> str:
     resolved = _validate_file_path(file_path)
 
     # Load .armisignore and check path exclusion before reading file or calling API
-    git_root = find_git_root(from_path=resolved)
+    git_root = await asyncio.to_thread(find_git_root, from_path=resolved)
     config = load_armisignore(git_root)
     if git_root and is_path_excluded(resolved, config, git_root):
         logger.info("scan_file: %s excluded by .armisignore", file_path)
@@ -872,7 +882,9 @@ async def scan_diff(
     Returns:
         A formatted report of vulnerabilities found in the changed code.
     """
-    diff_text, truncated = run_git_diff(repo_path, ref, staged)
+    # Every git call below runs off the event loop: a slow git (large repo,
+    # Windows AV, network FS) must not stall heartbeats or other tool calls.
+    diff_text, truncated = await asyncio.to_thread(run_git_diff, repo_path, ref, staged)
     if not diff_text:
         return "No changes to scan."
 
@@ -888,22 +900,25 @@ async def scan_diff(
         await ctx.info(f"Scanning {label} ({len(diff_text)} chars)")
     logger.info("Scanning %s (%d chars)", label, len(diff_text))
 
-    is_shipping_scan, require_approval = _shipping_decision(ref, staged, truncated, scan_repo)
+    is_shipping_scan, require_approval = await asyncio.to_thread(
+        _shipping_decision, ref, staged, truncated, scan_repo
+    )
     scan_hash = ""
     if is_shipping_scan:
         if staged:
-            scan_hash = compute_staged_hash(scan_repo)
+            scan_hash = await asyncio.to_thread(compute_staged_hash, scan_repo)
         elif diff_text:
             scan_hash = hashlib.sha256(diff_text.encode()).hexdigest()
 
     # Load .armisignore and filter excluded paths before API call
-    git_root = find_git_root(from_path=repo_path or None)
+    git_root = await asyncio.to_thread(find_git_root, from_path=repo_path or None)
     config = load_armisignore(git_root)
     if git_root and config.file_patterns:
         diff_text = filter_diff_excluded_paths(diff_text, config, git_root)
         if not diff_text.strip():
             report = f"SCAN {label}: all changed files excluded by .armisignore"
-            _cache_scan(
+            await asyncio.to_thread(
+                _cache_scan,
                 report,
                 [],
                 label,
@@ -952,7 +967,8 @@ async def scan_diff(
         changed_files=changed_files,
         suppression_summary=suppression_summary,
     )
-    _cache_scan(
+    await asyncio.to_thread(
+        _cache_scan,
         report,
         active,
         label,
@@ -1012,7 +1028,8 @@ async def debug_config() -> str:
     Returns the current API URL, token status, and environment configuration.
     Use this to troubleshoot connection issues or verify configuration.
     """
-    return get_debug_config()
+    # Off the event loop: a stalled git call must not block the whole server.
+    return await asyncio.to_thread(get_debug_config)
 
 
 # ---------------------------------------------------------------------------
@@ -1165,7 +1182,7 @@ async def approve_findings(reason: str) -> str:
         reason: Why the findings are being approved (e.g., "false positives
                 on deleted code", "user accepted risk for test file").
     """
-    return do_approve_findings(reason)
+    return await asyncio.to_thread(do_approve_findings, reason)
 
 
 def _cache_scan(
@@ -1289,9 +1306,16 @@ def main() -> None:
     _runtime["ca_source"] = configure_ca_trust()
     _runtime["proxy"] = configure_proxy(APPSEC_API_URL).describe()
 
+    version = _plugin_version(os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir))
+    lowlevel = getattr(mcp, "_mcp_server", None)
+    if version != "unknown" and lowlevel is not None:
+        # FastMCP has no version argument; without this, initialize reports
+        # the MCP SDK's version as the server's. _mcp_server is private, so a
+        # future SDK that renames it must not stop the server from starting.
+        lowlevel.version = version
     logger.info(
         "Starting Armis AppSec MCP server %s (python %s at %s, %s)",
-        _plugin_version(os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir)),
+        version,
         platform.python_version(),
         sys.executable,
         platform.platform(),

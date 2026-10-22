@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -180,3 +181,77 @@ class TestCredentialReport:
         monkeypatch.setenv("ARMIS_DEFAULT_AUTH_METHOD", "SSO")
         text = "\n".join(server._credential_report())
         assert "client credentials are ignored" in text
+
+
+_DIFF = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+x = 1\n"
+
+
+class TestGitRunsOffTheEventLoop:
+    """A slow git call must not freeze the stdio server (PPSC-1785).
+
+    The patched call blocks until a coroutine on the event loop releases it.
+    If the call ran on the loop, that coroutine could never run and the wait
+    would time out.
+    """
+
+    def _assert_off_loop(self, target, result, make_coro):
+        started = threading.Event()
+        released = threading.Event()
+
+        def blocking(*_args, **_kwargs):
+            started.set()
+            assert released.wait(timeout=5), f"{target} blocked the event loop"
+            return result
+
+        async def release():
+            await asyncio.to_thread(started.wait, 5)
+            released.set()
+
+        async def main():
+            await asyncio.gather(make_coro(), release())
+
+        with (
+            patch.object(server, target, side_effect=blocking),
+            patch.object(server, "call_appsec_api", lambda code: _EMPTY),
+        ):
+            asyncio.run(main())
+
+    def test_scan_diff_git_diff(self):
+        with patch.object(server, "find_git_root", return_value=None):
+            self._assert_off_loop(
+                "run_git_diff", (_DIFF, False), lambda: server.scan_diff(repo_path="/x")
+            )
+
+    def test_scan_diff_staged_hash_and_cache(self):
+        with (
+            patch.object(server, "run_git_diff", return_value=(_DIFF, False)),
+            patch.object(server, "find_git_root", return_value=None),
+            patch.object(server, "_cache_scan"),
+        ):
+            self._assert_off_loop(
+                "compute_staged_hash",
+                "h",
+                lambda: server.scan_diff(repo_path="/x", staged=True),
+            )
+        with (
+            patch.object(server, "run_git_diff", return_value=(_DIFF, False)),
+            patch.object(server, "find_git_root", return_value=None),
+            patch.object(server, "compute_staged_hash", return_value="h"),
+        ):
+            self._assert_off_loop(
+                "_cache_scan", None, lambda: server.scan_diff(repo_path="/x", staged=True)
+            )
+
+    def test_scan_diff_git_root(self):
+        with patch.object(server, "run_git_diff", return_value=(_DIFF, False)):
+            self._assert_off_loop("find_git_root", None, lambda: server.scan_diff(repo_path="/x"))
+
+    def test_scan_file_git_root(self, tmp_path):
+        target = tmp_path / "a.py"
+        target.write_text("x = 1\n")
+        self._assert_off_loop("find_git_root", None, lambda: server.scan_file(str(target)))
+
+    def test_approve_findings(self):
+        self._assert_off_loop(
+            "do_approve_findings", "ok", lambda: server.approve_findings("user approved")
+        )
