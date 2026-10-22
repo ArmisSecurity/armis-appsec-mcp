@@ -172,19 +172,26 @@ _SP_WRITE_VERBS = (
     r"(?:tee|cp|mv|dd|install|ln|truncate|sed|ex|vi|vim|nano|emacs|sponge"
     r"|python[0-9.]*|perl|ruby|node|awk|gawk|mawk|php)"
 )
-# Windows shells. PowerShell cmdlets are case-insensitive; `cmd`/`powershell` are
-# listed as launchers because everything after them (`cmd //c copy NUL <pass>`,
-# `powershell -Command "Set-Content …"`) is a write context we cannot parse.
-# `[IO.File]::WriteAllText(…)` is caught by its method name.
+# Windows shells. PowerShell cmdlets are case-insensitive and can follow a pipe
+# (`'x' | Out-File <pass>`), so they match anywhere. `[IO.File]::WriteAllText(…)`
+# is caught by its method name.
 _SP_WIN_WRITE_VERBS = (
     r"(?i:set-content|add-content|out-file|new-item|copy-item|move-item|rename-item"
-    r"|clear-content|set-itemproperty|writeall\w+|appendall\w+"
-    r"|powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd(?:\.exe)?)"
+    r"|clear-content|set-itemproperty|writeall\w+|appendall\w+)"
 )
+# Where a command can start: line/segment start, or the script argument of a
+# shell launcher (`bash -c "cmd /c …"`).
+_SP_CMD_POS = r"(?:^|[;&|(\n]|\s-c\s+['\"]?)\s*"
 # cmd builtins and PowerShell aliases that are ordinary English words (`copy`,
 # `move`) or two letters (`sc`, `ni`): only a write when they START a command,
 # so `git commit -m "copy armis-scan-pass"` stays a mere mention.
 _SP_CMD_START_VERBS = r"(?i:copy|move|xcopy|robocopy|ren|rename|sc|ac|ni|cpi|mi)"
+# Windows launchers: everything after them (`cmd //c copy NUL <pass>`,
+# `powershell -Command "Set-Content …"`) is a write context we cannot parse.
+# `cmd`/`powershell` appear in commit messages, so like the builtins above they
+# count only at command position (optionally with a path prefix, `C:\…\cmd.exe`).
+_SP_WIN_LAUNCHERS = r"(?i:powershell|pwsh|cmd)(?:\.exe)?"
+_SP_LAUNCHER_PATH = r"(?:[^\s;&|]*[/\\])?"
 # The name as a bounded token (path component, quoted arg, or assignment value).
 # `\\` so a Windows separator (`.git\armis-scan-pass`) bounds it too.
 _SP_TOKEN = rf"(?:^|[\s/\\'\"=(]){_SCAN_PASS_NAMES}\b"
@@ -203,7 +210,8 @@ _SCAN_PASS_WRITE_PATTERN = re.compile(
     rf"|\b{_SP_WRITE_VERBS}\b[^\n;&|]*{_SP_TOKEN}"
     rf"|(?<![\w.\-])py\b[^\n;&|]*{_SP_TOKEN}"
     rf"|\b{_SP_WIN_WRITE_VERBS}\b[^\n;&|]*{_SP_TOKEN}"
-    rf"|(?:^|[;&|(\n])\s*{_SP_CMD_START_VERBS}\b[^\n;&|]*{_SP_TOKEN}"
+    rf"|{_SP_CMD_POS}{_SP_CMD_START_VERBS}\b[^\n;&|]*{_SP_TOKEN}"
+    rf"|{_SP_CMD_POS}['\"]?{_SP_LAUNCHER_PATH}{_SP_WIN_LAUNCHERS}\b[^\n;&|]*{_SP_TOKEN}"
     # 3. assigning the file's path to a shell variable (laundering setup).
     #    Anchor the assignment start (`(?:^|[\s;&|(])`) so `\w*` cannot begin at
     #    every interior word-char — an unanchored `[A-Za-z_]\w*=` backtracks
