@@ -43,7 +43,9 @@ def main():
         # command regardless of which event invoked us. (The shell matcher in
         # cursor.hooks.json — a `contains`-semantics regex over the command
         # string — is a deliberate SUPERSET of every command check_gate denies:
-        # `\bgit\b|\bgh\b|scan-pass`. Shipping commands always contain git/gh and
+        # case-insensitive `\bgit\b|\bgh\b|scan-p|armis-~` (spelled with [Gg]-style
+        # classes; `GIT.EXE` and `ARMIS-SCAN-PASS` / `ARMIS-~1` are real on
+        # Windows / APFS). Shipping commands always contain git/gh and
         # forgery targets always contain "scan-pass", so this fires whenever the
         # gate would deny while skipping ls/npm/cat/etc. If we instead gated on
         # tool_name the forgery guard in check_gate would never run for a bare

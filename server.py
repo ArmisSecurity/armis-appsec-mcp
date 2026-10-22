@@ -81,6 +81,23 @@ _runtime: dict[str, str] = {
 }
 
 
+def _hook_python_report() -> str:
+    """Which interpreter the commit-gate hooks will find on PATH.
+
+    The hook commands try python3, then python, then ``py -3`` (the Windows
+    launcher). A hook that can't start is a non-blocking error in Claude Code,
+    which silently disables the commit gate and the forgery guard, so report it.
+    """
+    for name in ("python3", "python", "py"):
+        found = shutil.which(name)
+        if found:
+            return f"Hook interpreter: {name} ({found})"
+    return (
+        "Hook interpreter: NONE FOUND on PATH (python3, python, py) -- the commit "
+        "gate and scan-pass guard hooks cannot run, so commits are NOT gated"
+    )
+
+
 def _credential_report() -> list[str]:
     """Where each credential came from (presence only, never values), plus a fix hint."""
     file_values = dotenv_values(_env_file) if os.path.isfile(_env_file) else {}
@@ -634,6 +651,7 @@ def get_debug_config() -> str:
     lines.append(
         f"Git: {shutil.which('git') or 'not found on PATH'} (rev-parse {git_seconds:.2f}s)"
     )
+    lines.append(_hook_python_report())
     lines.append(f"CA source: {_runtime['ca_source']}")
     lines.append(f"Proxy: {_runtime['proxy']}")
     lines.append(f"Log file: {_runtime['log_file']}")
@@ -1326,6 +1344,8 @@ def main() -> None:
     logger.info("Log file: %s", _runtime["log_file"])
     for line in _credential_report():
         logger.info("%s", line)
+    hook_python = _hook_python_report()
+    (logger.warning if "NONE FOUND" in hook_python else logger.info)("%s", hook_python)
 
     try:
         init_auth(APPSEC_API_URL)
