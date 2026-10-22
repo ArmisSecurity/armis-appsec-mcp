@@ -23,6 +23,7 @@ When the user asks to "scan", "security check", or "check for vulnerabilities":
 |----------|------|------------|
 | Staged/unstaged changes | `scan_diff` | `staged=true` or `ref=main`, plus `repo_path=/absolute/repo/path` |
 | A specific file | `scan_file` | `file_path=/absolute/path` |
+| Several files | `scan_files` | `file_paths=["/absolute/a", "/absolute/b"]` (max 20) |
 | Pasted code snippet | `scan_code` | `code="..."`, optional `filename` |
 | Check scanner config | `debug_config` | (none) |
 

@@ -301,14 +301,14 @@ class TestIsPathExcluded:
 class TestFindGitRoot:
     def test_returns_none_outside_git(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        with patch("suppression.subprocess.run") as mock_run:
+        with patch("hash_utils.subprocess.run") as mock_run:
             mock_run.return_value.returncode = 128
             mock_run.return_value.stdout = ""
             result = find_git_root()
         assert result is None
 
     def test_resolves_from_file_path(self, tmp_path):
-        with patch("suppression.subprocess.run") as mock_run:
+        with patch("hash_utils.subprocess.run") as mock_run:
             mock_run.return_value.returncode = 0
             mock_run.return_value.stdout = "/some/repo\n"
             result = find_git_root(from_path=str(tmp_path / "src" / "app.py"))
@@ -317,7 +317,7 @@ class TestFindGitRoot:
         assert mock_run.call_args[1]["cwd"] == str(tmp_path / "src")
 
     def test_no_from_path_uses_process_cwd(self):
-        with patch("suppression.subprocess.run") as mock_run:
+        with patch("hash_utils.subprocess.run") as mock_run:
             mock_run.return_value.returncode = 0
             mock_run.return_value.stdout = "/cwd/repo\n"
             result = find_git_root()
@@ -468,3 +468,29 @@ class TestFilterDiffExcludedPaths:
         )
         result = filter_diff_excluded_paths(diff, config, str(tmp_path))
         assert result == ""
+
+
+class TestFindGitRootRealRepo:
+    """Unmocked: a directory resolves to itself, a file to its parent's repo."""
+
+    @staticmethod
+    def _init(path):
+        import subprocess
+
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=str(path), capture_output=True, check=True)
+        return os.path.realpath(path)
+
+    def test_directory_resolves_to_itself_not_parent(self, tmp_path):
+        outer = self._init(tmp_path)  # enclosing repo
+        inner = self._init(tmp_path / "inner")
+        assert find_git_root(from_path=inner) == inner
+        assert find_git_root(from_path=inner + "/") == inner
+        assert find_git_root(from_path=inner) != outer
+
+    def test_file_path_resolves_to_containing_repo(self, tmp_path):
+        inner = self._init(tmp_path / "inner")
+        (tmp_path / "inner" / "sub").mkdir()
+        f = tmp_path / "inner" / "sub" / "a.py"
+        f.write_text("x = 1\n")
+        assert find_git_root(from_path=str(f)) == inner

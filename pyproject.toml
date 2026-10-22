@@ -8,13 +8,14 @@ exclude = ["hooks.tests*"]
 
 [project]
 name = "armis-appsec-mcp"
-version = "1.2.0"
+version = "1.4.1"
 description = "AI-powered security scanner MCP plugin for Claude Code"
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.25.0",
     "httpx>=0.28.1",
     "python-dotenv>=1.0.1",
+    "truststore>=0.10.4",
 ]
 
 [project.optional-dependencies]

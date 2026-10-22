@@ -36,7 +36,9 @@ import importlib
 
 if "server" in sys.modules:
     importlib.reload(sys.modules["server"])
+import hash_utils
 import server
+import suppression
 
 
 @pytest.fixture(autouse=True)
@@ -364,3 +366,45 @@ class TestCacheScanRefScanPass:
             )
         assert isolated_server_scan_pass.exists()
         assert isolated_server_scan_pass.read_text() == "staged-hash-123"
+
+
+# ---------------------------------------------------------------------------
+# git subprocesses must not inherit the MCP stdin pipe (Windows hang)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: server.run_git_diff(staged=True),
+        lambda: hash_utils.resolve_scan_pass_path(),
+        lambda: hash_utils.compute_staged_hash(),
+        lambda: suppression.find_git_root(),
+    ],
+    ids=["run_git_diff", "resolve_scan_pass_path", "compute_staged_hash", "find_git_root"],
+)
+def test_git_subprocess_does_not_inherit_stdin(call):
+    """Under stdio MCP, stdin is the client's pipe with a read pending on it. On
+    Windows a child inheriting that handle blocks until the next client message,
+    so every git call must pass stdin=DEVNULL."""
+    fake = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+    with patch("subprocess.run", return_value=fake) as run:
+        call()
+    assert run.called
+    for c in run.call_args_list:
+        assert c.kwargs.get("stdin") is subprocess.DEVNULL
+
+
+def test_debug_config_reports_git_timing():
+    out = server.get_debug_config()
+    assert "Git: " in out
+    assert "rev-parse" in out
+
+
+def test_git_timeout_is_logged(caplog):
+    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5)):
+        with caplog.at_level("WARNING", logger="appsec-mcp"):
+            assert hash_utils.resolve_scan_pass_path() is not None
+            assert hash_utils.compute_staged_hash() == ""
+            assert suppression.find_git_root() is None
+    assert sum("timed out" in r.getMessage() for r in caplog.records) == 3

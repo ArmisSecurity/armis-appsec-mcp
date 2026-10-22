@@ -12,11 +12,15 @@ Usage:
 """
 
 import asyncio
+import contextvars
+import functools
 import hashlib
 import json
 import logging
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,7 +31,7 @@ _plugin_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _plugin_dir)
 
 # Load .env from plugin directory if it exists (for ARMIS_CLIENT_ID etc.)
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 _env_file = os.path.join(_plugin_dir, ".env")
 if os.path.isfile(_env_file):
@@ -36,21 +40,26 @@ if os.path.isfile(_env_file):
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
-from auth import get_auth_method, get_auth_status, init_auth
+from auth import get_auth_method, get_auth_status, get_pending_signin, init_auth
 from hash_utils import (
     cleanup_legacy_scan_pass,
     compute_staged_hash,
     merge_or_rebase_in_progress,
     resolve_scan_pass_path,
 )
+from net_config import configure_ca_trust, configure_proxy
 from scanner_core import (
     APPSEC_API_URL,
+    MAX_CONCURRENT_SCANS,
+    ScanStage,
     build_diff_line_map,
     call_appsec_api,
     changed_lines_for_file,
+    current_stage,
     format_findings,
     parse_findings,
 )
+from server_log import install_exception_hooks, setup_logging
 from suppression import (
     ArmisIgnoreConfig,
     apply_inline_suppressions,
@@ -63,6 +72,151 @@ from suppression import (
 )
 
 logger = logging.getLogger("appsec-mcp")
+
+# Network/logging setup results, filled in by main() and reported by debug_config.
+_runtime: dict[str, str] = {
+    "ca_source": "not configured",
+    "proxy": "not configured",
+    "log_file": "none",
+}
+
+
+def _credential_report() -> list[str]:
+    """Where each credential came from (presence only, never values), plus a fix hint."""
+    file_values = dotenv_values(_env_file) if os.path.isfile(_env_file) else {}
+
+    def source(name: str) -> str:
+        value = os.environ.get(name, "")
+        if not value:
+            return "not set"
+        return "set (.env)" if file_values.get(name) == value else "set (process env)"
+
+    client_id = source("ARMIS_CLIENT_ID")
+    client_key = source("ARMIS_CLIENT_SECRET")
+    tenant = source("ARMIS_TENANT_ID")
+    env_state = "found" if os.path.isfile(_env_file) else "missing"
+    lines = [
+        f"Credential sources: client id {client_id}, client secret {client_key}, "
+        f"tenant id {tenant}",
+        f".env file: {_env_file} ({env_state})",
+    ]
+    if os.environ.get("ARMIS_DEFAULT_AUTH_METHOD", "").strip().lower() == "sso":
+        lines.append(
+            "ARMIS_DEFAULT_AUTH_METHOD=sso: client credentials are ignored; scans use "
+            "the shared sign-in cache or browser sign-in."
+        )
+    elif client_id == "not set" and client_key == "not set":
+        lines.append(
+            "No API credentials: scans use the shared sign-in cache or browser sign-in. "
+            f"To use an API key, add ARMIS_CLIENT_ID and ARMIS_CLIENT_SECRET to {_env_file}; "
+            "variables exported in a shell are not inherited by editor-launched servers."
+        )
+    return lines
+
+
+def _logged_tool(fn):
+    """Log each tool call's name, duration and outcome (never its arguments)."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        t0 = time.monotonic()
+        try:
+            result = await fn(*args, **kwargs)
+        except ToolError as e:
+            logger.warning("tool %s failed in %.2fs: %s", fn.__name__, time.monotonic() - t0, e)
+            raise
+        except Exception:
+            logger.exception("tool %s crashed in %.2fs", fn.__name__, time.monotonic() - t0)
+            raise
+        logger.info("tool %s ok in %.2fs", fn.__name__, time.monotonic() - t0)
+        return result
+
+    return wrapper
+
+
+class ScanTimeoutError(ToolError, RuntimeError):
+    """A scan exceeded its overall deadline (``scan_files`` stops the batch on it)."""
+
+
+# Set by scan_files so per-file heartbeats don't emit progress that restarts at
+# zero for every file (progress must increase within one request).
+_in_batch: contextvars.ContextVar[bool] = contextvars.ContextVar("_in_batch", default=False)
+
+_DEFAULT_SCAN_DEADLINE_SECONDS = 180.0
+_HEARTBEAT_SECONDS = 10.0
+
+
+def _scan_deadline() -> float:
+    """Total seconds one scan may take (auth + API); override with APPSEC_SCAN_TIMEOUT."""
+    try:
+        value = float(os.environ.get("APPSEC_SCAN_TIMEOUT", ""))
+    except ValueError:
+        return _DEFAULT_SCAN_DEADLINE_SECONDS
+    return value if value > 0 else _DEFAULT_SCAN_DEADLINE_SECONDS
+
+
+async def _heartbeat(ctx: Context, stage: ScanStage, deadline: float) -> None:
+    """Tell the client the scan is alive, and surface a pending browser sign-in.
+
+    Best effort: clients that don't render progress ignore it, and any failure
+    here must never fail the scan.
+    """
+    t0 = time.monotonic()
+    announced = ""
+    while True:
+        await asyncio.sleep(_HEARTBEAT_SECONDS)
+        elapsed = time.monotonic() - t0
+        try:
+            pending = get_pending_signin()
+            if pending and pending != announced:
+                announced = pending
+                await ctx.info(pending)
+            if not _in_batch.get():
+                await ctx.report_progress(elapsed, deadline, f"{stage.name} ({int(elapsed)}s)")
+        except Exception as e:
+            logger.debug("heartbeat failed: %s", e)
+
+
+async def _call_api(code: str, ctx: Context | None) -> str:
+    """Run ``call_appsec_api`` in a worker thread under one overall deadline.
+
+    The per-request httpx timeouts are per phase, so auth + scan + a 401 retry
+    could otherwise stay silent for 5+ minutes. On timeout the error names the
+    step that was running. The worker thread runs on until its current httpx
+    call returns, then sees ``stage.abandoned`` and stops instead of retrying.
+    """
+    stage = ScanStage()
+    token = current_stage.set(stage)
+    deadline = _scan_deadline()
+    started = time.monotonic()
+    beat = asyncio.create_task(_heartbeat(ctx, stage, deadline)) if ctx else None
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(call_appsec_api, code), deadline)
+    except TimeoutError:
+        if time.monotonic() - started < deadline - 1:
+            # A TimeoutError raised inside the worker, not our deadline expiring.
+            raise
+        waited = time.monotonic() - stage.since
+        logger.error(
+            "Scan timed out after %.0fs while %s (%.0fs in that step)",
+            deadline,
+            stage.name,
+            waited,
+        )
+        msg = (
+            f"Scan timed out after {deadline:.0f}s while {stage.name}. "
+            f"See the log ({_runtime['log_file']}) and run debug_config. "
+            "Set APPSEC_SCAN_TIMEOUT (seconds) if scans are legitimately slower."
+        )
+        pending = get_pending_signin()
+        if pending:
+            msg += f" {pending} Then retry the scan."
+        raise ScanTimeoutError(msg) from None
+    finally:
+        stage.abandoned = True  # an orphaned worker must not keep retrying
+        if beat:
+            beat.cancel()
+        current_stage.reset(token)
 
 
 async def _run_scan(
@@ -86,7 +240,9 @@ async def _run_scan(
     """
     t0 = time.monotonic()
     try:
-        raw = await asyncio.to_thread(call_appsec_api, code)
+        raw = await _call_api(code, ctx)
+    except ScanTimeoutError:
+        raise
     except RuntimeError as e:
         raise ToolError(str(e)) from e
     except Exception as e:
@@ -96,7 +252,7 @@ async def _run_scan(
 
     # Apply .armisignore suppression
     if config is None:
-        git_root = find_git_root()
+        git_root = await asyncio.to_thread(find_git_root)
         config = load_armisignore(git_root)
     active, suppressed, suppression_summary = apply_suppressions(findings, config)
 
@@ -228,7 +384,7 @@ mcp = FastMCP(
 # Security: path validation for scan_file
 # ---------------------------------------------------------------------------
 _BLOCKED_PREFIXES = ("/etc/", "/proc/", "/sys/", "/private/etc/")
-_BLOCKED_DOTDIRS = {".ssh", ".gnupg", ".aws", ".config/gcloud"}
+_BLOCKED_DOTDIRS = {".ssh", ".gnupg", ".aws", os.path.join(".config", "gcloud")}
 _MAX_CODE_CHARS = 90_000
 
 # Git ref validation: alphanumeric + common ref chars (branch, tag, SHA, HEAD~3)
@@ -238,10 +394,15 @@ _VALID_GIT_REF = re.compile(r"^[a-zA-Z0-9_./\-~^@{}]+$")
 _ALLOWED_ROOTS: list[str] = []
 
 
+def _home_dir() -> str:
+    """Resolve the user's home directory (single source of truth for both callers below)."""
+    return os.path.realpath(os.path.expanduser("~"))
+
+
 def _get_allowed_roots() -> list[str]:
     """Lazily compute allowed root directories for path validation."""
     if not _ALLOWED_ROOTS:
-        home = os.path.realpath(os.path.expanduser("~"))
+        home = _home_dir()
         # Include /tmp, macOS /private/tmp, and the system temp directory
         # (on macOS, tempfile.gettempdir() returns /var/folders/... -> /private/var/folders/...)
         sys_tmp = os.path.realpath(tempfile.gettempdir())
@@ -250,26 +411,38 @@ def _get_allowed_roots() -> list[str]:
     return _ALLOWED_ROOTS
 
 
+def _is_under(resolved: str, base: str) -> bool:
+    """True if `resolved` equals `base` or is nested under it.
+
+    Compares via os.path.normcase so this is correct on case-insensitive
+    filesystems (Windows, default macOS) without weakening case-sensitive
+    POSIX filesystems, where normcase is a no-op.
+    """
+    resolved_cf = os.path.normcase(resolved)
+    base_cf = os.path.normcase(base)
+    return resolved_cf == base_cf or resolved_cf.startswith(base_cf + os.path.normcase(os.sep))
+
+
 def _validate_file_path(file_path: str) -> str:
     """Resolve and validate a file path. Returns the resolved path or raises ToolError."""
     resolved = os.path.realpath(file_path)
 
     # Allowlist: path must be under HOME, /tmp, or /private/tmp
     allowed = _get_allowed_roots()
-    if not any(resolved == root or resolved.startswith(root + "/") for root in allowed):
+    if not any(_is_under(resolved, root) for root in allowed):
         raise ToolError(f"Path '{file_path}' is outside allowed directories (home, /tmp).")
 
     # Blocklist (defense-in-depth): system paths
     for prefix in _BLOCKED_PREFIXES:
         normalized = prefix.rstrip("/")
-        if resolved == normalized or resolved.startswith(normalized + "/"):
+        if _is_under(resolved, normalized):
             raise ToolError(f"Scanning system path '{resolved}' is not allowed.")
 
     # Blocklist (defense-in-depth): sensitive dotdirs under HOME
-    home = os.path.realpath(os.path.expanduser("~"))
+    home = _home_dir()
     for dotdir in _BLOCKED_DOTDIRS:
         blocked_dir = os.path.join(home, dotdir)
-        if resolved == blocked_dir or resolved.startswith(blocked_dir + os.sep):
+        if _is_under(resolved, blocked_dir):
             raise ToolError(f"Scanning '{resolved}' is blocked (sensitive directory).")
 
     return resolved
@@ -372,7 +545,10 @@ def run_git_diff(
     logger.info("Running: %s in %s", " ".join(cmd), cwd)
 
     try:
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=30)
+        # stdin=DEVNULL: see hash_utils._git_output.
+        result = subprocess.run(
+            cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, timeout=30
+        )
     except subprocess.TimeoutExpired as e:
         raise ToolError(
             "git diff timed out after 30 seconds. Try a narrower ref or smaller repo."
@@ -393,6 +569,17 @@ def run_git_diff(
         logger.warning("Truncated diff to %d chars", _MAX_CODE_CHARS)
 
     return diff_text, truncated
+
+
+def _plugin_version(plugin_root: str) -> str:
+    version_file = os.path.join(plugin_root, ".installed-version")
+    if os.path.isfile(version_file):
+        try:
+            with open(version_file) as vf:
+                return vf.read().strip() or "unknown"
+        except OSError:
+            pass
+    return "unknown"
 
 
 def get_debug_config() -> str:
@@ -418,17 +605,13 @@ def get_debug_config() -> str:
     has_tenant = "set" if os.environ.get("ARMIS_TENANT_ID") else "not set"
 
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir)
-    version_file = os.path.join(plugin_root, ".installed-version")
-    version = "unknown"
-    if os.path.isfile(version_file):
-        try:
-            with open(version_file) as vf:
-                version = vf.read().strip() or "unknown"
-        except OSError:
-            pass
+    version = _plugin_version(plugin_root)
 
     env_exists = os.path.isfile(os.path.join(plugin_root, ".env"))
+    # Timed because every tool runs git: a slow git here means slow scans.
+    t0 = time.monotonic()
     scan_pass_exists = os.path.isfile(resolve_scan_pass_path())
+    git_seconds = time.monotonic() - t0
 
     lines = [
         f"Auth: {auth_status}",
@@ -444,7 +627,16 @@ def get_debug_config() -> str:
     if plugin_root != _plugin_dir:
         lines.append(f"Source dir: {_plugin_dir}")
     lines.append(f"Credentials file: {'present' if env_exists else 'missing'}")
+    lines.extend(_credential_report())
+    lines.append(f"Scan timeout: {_scan_deadline():.0f}s")
+    lines.append(f"Max concurrent scans: {MAX_CONCURRENT_SCANS}")
     lines.append(f"Scan pass: {'present' if scan_pass_exists else 'none'}")
+    lines.append(
+        f"Git: {shutil.which('git') or 'not found on PATH'} (rev-parse {git_seconds:.2f}s)"
+    )
+    lines.append(f"CA source: {_runtime['ca_source']}")
+    lines.append(f"Proxy: {_runtime['proxy']}")
+    lines.append(f"Log file: {_runtime['log_file']}")
     return "\n".join(lines)
 
 
@@ -452,6 +644,7 @@ def get_debug_config() -> str:
 # MCP Tools (thin async wrappers over sync helpers)
 # ---------------------------------------------------------------------------
 @mcp.tool()
+@_logged_tool
 async def scan_code(
     code: str,
     filename: str = "snippet",
@@ -524,7 +717,39 @@ def _compute_scan_file_diff_lines(git_root: str | None, resolved_path: str) -> s
     return changed_lines_for_file(diff_text, rel_path)
 
 
+async def _scan_one_file(file_path: str, ctx: Context | None) -> str:
+    resolved = _validate_file_path(file_path)
+
+    # Load .armisignore and check path exclusion before reading file or calling API
+    git_root = await asyncio.to_thread(find_git_root, from_path=resolved)
+    config = load_armisignore(git_root)
+    if git_root and is_path_excluded(resolved, config, git_root):
+        logger.info("scan_file: %s excluded by .armisignore", file_path)
+        return f"SCAN {os.path.basename(file_path)}: skipped (excluded by .armisignore)"
+
+    # armis:ignore cwe:22 cwe:23 cwe:73 cwe:770 reason:path-validated and size-capped in the reader
+    code, filename, resolved_path = read_and_validate_file(file_path)
+
+    if ctx:
+        await ctx.info(f"Scanning {filename} ({len(code)} chars)")
+    logger.info(f"Scanning file: {file_path} ({len(code)} chars)")
+
+    diff_lines = await asyncio.to_thread(_compute_scan_file_diff_lines, git_root, resolved_path)
+
+    source_lines = code.splitlines()
+    return await _run_scan(
+        code,
+        filename,
+        ctx,
+        config=config,
+        file_path=resolved_path,
+        source_lines=source_lines,
+        diff_lines=diff_lines,
+    )
+
+
 @mcp.tool()
+@_logged_tool
 async def scan_file(
     file_path: str,
     ctx: Context | None = None,
@@ -544,33 +769,65 @@ async def scan_file(
     Returns:
         A formatted report of any vulnerabilities found.
     """
-    resolved = _validate_file_path(file_path)
+    return await _scan_one_file(file_path, ctx)
 
-    # Load .armisignore and check path exclusion before reading file or calling API
-    git_root = find_git_root(from_path=resolved)
-    config = load_armisignore(git_root)
-    if git_root and is_path_excluded(resolved, config, git_root):
-        logger.info("scan_file: %s excluded by .armisignore", file_path)
-        return f"SCAN {os.path.basename(file_path)}: skipped (excluded by .armisignore)"
 
-    code, filename, resolved_path = read_and_validate_file(file_path)
+_MAX_SCAN_FILES = 20
 
-    if ctx:
-        await ctx.info(f"Scanning {filename} ({len(code)} chars)")
-    logger.info(f"Scanning file: {file_path} ({len(code)} chars)")
 
-    diff_lines = _compute_scan_file_diff_lines(git_root, resolved_path)
+@mcp.tool()
+@_logged_tool
+async def scan_files(
+    file_paths: list[str],
+    ctx: Context | None = None,
+) -> str:
+    """Scan several files on disk in one call (one approval prompt instead of one per file).
 
-    source_lines = code.splitlines()
-    return await _run_scan(
-        code,
-        filename,
-        ctx,
-        config=config,
-        file_path=resolved_path,
-        source_lines=source_lines,
-        diff_lines=diff_lines,
-    )
+    Each file is scanned exactly like ``scan_file``, one after another. A file
+    that fails (missing, binary, blocked path, API error) is reported inline and
+    does not stop the rest.
+
+    Args:
+        file_paths: Absolute paths to scan (at most 20 per call).
+
+    Returns:
+        One report per file, separated by blank lines.
+    """
+    if not file_paths:
+        raise ToolError("file_paths must contain at least one path.")
+    if len(file_paths) > _MAX_SCAN_FILES:
+        raise ToolError(
+            f"Too many files ({len(file_paths)}); scan at most {_MAX_SCAN_FILES} per call."
+        )
+
+    reports: list[str] = []
+    batch_token = _in_batch.set(True)
+    try:
+        for index, file_path in enumerate(file_paths, start=1):
+            if ctx:
+                try:
+                    await ctx.report_progress(index - 1, len(file_paths), f"Scanning {file_path}")
+                except Exception as e:
+                    logger.debug("progress report failed: %s", e)
+            try:
+                reports.append(await _scan_one_file(file_path, ctx))
+            except ScanTimeoutError as e:
+                # The API or sign-in is stuck; trying the remaining files would
+                # wait out a full deadline each. Report what finished and stop.
+                logger.warning("scan_files: %s timed out; skipping the rest: %s", file_path, e)
+                reports.append(f"SCAN {os.path.basename(file_path)}: ERROR {e}")
+                skipped = file_paths[index:]
+                reports.extend(
+                    f"SCAN {os.path.basename(p)}: SKIPPED (an earlier scan timed out)"
+                    for p in skipped
+                )
+                break
+            except Exception as e:
+                logger.warning("scan_files: %s failed: %s", file_path, e)
+                reports.append(f"SCAN {os.path.basename(file_path)}: ERROR {e}")
+    finally:
+        _in_batch.reset(batch_token)
+    return "\n\n".join(reports)
 
 
 def _shipping_decision(
@@ -603,6 +860,7 @@ def _shipping_decision(
 
 
 @mcp.tool()
+@_logged_tool
 async def scan_diff(
     repo_path: str = "",
     ref: str = "",
@@ -624,7 +882,9 @@ async def scan_diff(
     Returns:
         A formatted report of vulnerabilities found in the changed code.
     """
-    diff_text, truncated = run_git_diff(repo_path, ref, staged)
+    # Every git call below runs off the event loop: a slow git (large repo,
+    # Windows AV, network FS) must not stall heartbeats or other tool calls.
+    diff_text, truncated = await asyncio.to_thread(run_git_diff, repo_path, ref, staged)
     if not diff_text:
         return "No changes to scan."
 
@@ -640,22 +900,25 @@ async def scan_diff(
         await ctx.info(f"Scanning {label} ({len(diff_text)} chars)")
     logger.info("Scanning %s (%d chars)", label, len(diff_text))
 
-    is_shipping_scan, require_approval = _shipping_decision(ref, staged, truncated, scan_repo)
+    is_shipping_scan, require_approval = await asyncio.to_thread(
+        _shipping_decision, ref, staged, truncated, scan_repo
+    )
     scan_hash = ""
     if is_shipping_scan:
         if staged:
-            scan_hash = compute_staged_hash(scan_repo)
+            scan_hash = await asyncio.to_thread(compute_staged_hash, scan_repo)
         elif diff_text:
             scan_hash = hashlib.sha256(diff_text.encode()).hexdigest()
 
     # Load .armisignore and filter excluded paths before API call
-    git_root = find_git_root(from_path=repo_path or None)
+    git_root = await asyncio.to_thread(find_git_root, from_path=repo_path or None)
     config = load_armisignore(git_root)
     if git_root and config.file_patterns:
         diff_text = filter_diff_excluded_paths(diff_text, config, git_root)
         if not diff_text.strip():
             report = f"SCAN {label}: all changed files excluded by .armisignore"
-            _cache_scan(
+            await asyncio.to_thread(
+                _cache_scan,
                 report,
                 [],
                 label,
@@ -671,7 +934,7 @@ async def scan_diff(
 
     t0 = time.monotonic()
     try:
-        raw = await asyncio.to_thread(call_appsec_api, diff_text)
+        raw = await _call_api(diff_text, ctx)
     except RuntimeError as e:
         raise ToolError(str(e)) from e
     except Exception as e:
@@ -704,7 +967,8 @@ async def scan_diff(
         changed_files=changed_files,
         suppression_summary=suppression_summary,
     )
-    _cache_scan(
+    await asyncio.to_thread(
+        _cache_scan,
         report,
         active,
         label,
@@ -757,13 +1021,15 @@ async def scan_diff(
 
 
 @mcp.tool()
+@_logged_tool
 async def debug_config() -> str:
     """Show current configuration for debugging.
 
     Returns the current API URL, token status, and environment configuration.
     Use this to troubleshoot connection issues or verify configuration.
     """
-    return get_debug_config()
+    # Off the event loop: a stalled git call must not block the whole server.
+    return await asyncio.to_thread(get_debug_config)
 
 
 # ---------------------------------------------------------------------------
@@ -904,6 +1170,7 @@ def do_approve_findings(reason: str) -> str:
 
 
 @mcp.tool()
+@_logged_tool
 async def approve_findings(reason: str) -> str:
     """Approve HIGH/CRITICAL scan findings and allow commit to proceed.
 
@@ -915,7 +1182,7 @@ async def approve_findings(reason: str) -> str:
         reason: Why the findings are being approved (e.g., "false positives
                 on deleted code", "user accepted risk for test file").
     """
-    return do_approve_findings(reason)
+    return await asyncio.to_thread(do_approve_findings, reason)
 
 
 def _cache_scan(
@@ -1028,11 +1295,48 @@ def security_review(code: str, language: str = "auto") -> str:
     )
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+def main() -> None:
+    level = logging.DEBUG if os.environ.get("APPSEC_DEBUG") else logging.INFO
+    log_file = setup_logging(_plugin_dir, level)
+    install_exception_hooks()
+    _runtime["log_file"] = log_file or "none"
+
+    # Before any httpx client exists: every call site builds its client per
+    # request and reads the ssl module + env (trust_env) at that point.
+    _runtime["ca_source"] = configure_ca_trust()
+    _runtime["proxy"] = configure_proxy(APPSEC_API_URL).describe()
+
+    version = _plugin_version(os.environ.get("CLAUDE_PLUGIN_ROOT", _plugin_dir))
+    lowlevel = getattr(mcp, "_mcp_server", None)
+    if version != "unknown" and lowlevel is not None:
+        # FastMCP has no version argument; without this, initialize reports
+        # the MCP SDK's version as the server's. _mcp_server is private, so a
+        # future SDK that renames it must not stop the server from starting.
+        lowlevel.version = version
+    logger.info(
+        "Starting Armis AppSec MCP server %s (python %s at %s, %s)",
+        version,
+        platform.python_version(),
+        sys.executable,
+        platform.platform(),
+    )
+    logger.info("API URL: %s (env %s)", APPSEC_API_URL, os.environ.get("APPSEC_ENV", "prod"))
+    logger.info("CA source: %s", _runtime["ca_source"])
+    logger.info("Proxy: %s (PAC/WPAD auto-config not supported)", _runtime["proxy"])
+    logger.info("Log file: %s", _runtime["log_file"])
+    for line in _credential_report():
+        logger.info("%s", line)
+
     try:
         init_auth(APPSEC_API_URL)
     except RuntimeError as e:
         logger.warning("Auth not configured: %s — scans will fail until credentials are set.", e)
+    logger.info("Auth method: %s", get_auth_method())
     transport = os.environ.get("APPSEC_TRANSPORT", "stdio")
+    # An exception escaping mcp.run() reaches the excepthook installed above.
     mcp.run(transport=transport)  # type: ignore[arg-type]
+    logger.info("MCP server stopped")
+
+
+if __name__ == "__main__":
+    main()

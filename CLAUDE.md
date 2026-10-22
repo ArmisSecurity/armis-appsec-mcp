@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Claude Code **plugin** (not a library) that exposes Armis's AI-powered SAST scanner through three surfaces:
 
-1. **MCP server** (`server.py`) — tools `scan_code`, `scan_file`, `scan_diff`, `approve_findings`, `debug_config` and the `appsec://last-scan` resource.
+1. **MCP server** (`server.py`) — tools `scan_code`, `scan_file`, `scan_files`, `scan_diff`, `approve_findings`, `debug_config` and the `appsec://last-scan` resource.
 2. **PreToolUse hooks** (`hooks/`) — a commit gate that blocks `git commit` / `git push` / `gh pr create` until a scan has passed, plus a guard that prevents Write/Edit from forging `.scan-pass`.
 3. **Slash command** (`skills/security-scan/SKILL.md`) — on-demand `/security-scan` invocation.
 
@@ -52,6 +52,8 @@ python server.py
 - `auth.JWTAuth` → OAuth2 client-credentials against `/auth/token`. Token cached in memory, re-exchanged when within 5 minutes of `exp`. `_parse_jwt_exp` bounds-checks `exp` (must be future, ≤24h out).
 - `auth.SharedCacheAuth` → reuses the OAuth2 tokens armis-cli caches in `~/.armis/.sessions` (the cross-process contract in `token_cache.py`, a port of armis-cli's `tokenstore.go`). Lazy: no disk/network in `init_auth`. On the first scan that needs auth it (1) uses a valid cached access token, else (2) refreshes via the rotated-refresh grant (persisting the new pair — never keep a divergent second store, or reuse-detection revokes the token family), else (3) runs the RFC 8628 browser **Device Auth** flow (`device_auth.DeviceClient`, needs `ARMIS_TENANT_ID`) and writes the result back to the shared cache so armis-cli / knowledge-mcp reuse it. The OAuth2 device/token endpoints are root-mounted on the **issuer** (`{issuer}/oauth2/device|token`), where issuer = `APPSEC_API_URL` minus a trailing `/api/vN` (`token_cache.issuer_from_api_url`) — that stripped issuer is also the `.sessions` env key, matching how the CLI keys the cache. Fail-**closed** (can't scan without auth), same as `JWTAuth`.
 - `suppression` → two mechanisms, both deterministic local matching (no LLM involvement): (1) **`.armisignore`** at git root — `cwe:`, `severity:`, `category:`, `rule:` directives and path patterns (basename, glob, or `dir/` prefix); (2) **inline `armis:ignore`** source comments — `apply_inline_suppressions` (file scans, by source line) and `apply_inline_suppressions_to_diff` (diff scans, by blob line via `build_diff_line_map`). Fail-open on any parse/IO error.
+- `net_config` → runs once at startup (`server.main()`, `git-hooks/scan-staged.py`), before any httpx call. `configure_ca_trust()`: `SSL_CERT_FILE` > `SSL_CERT_DIR` > `REQUESTS_CA_BUNDLE` (re-exported as `SSL_CERT_FILE`/`SSL_CERT_DIR`, which httpx reads) > `truststore.inject_into_ssl()` (OS store) > certifi. `configure_proxy(api_url)`: any `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` env var → env is authoritative, untouched; else the OS proxy (registry / macOS sysconf, *not* `getproxies()`, which a lone `NO_PROXY` short-circuits) is exported as `HTTPS_PROXY` unless `NO_PROXY` or the OS bypass list covers the API host — then the host is appended to `NO_PROXY` so httpx's own registry fallback can't re-apply it. No PAC. All call sites use `httpx.post(...)` with default `trust_env=True`, which is why mutating `os.environ`/`ssl` works; keep it that way.
+- `server_log` → stderr + `<plugin dir>/logs/server.log` (RotatingFileHandler, 1 MB × 3). `RedactingFormatter` masks URL userinfo, bearer tokens, and token/secret fields in every formatted line (tracebacks included). Never add a stdout handler — stdout is the MCP stdio channel. Tool calls are logged via the `@_logged_tool` decorator in `server.py` (name, duration, outcome; never arguments).
 - `hash_utils.compute_staged_hash()` → SHA-256 of `git diff --cached --no-color --no-ext-diff`; used by both server and hook to agree on "same staged diff."
 
 ## The `.scan-pass` commit gate (critical invariant)
@@ -59,7 +61,7 @@ python server.py
 This is the trickiest cross-file interaction. The commit gate works like a handshake:
 
 1. Agent calls `scan_diff(staged=True, repo_path=...)` (or `ref=...`). On success with **no HIGH/CRITICAL findings**, `server._cache_scan()` writes `SHA-256(staged diff)` to the scan-pass file. The file lives **inside the repo's git dir** as `<git-dir>/armis-scan-pass` — resolved by `hash_utils.resolve_scan_pass_path(repo_path)` via `git rev-parse --absolute-git-dir`. Keeping it in `.git/` means it never appears in the working tree (no `git status` noise, nothing to gitignore) and it resolves correctly inside **git worktrees** (every Conductor workspace), where `.git` is a *file*, not a directory.
-2. Agent calls `git commit`. `hooks/pre_commit_scan.py` fires (PreToolUse on Bash), computes the **current** staged hash, and allows the command only if it equals the stored hash. Stale passes (someone staged more code since scanning) are rejected.
+2. Agent calls `git commit`. `hooks/pre_commit_scan.py` fires (PreToolUse on Bash), computes the **current** staged hash, and allows the command only if it equals the stored hash. Stale passes (someone staged more code since scanning) are rejected. Because the hook runs *before* the command, `check_gate` also denies any commit that would record more than the hashed index (`hook_core._index_changing_commit`): an index-mutating git subcommand in the same command line (`git add -A && git commit`), `-a`/`-i`/`-o`/`-p`, pathspecs, or any commit option outside the allowlist. A commit in the same command as a push/PR still gets the hash check.
 3. For `git push` / `gh pr create`, file presence alone is sufficient — the commit already enforced the hash match.
 4. If the agent needs to ship despite HIGH/CRITICAL findings, the user must explicitly approve; the agent then calls `approve_findings(reason=...)` which writes `.scan-pass` with the approval hash. **The agent must never call `approve_findings` on its own** — the system message in `_build_system_message` spells this out.
 
@@ -67,6 +69,8 @@ This is the trickiest cross-file interaction. The commit gate works like a hands
 - `hooks/protect_scan_pass.py` denies any `Write`/`Edit` whose basename is `armis-scan-pass` (or the legacy `.scan-pass`) — see `hook_core.is_scan_pass_file`.
 - `hooks/pre_commit_scan.py` denies any Bash command matching `_SCAN_PASS_WRITE_PATTERN` — a *write context* targeting `armis-scan-pass` / `.scan-pass`: a redirect (`>`, `>>`, `>|`, fd-prefixed), a write-capable command naming the file (`tee`/`cp`/`mv`/`dd`/`sed -i`/`install`/`ln`/`truncate`/`sponge`/editors/interpreters like `python`/`perl`/`awk`/`gawk`/`php`), or assigning the path to a shell variable. It deliberately does **not** match mere mentions (commit messages, `grep`/`cat`/`rm`/`pytest`). The verb list is a blocklist (inherently leaky) — the hash match and `protect_scan_pass.py`'s Write/Edit guard are the backstops, and an unforgeable HMAC token is the durable follow-up.
 - The scan-pass path is computed by `git` itself (`git rev-parse --absolute-git-dir`), not from an env var, so there is no externally-controlled path to traverse (the old `CLAUDE_PLUGIN_ROOT`-based resolution and its CWE-73 mitigation are gone).
+- **Case-insensitive filesystems and Windows.** The default macOS APFS and Windows NTFS fold case, so `.git/ARMIS-SCAN-PASS` *is* the pass file. Both guards match the name case-insensitively (`_SCAN_PASS_NAMES` uses a scoped `(?i:…)`; `is_scan_pass_file` casefolds). On top of that, `is_scan_pass_file` normalizes the NTFS aliases: either path separator, trailing dots/spaces (`armis-scan-pass.`), stream suffixes (`::$DATA`, `:stream`), and the 8.3 short names `ARMIS-~N` / `SCAN-P~N` (matched by shape — other aliases can't be derived textually; the hash match backstops them). The Bash pattern also covers backslash/quoted/spaced paths, `cmd`/`powershell`/`pwsh` launchers, PowerShell cmdlets (`Set-Content`, `Out-File`, `Add-Content`, `New-Item`, `Copy-Item`, `Move-Item`, …, `[IO.File]::WriteAllText`), `py`, `$var = '<pass>'`, and `copy`/`move`/`ren`/`sc`/`ni` **only at command position** (they are ordinary English words, so `git commit -m "copy armis-scan-pass"` stays a mere mention). Every per-client adapter must use `hook_core.is_scan_pass_file`; `gemini_pre_tool.py` once had a private exact-case copy.
+- **Shipping binaries.** `git`/`gh` are matched with an optional `.exe`, any case, and a path prefix with either separator, including a quoted path containing spaces (`"C:/Program Files/Git/cmd/git.exe" commit`). `_commit_invocations` uses `_is_git_binary` for the same normalization.
 
 **Reader/writer must agree (the worktree bug, part 1 — *same resolver*):** the gate reader (`hook_core`) and the scanner writer (`server`, `git-hooks`) **both** call `hash_utils.resolve_scan_pass_path()`. They previously used two private `_find_git_root` walkers that disagreed on a worktree's `.git` *file* (`os.path.isdir` vs `os.path.exists`), so the gate denied forever in every Conductor workspace. Never reintroduce a second resolver.
 
@@ -83,6 +87,7 @@ Don't "simplify" any of this without reading `.context/0008-*.md` — the guard 
 - `scan_file` also short-circuits *before* the API call if the file path is excluded by `.armisignore` — avoids paying API cost on ignored files.
 - Category is derived, not declared: `has_secret: true` → `"secrets"`, else `"sast"`.
 
+- `suppression.find_git_root(from_path)` takes a **file or a directory**: a directory resolves to itself, a file to its parent. (It once always took `dirname`, so `scan_diff(repo_path="/repo")` looked up `/` — or an enclosing repo — and silently dropped the real `.armisignore`.) Tests for this must not mock `find_git_root`.
 ### Inline `armis:ignore` comments
 
 A finding can also be suppressed by a comment **in the source itself**, on the finding's own
@@ -125,6 +130,8 @@ anchor on). Syntax:
 | `suppression.load_armisignore` | **Fail open** on IO/parse errors | Never lose findings due to a malformed ignore file |
 | `auth.JWTAuth` / `auth.SharedCacheAuth` | **Fail closed** | Can't scan without auth; errors propagate as `RuntimeError` → `ToolError` |
 | `token_cache.TokenStore.load` | **Fail open** (missing/corrupt/oversized → `None`) | A bad `.sessions` file must never break credential resolution — fall through to the next source |
+| `net_config` (CA / proxy setup) | **Fail open** (errors → httpx defaults: certifi, env-only proxies) | A broken OS store / registry read must not stop the server |
+| `server_log.setup_logging` | **Fail open** (can't create `logs/` → stderr only) | Logging must never block startup |
 | CI scanner (separate pipeline) | **Fail closed** | Second line of defense |
 
 When you edit either hook, preserve the outer `try: ... except Exception: print({}); sys.exit(0)` — it is load-bearing.
@@ -161,7 +168,12 @@ When you edit either hook, preserve the outer `try: ... except Exception: print(
 | `ARMIS_TENANT_ID` | optional | Tenant to authenticate against. Required **only** when the plugin itself starts the browser Device Auth flow (SSO path with an empty `~/.armis/.sessions`). Ignored by the client-credentials path. |
 | `APPSEC_ENV` | `prod` | Selects `moose.armis.com` (prod) or `moose-dev.armis.com` (dev) |
 | `APPSEC_API_URL` | auto | Full override; must be HTTPS unless hostname is localhost |
-| `APPSEC_DEBUG` | unset | Any truthy value enables debug logging |
+| *(run.sh preflight)* | — | `run.sh` only rejects a *half*-configured client-credential pair (just ID or just SECRET, in env or `.env`). No credentials at all is valid (SSO / Device Auth); `ARMIS_DEFAULT_AUTH_METHOD=sso` skips the check. |
+| `APPSEC_SCAN_TIMEOUT` | `180` | Overall seconds per scan (`server._call_api`): auth + API. On expiry the error names the stage (`scanner_core.ScanStage`, carried to the worker thread via a ContextVar) and any pending device sign-in URL. |
+| `APPSEC_MAX_CONCURRENT_SCANS` | `3` | Caps (clamped to 1–16) in-flight `/scan/fast` requests (`scanner_core._SCAN_SLOTS`). 429/502/503/504 are retried ≤3× with 2/4/8s backoff (`Retry-After` honored, capped 20s). |
+| `APPSEC_DEBUG` | unset | Any truthy value sets the server log level to DEBUG |
+| `SSL_CERT_FILE` / `SSL_CERT_DIR` / `REQUESTS_CA_BUNDLE` | unset | Explicit CA bundle; beats the OS store (see `net_config`) |
+| `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` / `NO_PROXY` | unset | If any proxy var is set the env is authoritative; otherwise the OS proxy is used |
 | `APPSEC_TRANSPORT` | `stdio` | MCP transport passed to `mcp.run()` |
 | `CLAUDE_PLUGIN_ROOT` | auto | Set by Claude Code; must resolve inside a git repo or it's ignored |
 

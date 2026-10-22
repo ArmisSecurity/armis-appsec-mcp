@@ -5,8 +5,11 @@ locate the scan-pass commit-gate file.
 """
 
 import hashlib
+import logging
 import os
 import subprocess
+
+logger = logging.getLogger("appsec-mcp")
 
 _MAX_DIFF_BYTES = 50 * 1024 * 1024  # 50 MB — safety limit for hashing
 _plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -19,22 +22,41 @@ SCAN_PASS_BASENAME = "armis-scan-pass"  # noqa: S105 — filename, not a secret
 LEGACY_SCAN_PASS_BASENAME = ".scan-pass"  # noqa: S105 — filename, not a secret
 
 
+_GIT_TIMEOUT = 5
+_GIT_DIFF_TIMEOUT = 10
+
+
+def _cwd_label(cwd: str | None) -> str:
+    # Called from except handlers: must not raise (os.getcwd() does when the
+    # CWD was deleted, which would escape the handler and fail the gate open).
+    return cwd or "the process CWD"
+
+
 def _git_output(args: list[str], cwd: str | None = None) -> str | None:
     """Run a read-only git command; return stripped stdout or None.
 
     ``cwd`` selects the directory git runs in (``None`` → the process CWD).
-    Mirrors suppression.find_git_root: short timeout, fail-soft on any error
-    (missing git binary, not a repo, timeout).
+    Short timeout, fail-soft on any error (missing git binary, not a repo,
+    timeout).
     """
     try:
         result = subprocess.run(
             ["git", *args],
             cwd=cwd,
+            # The MCP server's stdin is the client's JSON-RPC pipe, with a read
+            # pending on it. On Windows a child that inherits that handle blocks
+            # until the read completes (the next client message), so git hangs.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=_GIT_TIMEOUT,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "git %s timed out after %ds in %s", " ".join(args), _GIT_TIMEOUT, _cwd_label(cwd)
+        )
+        return None
+    except OSError:
         return None
     if result.returncode != 0:
         return None
@@ -164,13 +186,19 @@ def compute_staged_hash(repo_path: str | None = None) -> str:
         result = subprocess.run(
             ["git", "diff", "--cached", "--no-color", "--no-ext-diff"],
             cwd=repo_path,
+            stdin=subprocess.DEVNULL,  # see _git_output
             capture_output=True,
-            timeout=10,
+            timeout=_GIT_DIFF_TIMEOUT,
         )
         if result.returncode != 0 or not result.stdout:
             return ""
         if len(result.stdout) > _MAX_DIFF_BYTES:
             return ""  # Too large to hash safely
         return hashlib.sha256(result.stdout).hexdigest()
-    except (subprocess.TimeoutExpired, OSError, ValueError):
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "git diff --cached timed out after %ds in %s", _GIT_DIFF_TIMEOUT, _cwd_label(repo_path)
+        )
+        return ""
+    except (OSError, ValueError):
         return ""

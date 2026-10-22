@@ -25,15 +25,26 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 install-hooks:
-	@test -d .git || { echo "ERROR: not a git repository. Run from the repo root." >&2; exit 1; }
-	@mkdir -p .git/hooks
-	@ln -sf ../../git-hooks/pre-commit .git/hooks/pre-commit
-	@chmod +x git-hooks/pre-commit
-	@echo "Pre-commit hook installed (fail-open). Set APPSEC_HOOK_STRICT=1 for strict mode."
+	@git rev-parse --git-dir >/dev/null 2>&1 || { echo "ERROR: not a git repository. Run from the repo root." >&2; exit 1; }
+	@HOOKS_DIR=$$(git rev-parse --git-path hooks) && \
+	mkdir -p "$$HOOKS_DIR" && \
+	rm -f "$$HOOKS_DIR/pre-commit" && \
+	printf '#!/usr/bin/env bash\nexec "$$(git rev-parse --show-toplevel)/git-hooks/pre-commit" "$$@"\n' > "$$HOOKS_DIR/pre-commit" && \
+	chmod +x "$$HOOKS_DIR/pre-commit" git-hooks/pre-commit && \
+	echo "Pre-commit hook installed (fail-open). Set APPSEC_HOOK_STRICT=1 for strict mode."
+# A generated wrapper (not a symlink) so this works without symlink privileges on Windows.
+# --git-path resolves the *shared* hooks dir, so this one wrapper serves every worktree.
+# The target path is resolved at COMMIT time via `git rev-parse --show-toplevel` (run
+# inside the wrapper), not baked in at install time: since the wrapper is shared across
+# worktrees but git-hooks/pre-commit is checked out separately in each one, baking in the
+# installing worktree's absolute path would break every other worktree the moment that
+# one worktree is removed/pruned. Resolving at run time always finds the currently
+# committing worktree's own copy.
 
 uninstall-hooks:
-	@rm -f .git/hooks/pre-commit
-	@echo "Pre-commit hook removed."
+	@HOOKS_DIR=$$(git rev-parse --git-path hooks 2>/dev/null || echo .git/hooks) && \
+	rm -f "$$HOOKS_DIR/pre-commit" && \
+	echo "Pre-commit hook removed."
 
 # ---------------------------------------------------------------------------
 # Local dev: point the installed plugin at THIS working tree so you can test
@@ -90,10 +101,35 @@ setup:
 	@test -n "$(CLIENT)" || { echo "Usage: make setup CLIENT=cursor|vscode|gemini|copilot|codex|cline"; exit 1; }
 	@case "$(CLIENT)" in cursor|vscode|gemini|copilot|codex|cline) ;; *) echo "ERROR: Unknown CLIENT '$(CLIENT)'. Valid: cursor, vscode, gemini, copilot, codex, cline" >&2; exit 1;; esac
 	@PLUGIN_DIR=$$(pwd) && \
+	BASH_EXE="" && \
+	IS_WINDOWS="" && \
+	case "$$(uname -s 2>/dev/null)" in \
+		MINGW*|MSYS*|CYGWIN*) \
+			IS_WINDOWS=1 && \
+			BASH_PATH=$$(command -v bash 2>/dev/null || true) && \
+			if [ -n "$$BASH_PATH" ]; then \
+				BASH_EXE=$$(cygpath -m "$$BASH_PATH" 2>/dev/null || true); \
+			fi && \
+			PLUGIN_DIR=$$(cygpath -m "$$PLUGIN_DIR" 2>/dev/null || echo "$$PLUGIN_DIR") ;; \
+	esac && \
+	if [ -n "$$IS_WINDOWS" ] && [ -z "$$BASH_EXE" ]; then \
+		echo "# WARNING: Git Bash on Windows detected, but could not resolve bash.exe via cygpath." >&2 && \
+		echo "# The generated \"command\" below still points at run.sh, which VS Code / other clients" >&2 && \
+		echo "# cannot launch as a native Windows process. Install Git Bash / cygpath and rerun," >&2 && \
+		echo "# or edit the \"command\" field manually to point at bash.exe." >&2; \
+	fi && \
 	TEMPLATE="config-templates/$(CLIENT).mcp.json" && \
 	[ ! -f "$$TEMPLATE" ] && TEMPLATE="config-templates/$(CLIENT)-cli.mcp.json"; \
 	echo "=== MCP Server Config ===" && \
-	sed "s|/absolute/path/to/armis-appsec-mcp|$$PLUGIN_DIR|g" "$$TEMPLATE" && \
+	OUT=$$(sed "s|/absolute/path/to/armis-appsec-mcp|$$PLUGIN_DIR|g" "$$TEMPLATE") && \
+	if [ -n "$$BASH_EXE" ]; then \
+		SCRIPT_PATH="$$PLUGIN_DIR/run.sh" && \
+		OUT=$$(printf '%s\n' "$$OUT" | sed "s|\"command\": \"$$SCRIPT_PATH\"|\"command\": \"$$BASH_EXE\"|; s|\"args\": \[\]|\"args\": [\"$$SCRIPT_PATH\"]|"); \
+		echo "# Git Bash on Windows detected: command rewritten to launch bash.exe directly," >&2 && \
+		echo "# since VS Code / other clients spawn MCP servers as native Windows processes" >&2 && \
+		echo "# and cannot resolve Git Bash's /c/... paths." >&2; \
+	fi && \
+	printf '%s\n' "$$OUT" && \
 	HOOKS_TEMPLATE="config-templates/$(CLIENT).hooks.json" && \
 	if [ -f "$$HOOKS_TEMPLATE" ]; then \
 		echo "" && echo "=== Hook Config (commit gate) ===" && \

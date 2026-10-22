@@ -136,6 +136,49 @@ class TestJWTAuthExchange:
         assert jwt_auth._expires_at > time.time()
         mock_post.assert_called_once()
 
+    def _exchange(self, jwt_auth, exp, headers=None):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"token": _make_jwt(exp=exp)}
+        mock_response.headers = headers or {}
+        with patch("auth.httpx.post", return_value=mock_response):
+            jwt_auth.exchange()
+
+    def test_short_lived_token_warns(self, caplog):
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        with caplog.at_level("WARNING", logger="appsec-mcp"):
+            self._exchange(jwt_auth, exp=time.time() + 30)
+        assert "re-exchanged on every call" in caplog.text
+
+    def test_normal_token_does_not_warn(self, caplog):
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        with caplog.at_level("WARNING", logger="appsec-mcp"):
+            self._exchange(jwt_auth, exp=time.time() + 3600)
+        assert caplog.text == ""
+
+    def test_clock_skew_against_date_header_warns(self, caplog):
+        from email.utils import formatdate
+
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        server_now = formatdate(time.time() - 7200, usegmt=True)  # local clock 2h ahead
+        with caplog.at_level("WARNING", logger="appsec-mcp"):
+            self._exchange(jwt_auth, exp=time.time() + 3600, headers={"Date": server_now})
+        assert "Local clock differs" in caplog.text
+
+    def test_clock_skew_warns_even_when_token_looks_expired(self, caplog):
+        from email.utils import formatdate
+
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        server_now = formatdate(time.time() - 7200, usegmt=True)  # local clock 2h ahead
+        with caplog.at_level("WARNING", logger="appsec-mcp"):
+            with pytest.raises(RuntimeError, match="in the past"):
+                self._exchange(jwt_auth, exp=time.time() - 3600, headers={"Date": server_now})
+        assert "Local clock differs" in caplog.text
+
+    def test_bad_date_header_is_ignored(self):
+        jwt_auth = JWTAuth("https://example.com/api/v1", "id")
+        self._exchange(jwt_auth, exp=time.time() + 3600, headers={"Date": "garbage"})
+        assert jwt_auth._token is not None
+
     def test_401_raises_clear_error(self):
         jwt_auth = JWTAuth("https://example.com/api/v1", "id")
         mock_response = MagicMock()
@@ -469,6 +512,36 @@ class TestSharedCacheAuth:
         mock_poll.assert_called_once()
         assert store.load(self.ISSUER).access_token == "fresh"
 
+    def test_pending_signin_set_while_polling_then_cleared(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        provider, _ = self._make(tmp_path)
+        da = DeviceAuthorization("dc", "UC", "https://v", "https://v?c=UC", 600, 5)
+        fresh = StoredToken(access_token="fresh", expires_at=_future())
+        seen = {}
+
+        def poll(*a, **k):
+            seen["during"] = provider.pending_signin
+            return fresh
+
+        with (
+            patch.object(provider._device, "request_device_code", return_value=da),
+            patch.object(provider._device, "poll_token", side_effect=poll),
+            patch("shared_cache_auth.open_browser", return_value=False),
+        ):
+            provider.get_header()
+
+        assert "https://v?c=UC" in seen["during"] and "UC" in seen["during"]
+        assert provider.pending_signin == ""
+
+    def test_second_device_login_while_pending_fails_fast(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARMIS_TENANT_ID", "tenant1")
+        provider, _ = self._make(tmp_path)
+        provider.pending_signin = "Armis sign-in is waiting for you: open U and confirm code C."
+        with patch.object(provider._device, "request_device_code") as mock_req:
+            with pytest.raises(RuntimeError, match="waiting for you"):
+                provider.get_header()
+        mock_req.assert_not_called()
+
     def test_device_flow_uses_public_client_id(self, tmp_path, monkeypatch):
         # The device flow is a public client (no secret); it identifies with the
         # hardcoded public client_id armis-cli defaults to, not a per-install env var.
@@ -549,3 +622,14 @@ class TestSharedCacheAuth:
             header = provider.get_header()
 
         assert header == "Bearer fresh"  # fell through to device login, not the killed token
+
+
+class TestLateInvalidate:
+    def test_jwt_late_401_does_not_wipe_newer_token(self):
+        auth = JWTAuth("https://example.com/api/v1", "cid")
+        auth._token = "new"
+        auth._expires_at = time.time() + 3600
+        auth.invalidate("Bearer old")
+        assert auth._token == "new"
+        auth.invalidate("Bearer new")
+        assert auth._token is None

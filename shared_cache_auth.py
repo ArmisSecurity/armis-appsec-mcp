@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 
 from device_auth import (
     DEFAULT_DEVICE_CLIENT_ID,
@@ -43,27 +44,34 @@ class SharedCacheAuth:
     Fail-closed: a terminal failure raises ``RuntimeError`` (can't scan without
     auth), matching the fail-open/closed policy table in CLAUDE.md.
 
-    Not thread-safe -- the MCP plugin processes tool calls sequentially.
+    State is guarded by a re-entrant lock: a timed-out scan leaves its worker
+    thread running, so a retry can overlap with it. A retry arriving during a
+    browser sign-in waits for it and then reuses the resulting token.
     """
 
     def __init__(self, issuer: str, store: TokenStore | None = None):
         self._issuer = issuer
         self._store = store if store is not None else TokenStore()
         self._device = DeviceClient(issuer)
+        # Set while a browser sign-in is waiting on the user, so the server can
+        # surface the URL/code in the chat instead of only on stderr.
+        self.pending_signin: str = ""
         self._token: StoredToken | None = None
         # Access tokens the server rejected (401). A token can be unexpired
         # locally yet killed server-side (session revoked/logged out), so we
         # must not keep handing it back from the in-memory or on-disk cache.
         self._rejected: set[str] = set()
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Token lifecycle
     # ------------------------------------------------------------------
     def get_header(self) -> str:
         """Return 'Bearer <token>', resolving/refreshing/logging-in as needed."""
-        return f"Bearer {self._ensure_access_token()}"
+        with self._lock:
+            return f"Bearer {self._ensure_access_token()}"
 
-    def invalidate(self) -> None:
+    def invalidate(self, header: str = "") -> None:
         """Mark the last-issued access token as bad so the next call re-auths.
 
         Called after the scan API rejects the token with 401: the session was
@@ -71,10 +79,17 @@ class SharedCacheAuth:
         locally. Recording it in ``_rejected`` forces ``_ensure_access_token``
         past the in-memory/cache hits into refresh → device login, and prevents
         an infinite loop of re-reading the same dead token from ``.sessions``.
+
+        ``header`` is the one the server rejected. If the current token has
+        since changed (a late 401 from an abandoned scan), nothing is dropped.
         """
-        if self._token is not None and self._token.access_token:
-            self._rejected.add(self._token.access_token)
-        self._token = None
+        with self._lock:
+            current = self._token.access_token if self._token is not None else ""
+            if header and header != f"Bearer {current}":
+                return
+            if current:
+                self._rejected.add(current)
+            self._token = None
 
     def _usable(self, token: StoredToken | None) -> bool:
         """True when ``token`` is present, unexpired, and not server-rejected."""
@@ -130,6 +145,10 @@ class SharedCacheAuth:
 
     def _device_login(self) -> StoredToken:
         """Run the RFC 8628 browser device flow and persist the result."""
+        if self.pending_signin:
+            # A previous scan timed out while this flow was still polling in its
+            # worker thread. Re-prompt instead of starting a second device code.
+            raise RuntimeError(self.pending_signin)
         tenant_id = os.environ.get("ARMIS_TENANT_ID", "")
         if not tenant_id:
             raise RuntimeError(
@@ -140,6 +159,7 @@ class SharedCacheAuth:
         # The device-flow client_id is a public, non-secret identifier (RFC 8628
         # public client) -- no client_secret is ever involved. Use the same
         # hardcoded value armis-cli defaults to so the server recognizes it.
+        # armis:ignore cwe:798 reason:public RFC 8628 client id, not a secret
         client_id = DEFAULT_DEVICE_CLIENT_ID
 
         try:
@@ -150,15 +170,22 @@ class SharedCacheAuth:
         browse_url = da.verification_uri_complete or da.verification_uri
         opened = open_browser(browse_url) if browse_url else False
         self._print_verification_instructions(da, browse_url, opened)
+        self.pending_signin = (
+            f"Armis sign-in is waiting for you: open {browse_url or da.verification_uri} "
+            f"and confirm code {da.user_code}."
+        )
 
         try:
             token = self._device.poll_token(da.device_code, client_id, da.interval, da.expires_in)
+            token.issuer = token.issuer or self._issuer
+            self._token = token
+            self._persist(token)
         except OAuthError as e:
             raise RuntimeError(f"Armis sign-in did not complete: {e}") from e
-
-        token.issuer = token.issuer or self._issuer
-        self._token = token
-        self._persist(token)
+        finally:
+            # Cleared only after the token is stored, so a retry arriving mid-way
+            # cannot start a second device flow.
+            self.pending_signin = ""
         logger.info("Signed in via device flow; identity=%s", token.subject or "?")
         return token
 

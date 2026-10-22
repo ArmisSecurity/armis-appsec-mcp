@@ -4,6 +4,38 @@ VENV_DIR="$PLUGIN_DIR/.venv"
 REQS_FILE="$PLUGIN_DIR/requirements.txt"
 DEPS_SENTINEL="$VENV_DIR/.deps-installed"
 
+# venv layout differs by platform: POSIX puts the interpreter under bin/,
+# native Windows Python (e.g. via Git Bash) puts it under Scripts/.
+venv_python() {
+    if [ -f "$VENV_DIR/bin/python" ]; then
+        printf '%s\n' "$VENV_DIR/bin/python"
+    elif [ -f "$VENV_DIR/Scripts/python.exe" ]; then
+        printf '%s\n' "$VENV_DIR/Scripts/python.exe"
+    fi
+}
+
+venv_pip() {
+    if [ -f "$VENV_DIR/bin/pip" ]; then
+        printf '%s\n' "$VENV_DIR/bin/pip"
+    elif [ -f "$VENV_DIR/Scripts/pip.exe" ]; then
+        printf '%s\n' "$VENV_DIR/Scripts/pip.exe"
+    fi
+}
+
+# Native Windows Python installs commonly expose only "python", not "python3".
+PYTHON_BIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+PYTHON_ARGS=""
+# Stock python.org Windows installs may register only the "py" launcher,
+# with neither "python3" nor "python" on PATH.
+if [ -z "$PYTHON_BIN" ] && command -v py >/dev/null 2>&1; then
+    PYTHON_BIN="py"
+    PYTHON_ARGS="-3"
+fi
+if [ -z "$PYTHON_BIN" ]; then
+    echo "ERROR: no python3/python/py found on PATH." >&2
+    exit 1
+fi
+
 # Compute a hash of requirements.txt to detect changes.
 REQS_HASH=""
 if command -v sha256sum >/dev/null 2>&1; then
@@ -24,8 +56,9 @@ fi
 
 # Also reinstall if the venv's Python is broken (e.g. pyenv version switch, Homebrew upgrade).
 # Running `python -c ""` is a cheap probe — it fails if the interpreter binary is gone/stale.
-if [ "$NEEDS_INSTALL" -eq 0 ] && [ -f "$VENV_DIR/bin/python" ]; then
-    if ! "$VENV_DIR/bin/python" -c "" >/dev/null 2>&1; then
+if [ "$NEEDS_INSTALL" -eq 0 ]; then
+    VENV_PYTHON="$(venv_python)"
+    if [ -z "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c "" >/dev/null 2>&1; then
         NEEDS_INSTALL=1
     fi
 fi
@@ -33,10 +66,16 @@ fi
 if [ "$NEEDS_INSTALL" -eq 1 ]; then
     # Remove existing venv entirely before recreating — re-running venv against an existing
     # directory with a different Python grafts a second lib/pythonX.Y tree while leaving
-    # bin/python pointing at the original, causing ModuleNotFoundError at runtime.
+    # bin/python (or Scripts/python.exe) pointing at the original, causing
+    # ModuleNotFoundError at runtime.
     rm -rf "$VENV_DIR"
-    python3 -m venv "$VENV_DIR" || { echo "ERROR: python3 -m venv failed. Is python3 installed?" >&2; exit 1; }
-    "$VENV_DIR/bin/pip" install -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
+    "$PYTHON_BIN" $PYTHON_ARGS -m venv "$VENV_DIR" || { echo "ERROR: $PYTHON_BIN $PYTHON_ARGS -m venv failed." >&2; exit 1; }
+    VENV_PIP="$(venv_pip)"
+    if [ -z "$VENV_PIP" ]; then
+        echo "ERROR: no pip found in $VENV_DIR (checked bin/pip and Scripts/pip.exe) after venv creation." >&2
+        exit 1
+    fi
+    "$VENV_PIP" install -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
     if [ -n "$REQS_HASH" ]; then
         printf '%s\n' "$REQS_HASH" > "$DEPS_SENTINEL"
     else
@@ -44,28 +83,46 @@ if [ "$NEEDS_INSTALL" -eq 1 ]; then
     fi
 fi
 
-# Pre-flight: check credentials exist (env vars OR .env file)
+# Pre-flight: catch a half-configured client-credentials setup early. Having no
+# credentials at all is valid: auth.init_auth falls back to the shared token
+# cache / Device Auth (SSO), so only a lone ID or SECRET is an error here.
+# ARMIS_DEFAULT_AUTH_METHOD=sso ignores client credentials entirely, so skip.
 ENV_FILE="$PLUGIN_DIR/.env"
-if [ -z "${ARMIS_CLIENT_ID:-}" ] || [ -z "${ARMIS_CLIENT_SECRET:-}" ]; then
-    if [ ! -f "$ENV_FILE" ]; then
-        MISSING=""
-        [ -z "${ARMIS_CLIENT_ID:-}" ] && MISSING="ARMIS_CLIENT_ID"
-        [ -z "${ARMIS_CLIENT_SECRET:-}" ] && MISSING="${MISSING:+$MISSING, }ARMIS_CLIENT_SECRET"
-        echo "ERROR: $MISSING not set and .env not found at $ENV_FILE" >&2
-        echo "  Either export ARMIS_CLIENT_ID/ARMIS_CLIENT_SECRET, or create .env:" >&2
-        echo "    ARMIS_CLIENT_ID=<your-id>" >&2
-        echo "    ARMIS_CLIENT_SECRET=<your-secret>" >&2
-        echo "  Contact the Armis AppSec team for credentials." >&2
-        exit 1
+
+# True if NAME is set in the environment or assigned in .env.
+has_setting() {
+    _val="${!1:-}"
+    [ -n "$_val" ] && return 0
+    [ -f "$ENV_FILE" ] && grep -qE "^$1=" "$ENV_FILE" 2>/dev/null
+}
+
+# Value of NAME from the environment, else .env (quotes stripped), lowercased.
+setting_value() {
+    _val="${!1:-}"
+    if [ -z "$_val" ] && [ -f "$ENV_FILE" ]; then
+        _val="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n 1 | cut -d '=' -f2- | tr -d "\"'")"
     fi
-    if ! grep -qE '^ARMIS_CLIENT_ID=' "$ENV_FILE" 2>/dev/null; then
-        echo "ERROR: ARMIS_CLIENT_ID not found in $ENV_FILE" >&2
-        exit 1
-    fi
-    if ! grep -qE '^ARMIS_CLIENT_SECRET=' "$ENV_FILE" 2>/dev/null; then
-        echo "ERROR: ARMIS_CLIENT_SECRET not found in $ENV_FILE" >&2
+    printf '%s\n' "$_val" | tr '[:upper:]' '[:lower:]'
+}
+
+if [ "$(setting_value ARMIS_DEFAULT_AUTH_METHOD)" != "sso" ]; then
+    HAS_ID=0
+    HAS_SECRET=0
+    has_setting ARMIS_CLIENT_ID && HAS_ID=1
+    has_setting ARMIS_CLIENT_SECRET && HAS_SECRET=1
+    if [ "$HAS_ID" -ne "$HAS_SECRET" ]; then
+        MISSING="ARMIS_CLIENT_SECRET"
+        [ "$HAS_ID" -eq 0 ] && MISSING="ARMIS_CLIENT_ID"
+        echo "ERROR: $MISSING is not set (env or $ENV_FILE) but the other client credential is." >&2
+        echo "  Set both ARMIS_CLIENT_ID and ARMIS_CLIENT_SECRET, or remove both to sign in via SSO" >&2
+        echo "  (set ARMIS_TENANT_ID for the first browser sign-in)." >&2
         exit 1
     fi
 fi
 
-exec "$VENV_DIR/bin/python" "$PLUGIN_DIR/server.py"
+VENV_PYTHON="$(venv_python)"
+if [ -z "$VENV_PYTHON" ]; then
+    echo "ERROR: no python interpreter found in $VENV_DIR (checked bin/python and Scripts/python.exe)." >&2
+    exit 1
+fi
+exec "$VENV_PYTHON" "$PLUGIN_DIR/server.py"

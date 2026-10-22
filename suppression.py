@@ -10,8 +10,9 @@ import fnmatch
 import logging
 import os
 import re
-import subprocess
 from dataclasses import dataclass, field
+
+from hash_utils import resolve_repo_toplevel
 
 logger = logging.getLogger("appsec-mcp")
 
@@ -30,23 +31,18 @@ class ArmisIgnoreConfig:
 def find_git_root(from_path: str | None = None) -> str | None:
     """Return the git repository root, or None if not in a git repo.
 
+    ``from_path`` may be a directory or a file; ``None`` uses the process CWD.
+
     Re-resolved on every call to handle long-running server processes
     where the user may switch between repositories.
     """
-    cwd = os.path.dirname(from_path) if from_path and os.path.isabs(from_path) else None
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            cwd=cwd,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    return None
+    cwd = None
+    if from_path and os.path.isabs(from_path):
+        # A directory resolves to itself; a file path (scan_file) to its parent.
+        # dirname() alone turns "/repo" into "/", dropping the repo's own
+        # .armisignore (or hitting an enclosing repo's).
+        cwd = from_path if os.path.isdir(from_path) else os.path.dirname(from_path)
+    return resolve_repo_toplevel(cwd)
 
 
 def load_armisignore(git_root: str | None) -> ArmisIgnoreConfig:

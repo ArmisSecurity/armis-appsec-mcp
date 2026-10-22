@@ -21,11 +21,14 @@ Supports two credential paths, resolved in ``init_auth``:
 """
 
 import base64
+import datetime
 import json
 import logging
 import os
+import threading
 import time
 import urllib.parse
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -46,15 +49,40 @@ logger = logging.getLogger("appsec-mcp")
 
 # Refresh when less than 5 minutes remain (matches armis-cli)
 _REFRESH_BUFFER_SECONDS = 300
+_CLOCK_SKEW_WARN_SECONDS = 60
 
 _LOCALHOST_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _warn_clock_skew(response: httpx.Response) -> None:
+    """Warn when the local clock is far from the server's ``Date`` header.
+
+    A skewed clock makes valid tokens look expired (or not yet due for refresh)
+    and server-side 401s look like an auth bug. Diagnostic only; never raises.
+    """
+    try:
+        date_header = response.headers.get("Date")
+        if not date_header:
+            return
+        server_time = parsedate_to_datetime(date_header)
+        if server_time.tzinfo is None:  # "-0000" zone: RFC 5322 says UTC
+            server_time = server_time.replace(tzinfo=datetime.UTC)
+        skew = time.time() - server_time.timestamp()
+        if abs(skew) > _CLOCK_SKEW_WARN_SECONDS:
+            logger.warning(
+                "Local clock differs from the auth server's by %+.0fs. "
+                "Sync the system clock (Windows: w32tm /resync).",
+                skew,
+            )
+    except Exception as e:  # diagnostics must never break authentication
+        logger.debug("clock skew check failed: %s", e)
 
 
 class JWTAuth:
     """In-memory JWT token manager.
 
-    Not thread-safe. The MCP plugin processes tool calls sequentially,
-    so concurrent access is not a concern.
+    Token state is guarded by a lock: a timed-out scan leaves its worker thread
+    running, so a retry can overlap with it.
     """
 
     def __init__(self, api_url: str, client_id: str):
@@ -62,6 +90,7 @@ class JWTAuth:
         self._client_id = client_id
         self._token: str | None = None
         self._expires_at: float = 0.0  # epoch seconds
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Token lifecycle
@@ -112,6 +141,9 @@ class JWTAuth:
         if "token" not in data:
             raise RuntimeError("Authentication failed: unexpected response (missing token)")
 
+        # Before parsing: a clock far ahead makes the token look expired, and that
+        # is exactly when the skew warning is needed.
+        _warn_clock_skew(response)
         self._token = data["token"]
         try:
             self._expires_at = self._parse_jwt_exp(self._token)
@@ -119,24 +151,46 @@ class JWTAuth:
             self._token = None
             raise RuntimeError(f"Authentication failed: invalid JWT payload ({e})") from e
         logger.info("JWT token obtained, expires at %.0f", self._expires_at)
+        self._log_token_lifetime()
+
+    def _log_token_lifetime(self) -> None:
+        """Warn when the token's remaining life is under the refresh buffer.
+
+        Such a token is re-exchanged on every call. Diagnostic only; never raises.
+        """
+        ttl = self._expires_at - time.time()
+        logger.info("JWT lifetime: %.0fs remaining", ttl)
+        if ttl < _REFRESH_BUFFER_SECONDS:
+            logger.warning(
+                "JWT has only %.0fs left (< %ds refresh buffer): it will be re-exchanged "
+                "on every call. Check the system clock and timezone.",
+                ttl,
+                _REFRESH_BUFFER_SECONDS,
+            )
 
     def _is_valid(self) -> bool:
         return self._token is not None and time.time() < self._expires_at - _REFRESH_BUFFER_SECONDS
 
     def get_header(self) -> str:
         """Return 'Bearer <token>', exchanging/refreshing if needed."""
-        if not self._is_valid():
-            self.exchange()
-        return f"Bearer {self._token}"
+        with self._lock:
+            if not self._is_valid():
+                self.exchange()
+            return f"Bearer {self._token}"
 
-    def invalidate(self) -> None:
+    def invalidate(self, header: str = "") -> None:
         """Drop the cached token so the next call re-exchanges credentials.
 
         Called after the scan API rejects the token with 401 (e.g. the token was
-        revoked server-side before its local expiry).
+        revoked server-side before its local expiry). When ``header`` (the one
+        that was rejected) is given and the cached token has since changed, a
+        late 401 from an abandoned scan must not wipe the newer token.
         """
-        self._token = None
-        self._expires_at = 0.0
+        with self._lock:
+            if header and header != f"Bearer {self._token}":
+                return
+            self._token = None
+            self._expires_at = 0.0
 
     # ------------------------------------------------------------------
     # JWT payload parsing
@@ -246,7 +300,7 @@ def get_auth_header() -> str:
     return _auth.get_header()
 
 
-def invalidate_auth() -> None:
+def invalidate_auth(header: str = "") -> None:
     """Invalidate the current token so the next ``get_auth_header`` re-authenticates.
 
     Called by the scan path on an HTTP 401: the token the server rejected was
@@ -255,7 +309,12 @@ def invalidate_auth() -> None:
     ``JWTAuth``; refresh or device login for ``SharedCacheAuth``).
     """
     if _auth is not None:
-        _auth.invalidate()
+        _auth.invalidate(header)
+
+
+def get_pending_signin() -> str:
+    """Return the browser sign-in instructions if a device login is waiting, else ''."""
+    return getattr(_auth, "pending_signin", "") or ""
 
 
 def get_auth_status() -> str:

@@ -891,3 +891,98 @@ class TestScanFileEndToEndDiffScope:
 
         assert "secret-here" in report
         assert "outside diff scope" not in report
+
+
+# ---------------------------------------------------------------------------
+# scan_diff(repo_path=<dir>) must resolve .armisignore from that repo
+# ---------------------------------------------------------------------------
+def _git(cwd, *args):
+    import subprocess
+
+    subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, check=True)
+
+
+def _make_staged_repo(path):
+    """Real repo at ``path`` with one commit and a staged app.py."""
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init")
+    _git(path, "config", "user.email", "t@t.com")
+    _git(path, "config", "user.name", "T")
+    (path / "init.txt").write_text("init\n")
+    _git(path, "add", "init.txt")
+    _git(path, "commit", "-m", "init")
+    (path / "app.py").write_text("token = load_token()\nrun(x)\n")
+    _git(path, "add", "app.py")
+
+
+class TestScanDiffRepoPathArmisignore:
+    """REGRESSION: find_git_root(from_path=<repo dir>) used dirname(), i.e. the
+    repo's PARENT, so .armisignore was silently dropped for every
+    scan_diff(repo_path=...) call. These tests do NOT mock find_git_root.
+    """
+
+    _RAW = _findings_json(
+        [
+            {
+                "cwe": 798,
+                "severity": "HIGH",
+                "line": 1,
+                "explanation": "hardcoded secret",
+                "has_secret": True,
+            },
+            {
+                "cwe": 89,
+                "severity": "HIGH",
+                "line": 2,
+                "explanation": "sql injection",
+                "has_secret": False,
+            },
+        ]
+    )
+
+    @pytest.mark.parametrize("trailing_slash", [False, True])
+    @pytest.mark.asyncio
+    async def test_parent_not_a_repo(self, tmp_path, trailing_slash):
+        import tempfile
+
+        # tmp_path is itself a repo (autouse fixture); use a bare system temp dir.
+        with tempfile.TemporaryDirectory() as outer:
+            repo = os.path.realpath(outer) + "/repo"
+            from pathlib import Path
+
+            _make_staged_repo(Path(repo))
+            Path(repo, ".armisignore").write_text("cwe:798\n")
+            with patch("server.call_appsec_api", return_value=self._RAW):
+                report = await server.scan_diff(
+                    repo_path=repo + ("/" if trailing_slash else ""), staged=True
+                )
+
+        assert "hardcoded secret" not in report
+        assert "sql injection" in report
+        assert "1 suppressed" in report
+
+    @pytest.mark.asyncio
+    async def test_parent_is_repo_with_its_own_armisignore(self, tmp_path):
+        # tmp_path is a git repo (autouse fixture): it is the enclosing repo.
+        (tmp_path / ".armisignore").write_text("cwe:89\n")
+        repo = tmp_path / "nested"
+        _make_staged_repo(repo)
+        (repo / ".armisignore").write_text("cwe:798\n")
+
+        with patch("server.call_appsec_api", return_value=self._RAW):
+            report = await server.scan_diff(repo_path=str(repo), staged=True)
+
+        # Inner repo's rules apply; the enclosing repo's do not.
+        assert "hardcoded secret" not in report
+        assert "sql injection" in report
+
+    @pytest.mark.asyncio
+    async def test_path_pattern_excludes_before_api_call(self, tmp_path):
+        repo = tmp_path / "nested"
+        _make_staged_repo(repo)
+        (repo / ".armisignore").write_text("app.py\n")
+
+        with patch("server.call_appsec_api", side_effect=AssertionError("API called")):
+            report = await server.scan_diff(repo_path=str(repo), staged=True)
+
+        assert "excluded by .armisignore" in report
