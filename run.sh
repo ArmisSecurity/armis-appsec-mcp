@@ -83,26 +83,39 @@ if [ "$NEEDS_INSTALL" -eq 1 ]; then
     fi
 fi
 
-# Pre-flight: check credentials exist (env vars OR .env file)
+# Pre-flight: catch a half-configured client-credentials setup early. Having no
+# credentials at all is valid: auth.init_auth falls back to the shared token
+# cache / Device Auth (SSO), so only a lone ID or SECRET is an error here.
+# ARMIS_DEFAULT_AUTH_METHOD=sso ignores client credentials entirely, so skip.
 ENV_FILE="$PLUGIN_DIR/.env"
-if [ -z "${ARMIS_CLIENT_ID:-}" ] || [ -z "${ARMIS_CLIENT_SECRET:-}" ]; then
-    if [ ! -f "$ENV_FILE" ]; then
-        MISSING=""
-        [ -z "${ARMIS_CLIENT_ID:-}" ] && MISSING="ARMIS_CLIENT_ID"
-        [ -z "${ARMIS_CLIENT_SECRET:-}" ] && MISSING="${MISSING:+$MISSING, }ARMIS_CLIENT_SECRET"
-        echo "ERROR: $MISSING not set and .env not found at $ENV_FILE" >&2
-        echo "  Either export ARMIS_CLIENT_ID/ARMIS_CLIENT_SECRET, or create .env:" >&2
-        echo "    ARMIS_CLIENT_ID=<your-id>" >&2
-        echo "    ARMIS_CLIENT_SECRET=<your-secret>" >&2
-        echo "  Contact the Armis AppSec team for credentials." >&2
-        exit 1
+
+# True if NAME is set in the environment or assigned in .env.
+has_setting() {
+    _val="${!1:-}"
+    [ -n "$_val" ] && return 0
+    [ -f "$ENV_FILE" ] && grep -qE "^$1=" "$ENV_FILE" 2>/dev/null
+}
+
+# Value of NAME from the environment, else .env (quotes stripped), lowercased.
+setting_value() {
+    _val="${!1:-}"
+    if [ -z "$_val" ] && [ -f "$ENV_FILE" ]; then
+        _val="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n 1 | cut -d '=' -f2- | tr -d "\"'")"
     fi
-    if ! grep -qE '^ARMIS_CLIENT_ID=' "$ENV_FILE" 2>/dev/null; then
-        echo "ERROR: ARMIS_CLIENT_ID not found in $ENV_FILE" >&2
-        exit 1
-    fi
-    if ! grep -qE '^ARMIS_CLIENT_SECRET=' "$ENV_FILE" 2>/dev/null; then
-        echo "ERROR: ARMIS_CLIENT_SECRET not found in $ENV_FILE" >&2
+    printf '%s\n' "$_val" | tr '[:upper:]' '[:lower:]'
+}
+
+if [ "$(setting_value ARMIS_DEFAULT_AUTH_METHOD)" != "sso" ]; then
+    HAS_ID=0
+    HAS_SECRET=0
+    has_setting ARMIS_CLIENT_ID && HAS_ID=1
+    has_setting ARMIS_CLIENT_SECRET && HAS_SECRET=1
+    if [ "$HAS_ID" -ne "$HAS_SECRET" ]; then
+        MISSING="ARMIS_CLIENT_SECRET"
+        [ "$HAS_ID" -eq 0 ] && MISSING="ARMIS_CLIENT_ID"
+        echo "ERROR: $MISSING is not set (env or $ENV_FILE) but the other client credential is." >&2
+        echo "  Set both ARMIS_CLIENT_ID and ARMIS_CLIENT_SECRET, or remove both to sign in via SSO" >&2
+        echo "  (set ARMIS_TENANT_ID for the first browser sign-in)." >&2
         exit 1
     fi
 fi
