@@ -193,6 +193,8 @@ class TestWorktree:
                 f.write("deadbeef")
             assert os.path.isfile(result)
         finally:
+            # Windows cannot remove a worktree that is the process CWD.
+            monkeypatch.chdir(git_repo)
             _git(["worktree", "remove", "--force", str(worktree)], git_repo)
 
 
