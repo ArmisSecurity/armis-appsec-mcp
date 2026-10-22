@@ -470,6 +470,11 @@ class TestFilterDiffExcludedPaths:
         assert result == ""
 
 
+def _same_path(a, b):
+    """git prints forward slashes on Windows; compare paths regardless of separator."""
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
 class TestFindGitRootRealRepo:
     """Unmocked: a directory resolves to itself, a file to its parent's repo."""
 
@@ -484,13 +489,13 @@ class TestFindGitRootRealRepo:
     def test_directory_resolves_to_itself_not_parent(self, tmp_path):
         outer = self._init(tmp_path)  # enclosing repo
         inner = self._init(tmp_path / "inner")
-        assert find_git_root(from_path=inner) == inner
-        assert find_git_root(from_path=inner + "/") == inner
-        assert find_git_root(from_path=inner) != outer
+        assert _same_path(find_git_root(from_path=inner), inner)
+        assert _same_path(find_git_root(from_path=inner + "/"), inner)
+        assert not _same_path(find_git_root(from_path=inner), outer)
 
     def test_file_path_resolves_to_containing_repo(self, tmp_path):
         inner = self._init(tmp_path / "inner")
         (tmp_path / "inner" / "sub").mkdir()
         f = tmp_path / "inner" / "sub" / "a.py"
         f.write_text("x = 1\n")
-        assert find_git_root(from_path=str(f)) == inner
+        assert _same_path(find_git_root(from_path=str(f)), inner)

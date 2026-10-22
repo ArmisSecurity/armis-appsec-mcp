@@ -99,10 +99,11 @@ def _run_scan_staged(tmp_path, mock_response=None, mock_auth_error=None, env_ove
     """)
 
     wrapper_path = tmp_path / "_test_wrapper.py"
-    wrapper_path.write_text(wrapper)
+    wrapper_path.write_text(wrapper, encoding="utf-8")
 
     env = os.environ.copy()
     env["ARMIS_CLIENT_ID"] = "test-id"
+    # armis:ignore cwe:798 cwe:259 reason: dummy value for a mocked scan
     env["ARMIS_CLIENT_SECRET"] = "test-secret"
     env.pop("APPSEC_API_URL", None)
     env.pop("APPSEC_ENV", None)
@@ -296,10 +297,11 @@ class TestFailOpen:
         """)
 
         wrapper_path = tmp_path / "_test_exception.py"
-        wrapper_path.write_text(wrapper)
+        wrapper_path.write_text(wrapper, encoding="utf-8")
 
         env = os.environ.copy()
         env["ARMIS_CLIENT_ID"] = "test"
+        # armis:ignore cwe:798 cwe:259 reason: dummy value for a mocked scan
         env["ARMIS_CLIENT_SECRET"] = "test"
 
         result = subprocess.run(

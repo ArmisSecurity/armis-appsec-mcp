@@ -38,7 +38,7 @@ def _run(plugin_dir, env_extra=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("ARMIS_", "APPSEC_"))}
     env.update(env_extra or {})
     return subprocess.run(
-        ["bash", str(plugin_dir / "run.sh")],
+        [shutil.which("bash"), str(plugin_dir / "run.sh")],
         capture_output=True,
         text=True,
         timeout=30,
