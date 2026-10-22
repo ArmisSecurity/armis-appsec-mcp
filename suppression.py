@@ -10,8 +10,9 @@ import fnmatch
 import logging
 import os
 import re
-import subprocess
 from dataclasses import dataclass, field
+
+from hash_utils import resolve_repo_toplevel
 
 logger = logging.getLogger("appsec-mcp")
 
@@ -41,19 +42,7 @@ def find_git_root(from_path: str | None = None) -> str | None:
         # dirname() alone turns "/repo" into "/", dropping the repo's own
         # .armisignore (or hitting an enclosing repo's).
         cwd = from_path if os.path.isdir(from_path) else os.path.dirname(from_path)
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            cwd=cwd,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    return None
+    return resolve_repo_toplevel(cwd)
 
 
 def load_armisignore(git_root: str | None) -> ArmisIgnoreConfig:
