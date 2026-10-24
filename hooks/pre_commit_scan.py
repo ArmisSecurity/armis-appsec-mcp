@@ -2,7 +2,7 @@
 """
 Claude Code PreToolUse Hook -- Security gate for shipping commands.
 
-Fires before every Bash tool execution. Inspects the command and blocks
+Fires before every Bash / PowerShell tool execution. Inspects the command and blocks
 git commit, git push, and gh pr create until code has been scanned.
 
 Uses "exit 2 + stderr JSON" to deny the command and inject a systemMessage
@@ -53,6 +53,24 @@ def main():
             sys.exit(0)
 
         result: GateResult = check_gate(cmd)
+
+        if result.decision == "deny" and "--stdout-json" in sys.argv[1:]:
+            # PowerShell hosts mangle a native command's stderr into error
+            # records, so the exit-2 + stderr protocol is unreliable there. The
+            # documented alternative: exit 0 with the deny decision on stdout.
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": result.system_message,
+                        },
+                        "systemMessage": result.system_message,
+                    }
+                )
+            )
+            sys.exit(0)
 
         if result.decision == "deny":
             sys.stderr.write(

@@ -119,17 +119,21 @@ setup:
 		echo "# or edit the \"command\" field manually to point at bash.exe." >&2; \
 	fi && \
 	TEMPLATE="config-templates/$(CLIENT).mcp.json" && \
-	[ ! -f "$$TEMPLATE" ] && TEMPLATE="config-templates/$(CLIENT)-cli.mcp.json"; \
-	echo "=== MCP Server Config ===" && \
-	OUT=$$(sed "s|/absolute/path/to/armis-appsec-mcp|$$PLUGIN_DIR|g" "$$TEMPLATE") && \
-	if [ -n "$$BASH_EXE" ]; then \
-		SCRIPT_PATH="$$PLUGIN_DIR/run.sh" && \
-		OUT=$$(printf '%s\n' "$$OUT" | sed "s|\"command\": \"$$SCRIPT_PATH\"|\"command\": \"$$BASH_EXE\"|; s|\"args\": \[\]|\"args\": [\"$$SCRIPT_PATH\"]|"); \
-		echo "# Git Bash on Windows detected: command rewritten to launch bash.exe directly," >&2 && \
-		echo "# since VS Code / other clients spawn MCP servers as native Windows processes" >&2 && \
-		echo "# and cannot resolve Git Bash's /c/... paths." >&2; \
+	{ [ -f "$$TEMPLATE" ] || TEMPLATE="config-templates/$(CLIENT)-cli.mcp.json"; } && \
+	if [ -f "$$TEMPLATE" ]; then \
+		echo "=== MCP Server Config ===" && \
+		OUT=$$(sed "s|/absolute/path/to/armis-appsec-mcp|$$PLUGIN_DIR|g" "$$TEMPLATE") && \
+		if [ -n "$$BASH_EXE" ]; then \
+			SCRIPT_PATH="$$PLUGIN_DIR/run.sh" && \
+			OUT=$$(printf '%s\n' "$$OUT" | sed "s|\"command\": \"$$SCRIPT_PATH\"|\"command\": \"$$BASH_EXE\"|; s|\"args\": \[\]|\"args\": [\"$$SCRIPT_PATH\"]|"); \
+			echo "# Git Bash on Windows detected: command rewritten to launch bash.exe directly," >&2 && \
+			echo "# since VS Code / other clients spawn MCP servers as native Windows processes" >&2 && \
+			echo "# and cannot resolve Git Bash's /c/... paths." >&2; \
+		fi && \
+		printf '%s\n' "$$OUT"; \
+	else \
+		echo "# No MCP config template for $(CLIENT): add the server (launch $$PLUGIN_DIR/run.sh) per the client's own docs." >&2; \
 	fi && \
-	printf '%s\n' "$$OUT" && \
 	HOOKS_TEMPLATE="config-templates/$(CLIENT).hooks.json" && \
 	if [ -f "$$HOOKS_TEMPLATE" ]; then \
 		echo "" && echo "=== Hook Config (commit gate) ===" && \
