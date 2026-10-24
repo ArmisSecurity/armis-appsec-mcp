@@ -151,7 +151,10 @@ class TestGitRefValidation:
 
     def test_git_diff_command_has_no_ext_diff(self):
         """Verify scan_diff includes --no-ext-diff to prevent custom diff driver exploitation."""
-        source_path = os.path.join(_plugin_dir, "server.py")
-        with open(source_path) as f:
-            source = f.read()
-        assert "--no-ext-diff" in source, "server.py must include --no-ext-diff flag"
+        from scan_gate import DIFF_FILTER_ARGS
+
+        assert "--no-ext-diff" in DIFF_FILTER_ARGS
+        with open(os.path.join(_plugin_dir, "server.py")) as f:
+            assert "*DIFF_FILTER_ARGS" in f.read(), (
+                "server.py must build git diff from DIFF_FILTER_ARGS"
+            )

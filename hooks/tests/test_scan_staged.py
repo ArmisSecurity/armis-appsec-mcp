@@ -445,5 +445,83 @@ class TestInlineSuppression:
         stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=f"```json\n{findings}\n```")
         assert rc == 1
         assert "HIGH/CRITICAL findings" in stderr
-        assert "scan-pass written" not in stderr
+        assert "scan clean" not in stderr
         assert "HIGH/CRITICAL findings" in stderr
+
+
+def _findings_response(*findings):
+    return f"```json\n{json.dumps(list(findings))}\n```"
+
+
+_HIGH_798 = {
+    "severity": "HIGH",
+    "cwe": 798,
+    "cwe_name": "Hard-coded Creds",
+    "line": 1,
+    "explanation": "password in source",
+    "has_secret": True,
+}
+_CRIT_798 = {**_HIGH_798, "severity": "CRITICAL"}
+
+
+class TestShippingRulesMatchScanDiff:
+    """scan-staged.py must follow server.scan_diff's shipping rules (scan_gate)."""
+
+    def test_truncated_diff_writes_no_pass(self, tmp_path):
+        from scan_gate import MAX_CODE_CHARS
+
+        big = "\n".join(f"x{i} = {i}" for i in range(MAX_CODE_CHARS // 5)) + "\n"
+        _init_git_repo(tmp_path, staged_content=big)
+        stdout, stderr, rc = _run_scan_staged(tmp_path)
+        assert rc == 0
+        assert "truncated" in stderr
+        assert "scan clean" not in stderr
+        assert not scan_pass_path(tmp_path).exists()
+
+    def test_high_finding_removes_existing_pass(self, tmp_path):
+        _init_git_repo(tmp_path)
+        sp = scan_pass_path(tmp_path)
+        sp.write_text("stale-pass-hash")
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=_findings_response(_HIGH_798))
+        assert rc == 1
+        assert not sp.exists()
+
+    def test_armisignore_path_pattern_filters_before_api_call(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / ".armisignore").write_text("test.py\n")
+        # The staged test.py is excluded, so the HIGH finding the fake API would
+        # return is never requested -> clean scan, pass written.
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=_findings_response(_HIGH_798))
+        assert rc == 0
+        assert "excluded by .armisignore" in stderr
+        assert scan_pass_path(tmp_path).exists()
+
+    def test_deletion_only_diff_writes_no_pass(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
+        for k, v in (("user.email", "t@t.com"), ("user.name", "T")):
+            subprocess.run(["git", "config", k, v], cwd=str(tmp_path), check=True)
+        (tmp_path / "gone.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "gone.py"], cwd=str(tmp_path), check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"], cwd=str(tmp_path), capture_output=True, check=True
+        )
+        subprocess.run(["git", "rm", "-q", "gone.py"], cwd=str(tmp_path), check=True)
+
+        stdout, stderr, rc = _run_scan_staged(tmp_path)
+        assert rc == 0
+        assert "no staged changes to scan" in stderr
+        assert not scan_pass_path(tmp_path).exists()
+
+    def test_suppressed_critical_still_blocks(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / ".armisignore").write_text("cwe:798\n")
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=_findings_response(_CRIT_798))
+        assert rc == 1
+        assert not scan_pass_path(tmp_path).exists()
+
+    def test_suppressed_high_does_not_block(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / ".armisignore").write_text("cwe:798\n")
+        stdout, stderr, rc = _run_scan_staged(tmp_path, mock_response=_findings_response(_HIGH_798))
+        assert rc == 0
+        assert scan_pass_path(tmp_path).exists()
