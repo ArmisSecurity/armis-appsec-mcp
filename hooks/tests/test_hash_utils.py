@@ -75,13 +75,10 @@ class TestResolveScanPassPath:
         result = resolve_scan_pass_path()
         assert result == os.path.join(_expected_git_dir(git_repo), SCAN_PASS_BASENAME)
 
-    def test_not_a_git_repo_falls_back_to_plugin_dir(self, monkeypatch):
+    def test_not_a_git_repo_falls_back_to_plugin_dir(self, monkeypatch, tmp_path_factory):
         """Outside any git repo, fall back to the plugin install dir."""
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as isolated:
-            monkeypatch.chdir(isolated)
-            result = resolve_scan_pass_path()
+        monkeypatch.chdir(tmp_path_factory.mktemp("isolated"))
+        result = resolve_scan_pass_path()
         plugin_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         assert result == os.path.join(plugin_dir, SCAN_PASS_BASENAME)
 
@@ -285,12 +282,9 @@ class TestMergeOrRebaseInProgress:
         assert merge_or_rebase_in_progress() is False
         assert merge_or_rebase_in_progress(str(other)) is True
 
-    def test_false_outside_git_repo(self, monkeypatch):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as isolated:
-            monkeypatch.chdir(isolated)
-            assert merge_or_rebase_in_progress() is False
+    def test_false_outside_git_repo(self, monkeypatch, tmp_path_factory):
+        monkeypatch.chdir(tmp_path_factory.mktemp("isolated"))
+        assert merge_or_rebase_in_progress() is False
 
 
 class TestCleanupLegacyScanPass:
@@ -305,10 +299,7 @@ class TestCleanupLegacyScanPass:
         cleanup_legacy_scan_pass()
         assert not (git_repo / ".scan-pass").exists()
 
-    def test_noop_outside_git_repo(self, monkeypatch):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as isolated:
-            monkeypatch.chdir(isolated)
-            # No git repo → no toplevel → silently does nothing.
-            cleanup_legacy_scan_pass()
+    def test_noop_outside_git_repo(self, monkeypatch, tmp_path_factory):
+        monkeypatch.chdir(tmp_path_factory.mktemp("isolated"))
+        # No git repo → no toplevel → silently does nothing.
+        cleanup_legacy_scan_pass()

@@ -10,6 +10,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 
 import pytest
 
@@ -115,6 +116,7 @@ def _isolated_path(tmp_path, python_names):
     return str(bin_dir)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only stubs")
 def test_non_running_interpreter_is_not_chosen(plugin_dir, tmp_path):
     """The Microsoft Store python3 stub is on PATH but exits non-zero."""
     path = _isolated_path(tmp_path, {"python3": 49})
@@ -129,6 +131,7 @@ def test_non_running_interpreter_is_not_chosen(plugin_dir, tmp_path):
     assert "no working python3/python/py" in r.stderr
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only stubs")
 def test_working_interpreter_after_broken_one_is_chosen(plugin_dir, tmp_path):
     path = _isolated_path(tmp_path, {"python3": 49, "python": 0})
     r = subprocess.run(
@@ -142,6 +145,7 @@ def test_working_interpreter_after_broken_one_is_chosen(plugin_dir, tmp_path):
     assert "SERVER-STARTED" in r.stdout
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only stubs")
 def test_extensionless_run_entry_point_starts_server(plugin_dir):
     """.mcp.json launches `run`; it must hand over to run.sh from any CWD."""
     shutil.copy(os.path.join(_PLUGIN_ROOT, "run"), plugin_dir / "run")
