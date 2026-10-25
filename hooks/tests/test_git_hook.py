@@ -7,6 +7,7 @@ location, so we replicate the directory structure exactly.
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +18,17 @@ from conftest import scan_pass_path
 # Actual plugin root — used to copy hash_utils.py
 _PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _GIT_HOOK_SCRIPT = os.path.join(_PLUGIN_ROOT, "git-hooks", "pre-commit")
+
+
+def _bash():
+    """Git for Windows' bash; a bare `bash` on Windows may be WSL's or absent from PATH."""
+    found = shutil.which("bash")
+    if sys.platform == "win32":
+        git = shutil.which("git")
+        candidate = Path(git).parent.parent / "bin" / "bash.exe" if git else None
+        if candidate and candidate.is_file():
+            return str(candidate)
+    return found or "bash"
 
 
 def _link_python(link):
@@ -112,7 +124,7 @@ def _run_hook(tmp_path, installed_hook, env_override=None):
         env.update(env_override)
 
     result = subprocess.run(
-        ["bash", str(installed_hook)],
+        [_bash(), str(installed_hook)],
         capture_output=True,
         text=True,
         timeout=15,
