@@ -179,6 +179,7 @@ class TestWorktree:
                 f.write("deadbeef")
             assert os.path.isfile(result)
         finally:
+            monkeypatch.chdir(git_repo)  # Windows cannot remove the current directory
             _git(["worktree", "remove", "--force", str(worktree)], git_repo)
 
 

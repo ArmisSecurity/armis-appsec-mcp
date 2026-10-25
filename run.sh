@@ -22,17 +22,26 @@ venv_pip() {
     fi
 }
 
+# Probe each candidate instead of trusting its name: on Windows the Microsoft Store
+# "python3"/"python" App execution alias is on PATH but exits non-zero without running.
 # Native Windows Python installs commonly expose only "python", not "python3".
-PYTHON_BIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+PYTHON_BIN=""
 PYTHON_ARGS=""
+for _cand in python3 python; do
+    _path="$(command -v "$_cand" 2>/dev/null || true)"
+    if [ -n "$_path" ] && "$_path" -c 0 >/dev/null 2>&1; then
+        PYTHON_BIN="$_path"
+        break
+    fi
+done
 # Stock python.org Windows installs may register only the "py" launcher,
 # with neither "python3" nor "python" on PATH.
-if [ -z "$PYTHON_BIN" ] && command -v py >/dev/null 2>&1; then
+if [ -z "$PYTHON_BIN" ] && command -v py >/dev/null 2>&1 && py -3 -c 0 >/dev/null 2>&1; then
     PYTHON_BIN="py"
     PYTHON_ARGS="-3"
 fi
 if [ -z "$PYTHON_BIN" ]; then
-    echo "ERROR: no python3/python/py found on PATH." >&2
+    echo "ERROR: no working python3/python/py found on PATH." >&2
     exit 1
 fi
 
@@ -75,7 +84,7 @@ if [ "$NEEDS_INSTALL" -eq 1 ]; then
         echo "ERROR: no pip found in $VENV_DIR (checked bin/pip and Scripts/pip.exe) after venv creation." >&2
         exit 1
     fi
-    "$VENV_PIP" install -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
+    "$VENV_PIP" install --prefer-binary -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
     if [ -n "$REQS_HASH" ]; then
         printf '%s\n' "$REQS_HASH" > "$DEPS_SENTINEL"
     else

@@ -51,11 +51,31 @@ def test_powershell_hook_runs_under_powershell_with_stdout_protocol():
     assert "command -v" not in cmd  # no bash-only syntax
 
 
+def test_mcp_json_launches_extensionless_run_on_every_os():
+    with open(os.path.join(_ROOT, ".mcp.json")) as f:
+        command = json.load(f)["scanner"]["command"]
+    assert command == "${CLAUDE_PLUGIN_ROOT}/run"
+    # Windows resolves "run" to run.cmd (PATHEXT); POSIX executes the sh script.
+    assert os.access(os.path.join(_ROOT, "run"), os.X_OK)
+    with open(os.path.join(_ROOT, "run")) as f:
+        assert 'exec "$(dirname "$0")/run.sh"' in f.read()
+    with open(os.path.join(_ROOT, "run.cmd")) as f:
+        cmd = f.read()
+    assert "run.sh" in cmd and "bash.exe" in cmd
+    assert "CLAUDE_CODE_GIT_BASH_PATH" in cmd
+
+
 @pytest.mark.parametrize("matcher", ["Bash", "Write", "Edit"])
 def test_bash_form_hooks_fall_back_to_py_launcher(matcher):
     cmd = _by_matcher(matcher)["command"]
-    assert cmd.index("python3") < cmd.index("elif command -v python ") < cmd.index("py -3")
+    assert cmd.index("python3") < cmd.index("elif python -c 0 ") < cmd.index("py -3")
     assert "shell" not in _by_matcher(matcher)
+
+
+@pytest.mark.parametrize("matcher", ["Bash", "Write", "Edit"])
+def test_bash_form_hooks_probe_interpreter_not_name(matcher):
+    # The Microsoft Store python3/python stubs are on PATH but exit non-zero.
+    assert "command -v" not in _by_matcher(matcher)["command"]
 
 
 @pytest.mark.parametrize("path", _TEMPLATES, ids=os.path.basename)
@@ -63,10 +83,10 @@ def test_client_templates_fall_back_to_py_launcher(path):
     with open(path) as f:
         text = f.read()
     json.loads(text)
-    commands = re.findall(r'"(?:command|bash)": "([^"]*command -v python3[^"]*)"', text)
+    commands = re.findall(r'"(?:command|bash)": "([^"]*python3 -c 0[^"]*)"', text)
     assert commands, path
     for cmd in commands:
-        assert "elif command -v python " in cmd and "else py -3 " in cmd, cmd
+        assert "elif python -c 0 " in cmd and "else py -3 " in cmd, cmd
 
 
 def test_cursor_matcher_covers_windows_and_case_variants():
@@ -161,8 +181,23 @@ def test_hook_python_report(monkeypatch):
     sys.path.insert(0, _ROOT)
     import server
 
+    ran = subprocess.CompletedProcess([], 0)
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: ran)
     monkeypatch.setattr(server.shutil, "which", lambda n: "/x/py" if n == "py" else None)
     assert server._hook_python_report() == "Hook interpreter: py (/x/py)"
     monkeypatch.setattr(server.shutil, "which", lambda n: None)
     assert "NONE FOUND" in server._hook_python_report()
     assert "NOT gated" in server._hook_python_report()
+
+
+def test_hook_python_report_skips_store_stub(monkeypatch):
+    sys.path.insert(0, _ROOT)
+    import server
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 49 if "WindowsApps" in cmd[0] else 0)
+
+    paths = {"python3": "C:/WindowsApps/python3.exe", "python": "C:/Python312/python.exe"}
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setattr(server.shutil, "which", lambda n: paths.get(n))
+    assert server._hook_python_report() == "Hook interpreter: python (C:/Python312/python.exe)"

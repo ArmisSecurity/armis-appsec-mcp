@@ -98,3 +98,61 @@ def test_sso_opt_in_from_dotenv(plugin_dir):
     (plugin_dir / ".env").write_text('ARMIS_CLIENT_ID=i\nARMIS_DEFAULT_AUTH_METHOD="sso"\n')
     r = _run(plugin_dir)
     assert r.returncode == 0, r.stderr
+
+
+def _isolated_path(tmp_path, python_names):
+    """A PATH holding only the tools run.sh needs, plus stub interpreters."""
+    bin_dir = tmp_path / "isolated-bin"
+    bin_dir.mkdir()
+    for tool in ("dirname", "cat", "grep", "cut", "tr", "sha256sum", "shasum"):
+        found = shutil.which(tool)
+        if found:
+            (bin_dir / tool).symlink_to(found)
+    for name, code in python_names.items():
+        stub = bin_dir / name
+        stub.write_text(f"#!/bin/sh\nexit {code}\n")
+        stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    return str(bin_dir)
+
+
+def test_non_running_interpreter_is_not_chosen(plugin_dir, tmp_path):
+    """The Microsoft Store python3 stub is on PATH but exits non-zero."""
+    path = _isolated_path(tmp_path, {"python3": 49})
+    r = subprocess.run(
+        [shutil.which("bash"), str(plugin_dir / "run.sh")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"PATH": path},
+    )
+    assert r.returncode == 1
+    assert "no working python3/python/py" in r.stderr
+
+
+def test_working_interpreter_after_broken_one_is_chosen(plugin_dir, tmp_path):
+    path = _isolated_path(tmp_path, {"python3": 49, "python": 0})
+    r = subprocess.run(
+        [shutil.which("bash"), str(plugin_dir / "run.sh")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"PATH": path},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "SERVER-STARTED" in r.stdout
+
+
+def test_extensionless_run_entry_point_starts_server(plugin_dir):
+    """.mcp.json launches `run`; it must hand over to run.sh from any CWD."""
+    shutil.copy(os.path.join(_PLUGIN_ROOT, "run"), plugin_dir / "run")
+    (plugin_dir / "run").chmod(0o755)
+    r = subprocess.run(
+        [str(plugin_dir / "run")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(plugin_dir.parent),
+        env={k: v for k, v in os.environ.items() if not k.startswith(("ARMIS_", "APPSEC_"))},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "SERVER-STARTED" in r.stdout

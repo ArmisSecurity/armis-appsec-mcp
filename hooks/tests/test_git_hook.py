@@ -56,7 +56,7 @@ def _setup_plugin_structure(tmp_path):
 
     # Symlink the hook (mimics `make install-hooks`)
     installed_hook = hooks_dir / "pre-commit"
-    installed_hook.symlink_to("../../git-hooks/pre-commit")
+    installed_hook.symlink_to(os.path.join("..", "..", "git-hooks", "pre-commit"))
 
     return installed_hook
 

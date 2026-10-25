@@ -8,6 +8,7 @@ _plugin_dir = os.path.join(os.path.dirname(__file__), "..", "..")
 if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
 
+import suppression
 from suppression import (
     ArmisIgnoreConfig,
     _derive_category,
@@ -295,6 +296,33 @@ class TestIsPathExcluded:
         assert is_path_excluded(str(tmp_path / "lib" / "app.js"), config, git_root) is False
 
 
+class TestWindowsPathSemantics:
+    def test_directory_prefix_folds_case_when_filesystem_does(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(suppression, "_CASE_FOLDS", True)
+        config = ArmisIgnoreConfig(file_patterns=["vendor/"])
+        assert is_path_excluded(str(tmp_path / "Vendor" / "a.py"), config, str(tmp_path)) is True
+
+    def test_directory_prefix_is_case_sensitive_elsewhere(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(suppression, "_CASE_FOLDS", False)
+        config = ArmisIgnoreConfig(file_patterns=["vendor/"])
+        assert is_path_excluded(str(tmp_path / "Vendor" / "a.py"), config, str(tmp_path)) is False
+
+    def test_backslash_patterns_become_separators_on_windows(self, monkeypatch):
+        monkeypatch.setattr(suppression, "_BACKSLASH_IS_SEP", True)
+        config = _parse_armisignore_lines(["docs\\*.md\n", "build\\\n"])
+        assert config.file_patterns == ["docs/*.md", "build/"]
+
+    def test_backslash_patterns_untouched_elsewhere(self, monkeypatch):
+        monkeypatch.setattr(suppression, "_BACKSLASH_IS_SEP", False)
+        config = _parse_armisignore_lines(["docs\\*.md\n"])
+        assert config.file_patterns == ["docs\\*.md"]
+
+    def test_backslash_pattern_matches_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(suppression, "_BACKSLASH_IS_SEP", True)
+        config = _parse_armisignore_lines(["docs\\*.md\n"])
+        assert is_path_excluded(str(tmp_path / "docs" / "a.md"), config, str(tmp_path)) is True
+
+
 # ---------------------------------------------------------------------------
 # Category D: Edge cases — git root and load
 # ---------------------------------------------------------------------------
@@ -470,6 +498,11 @@ class TestFilterDiffExcludedPaths:
         assert result == ""
 
 
+def _same(a, b):
+    """git prints forward slashes on Windows; os.path.realpath does not."""
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
 class TestFindGitRootRealRepo:
     """Unmocked: a directory resolves to itself, a file to its parent's repo."""
 
@@ -484,13 +517,13 @@ class TestFindGitRootRealRepo:
     def test_directory_resolves_to_itself_not_parent(self, tmp_path):
         outer = self._init(tmp_path)  # enclosing repo
         inner = self._init(tmp_path / "inner")
-        assert find_git_root(from_path=inner) == inner
-        assert find_git_root(from_path=inner + "/") == inner
-        assert find_git_root(from_path=inner) != outer
+        assert _same(find_git_root(from_path=inner), inner)
+        assert _same(find_git_root(from_path=inner + "/"), inner)
+        assert not _same(find_git_root(from_path=inner), outer)
 
     def test_file_path_resolves_to_containing_repo(self, tmp_path):
         inner = self._init(tmp_path / "inner")
         (tmp_path / "inner" / "sub").mkdir()
         f = tmp_path / "inner" / "sub" / "a.py"
         f.write_text("x = 1\n")
-        assert find_git_root(from_path=str(f)) == inner
+        assert _same(find_git_root(from_path=str(f)), inner)

@@ -58,6 +58,23 @@ def load_armisignore(git_root: str | None) -> ArmisIgnoreConfig:
     return _parse_armisignore_lines(lines)
 
 
+_BACKSLASH_IS_SEP = os.sep == "\\"
+_CASE_FOLDS = os.path.normcase("A") == "a"
+
+
+def _normalize_separators(pattern: str) -> str:
+    """Treat '\\' as a path separator on Windows, where it is one.
+
+    Left alone elsewhere: gitignore uses backslash as an escape character.
+    """
+    return pattern.replace("\\", "/") if _BACKSLASH_IS_SEP else pattern
+
+
+def _fold_case(path: str) -> str:
+    """Fold case where the filesystem does (Windows); fnmatch already does this."""
+    return path.lower() if _CASE_FOLDS else path
+
+
 def _parse_armisignore_lines(lines: list[str]) -> ArmisIgnoreConfig:
     """Parse .armisignore lines into config. Pure logic, no I/O."""
     if len(lines) > _MAX_ARMISIGNORE_LINES:
@@ -92,6 +109,7 @@ def _parse_armisignore_lines(lines: list[str]) -> ArmisIgnoreConfig:
         elif line.startswith("rule:"):
             config.rule_ids.append(line[5:].strip())
         else:
+            line = _normalize_separators(line)
             if line in ("*", "**", "**/*"):
                 logger.warning(
                     ".armisignore: broad pattern %r may exclude all files from scanning",
@@ -161,8 +179,9 @@ def is_path_excluded(file_path: str, config: ArmisIgnoreConfig, git_root: str) -
     for pattern in config.file_patterns:
         if pattern.endswith("/"):
             # Directory prefix match
-            prefix = pattern  # e.g. "vendor/"
-            if rel_path.startswith(prefix) or rel_path == prefix.rstrip("/"):
+            prefix = _fold_case(pattern)  # e.g. "vendor/"
+            folded = _fold_case(rel_path)
+            if folded.startswith(prefix) or folded == prefix.rstrip("/"):
                 return True
         elif "/" in pattern:
             # Pattern contains path separator — match against full relative path

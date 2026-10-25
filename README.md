@@ -278,9 +278,12 @@ Then configure clients to connect via HTTP instead of launching a local process.
 
 ## Platform Support
 
-macOS and Linux are fully supported. On Windows, use WSL2 for Claude Code
-itself; for other MCP clients (Cursor, VS Code, etc.), `make setup` also
-supports launching natively via Git Bash — see `make setup CLIENT=...`.
+macOS and Linux are fully supported. On native Windows, Claude Code launches the
+plugin through `run.cmd`, which finds Git for Windows' `bash.exe` (Git for Windows
+is already required by Claude Code) and runs `run.sh`. Set `CLAUDE_CODE_GIT_BASH_PATH`
+if Git is installed somewhere unusual. WSL2 also works. For other MCP clients
+(Cursor, VS Code, etc.), `make setup` launches natively via Git Bash — see
+`make setup CLIENT=...`.
 
 ## Running Tests
 

@@ -92,12 +92,21 @@ def _hook_python_report() -> str:
     """Which interpreter the commit-gate hooks will find on PATH.
 
     The hook commands try python3, then python, then ``py -3`` (the Windows
-    launcher). A hook that can't start is a non-blocking error in Claude Code,
-    which silently disables the commit gate and the forgery guard, so report it.
+    launcher), taking the first that actually runs: the Microsoft Store
+    python3/python stubs are on PATH but exit non-zero. A hook that can't start
+    is a non-blocking error in Claude Code, which silently disables the commit
+    gate and the forgery guard, so report it.
     """
     for name in ("python3", "python", "py"):
         found = shutil.which(name)
-        if found:
+        if not found:
+            continue
+        probe = [found, "-3", "-c", "0"] if name == "py" else [found, "-c", "0"]
+        try:
+            ok = subprocess.run(probe, capture_output=True, timeout=10).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            ok = False
+        if ok:
             return f"Hook interpreter: {name} ({found})"
     return (
         "Hook interpreter: NONE FOUND on PATH (python3, python, py) -- the commit "

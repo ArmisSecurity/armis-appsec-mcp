@@ -1,0 +1,3 @@
+#!/bin/sh
+# Extensionless so .mcp.json can use one command on every OS; Windows resolves it to run.cmd.
+exec "$(dirname "$0")/run.sh" "$@"

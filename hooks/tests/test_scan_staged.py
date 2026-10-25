@@ -99,7 +99,7 @@ def _run_scan_staged(tmp_path, mock_response=None, mock_auth_error=None, env_ove
     """)
 
     wrapper_path = tmp_path / "_test_wrapper.py"
-    wrapper_path.write_text(wrapper)
+    wrapper_path.write_text(wrapper, encoding="utf-8")
 
     env = os.environ.copy()
     env["ARMIS_CLIENT_ID"] = "test-id"
@@ -296,7 +296,7 @@ class TestFailOpen:
         """)
 
         wrapper_path = tmp_path / "_test_exception.py"
-        wrapper_path.write_text(wrapper)
+        wrapper_path.write_text(wrapper, encoding="utf-8")
 
         env = os.environ.copy()
         env["ARMIS_CLIENT_ID"] = "test"
