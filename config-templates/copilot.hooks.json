@@ -4,7 +4,7 @@
     "preToolUse": [
       {
         "type": "command",
-        "bash": "sh \"/absolute/path/to/armis-appsec-mcp/hooks/run-hook.sh\" copilot_pre_tool.py",
+        "bash": ". \"/absolute/path/to/armis-appsec-mcp/hooks/find-python.sh\" && run_hook \"/absolute/path/to/armis-appsec-mcp/hooks/copilot_pre_tool.py\"",
         "matcher": "bash|powershell|create|edit",
         "timeoutSec": 10
       }

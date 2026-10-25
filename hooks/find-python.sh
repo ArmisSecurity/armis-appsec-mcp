@@ -1,4 +1,4 @@
-# Sourced by run.sh and hooks/run-hook.sh (POSIX sh). find_python sets PYTHON_BIN,
+# Sourced by run.sh and by every bash-form hook command (POSIX sh). find_python sets PYTHON_BIN,
 # plus PYTHON_ARGS=-3 for the py launcher, to the first interpreter that actually runs.
 #
 # Every PATH entry is tried, not just the first hit per name: on Windows the Microsoft
@@ -32,4 +32,15 @@ find_python() {
         PYTHON_ARGS=-3
     fi
     [ -n "$PYTHON_BIN" ]
+}
+
+# Hook entry point. The manifests source this file in the hook's own shell and call
+# run_hook, because the shell Claude Code starts may not have sh or dirname on PATH
+# (Git for Windows' usr/bin/bash.exe run without a login profile).
+run_hook() {
+    if ! find_python; then
+        echo "armis-appsec: no working python3/python/py on PATH; hook not run, commit gate is OFF." >&2
+        return 1
+    fi
+    exec "$PYTHON_BIN" $PYTHON_ARGS "$@"
 }

@@ -50,12 +50,18 @@ def test_powershell_hook_runs_under_powershell_with_stdout_protocol():
     assert "$input" in cmd  # hook JSON arrives on stdin
     assert "${CLAUDE_PLUGIN_ROOT}" in cmd
     assert "command -v" not in cmd  # no bash-only syntax
+    # A double-quoted `$s = "<path>"` lost its quotes and ran the .py by file association.
+    assert "$s = '${CLAUDE_PLUGIN_ROOT}/hooks/pre_commit_scan.py';" in cmd
 
 
 def test_powershell_hook_probes_every_path_match():
     # The Microsoft Store python/python3 stubs resolve by name but exit non-zero.
     cmd = _by_matcher("PowerShell")["command"]
-    assert "Get-Command $n -CommandType Application -All" in cmd
+    assert "foreach ($d in $env:Path -split ';')" in cmd
+    # Relative PATH entries (".") would run a python.exe from the user's repo.
+    assert "[IO.Path]::IsPathRooted($d)" in cmd
+    # Windows PowerShell 5.1 strips embedded double quotes from a native command's argument.
+    assert '"' not in cmd
     assert cmd.index("-c 0 *> $null") < cmd.index("$input |")
     assert cmd.index("'py'") < cmd.index("'python'") < cmd.index("'python3'")
 
@@ -90,14 +96,17 @@ def _commands(node):
 
 
 # Quoted, so a plugin path with a space (C:/Users/John Smith/...) stays one argument.
-_LAUNCHER = re.compile(r'sh "[^"]+/hooks/run-hook\.sh" \w+\.py')
+_LAUNCHER = re.compile(
+    r'\. "(?P<root>[^"]+)/hooks/find-python\.sh" && run_hook "(?P=root)/hooks/(?P<script>\w+\.py)"'
+)
 
 
 @pytest.mark.parametrize("matcher", ["Bash", "Write", "Edit"])
 def test_bash_form_hooks_go_through_the_launcher(matcher):
     hook = _by_matcher(matcher)
-    assert _LAUNCHER.fullmatch(hook["command"]), hook["command"]
-    assert hook["command"].startswith('sh "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh" ')
+    m = _LAUNCHER.fullmatch(hook["command"])
+    assert m, hook["command"]
+    assert m["root"] == "${CLAUDE_PLUGIN_ROOT}"
     assert "shell" not in hook
 
 
@@ -107,9 +116,9 @@ def test_client_templates_go_through_the_launcher(path):
         commands = list(_commands(json.load(f)))
     assert commands, path
     for cmd in commands:
-        assert _LAUNCHER.fullmatch(cmd), cmd
-        script = cmd.rsplit(" ", 1)[1]
-        assert os.path.isfile(os.path.join(_ROOT, "hooks", script)), script
+        m = _LAUNCHER.fullmatch(cmd)
+        assert m, cmd
+        assert os.path.isfile(os.path.join(_ROOT, "hooks", m["script"])), m["script"]
 
 
 @pytest.mark.skipif(git_bash() is None, reason="needs bash")
@@ -147,9 +156,7 @@ def test_manifest_command_runs_from_a_path_with_a_space(tmp_path, matcher):
 # CRLF checkouts (Git for Windows defaults to core.autocrlf=true)
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-@pytest.mark.parametrize(
-    "path", ["run.sh", "run", "git-hooks/pre-commit", "hooks/run-hook.sh", "hooks/find-python.sh"]
-)
+@pytest.mark.parametrize("path", ["run.sh", "run", "git-hooks/pre-commit", "hooks/find-python.sh"])
 def test_gitattributes_pins_bash_scripts_to_lf(path):
     r = subprocess.run(
         ["git", "check-attr", "eol", "--", path],

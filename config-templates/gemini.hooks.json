@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"/absolute/path/to/armis-appsec-mcp/hooks/run-hook.sh\" gemini_pre_tool.py",
+            "command": ". \"/absolute/path/to/armis-appsec-mcp/hooks/find-python.sh\" && run_hook \"/absolute/path/to/armis-appsec-mcp/hooks/gemini_pre_tool.py\"",
             "timeout": 10000
           }
         ]

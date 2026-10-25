@@ -1,4 +1,4 @@
-"""hooks/run-hook.sh: the launcher every bash-form hook command goes through."""
+"""run_hook in hooks/find-python.sh: every bash-form hook command goes through it."""
 
 import os
 import shutil
@@ -22,8 +22,7 @@ _ECHO_HOOK = "import sys; print(repr(sys.stdin.read()), sys.argv[1:])\n"
 def hooks_dir(tmp_path):
     d = tmp_path / "plugin" / "hooks"
     d.mkdir(parents=True)
-    for name in ("run-hook.sh", "find-python.sh"):
-        shutil.copy(os.path.join(_ROOT, "hooks", name), d)
+    shutil.copy(os.path.join(_ROOT, "hooks", "find-python.sh"), d)
     (d / "echo_hook.py").write_text(_ECHO_HOOK)
     return d
 
@@ -42,18 +41,16 @@ def _path_dir(tmp_path, name, pythons):
 
 
 def _run(hooks_dir, path, cwd=None):
-    tools = hooks_dir.parent.parent / "tools"
-    tools.mkdir(exist_ok=True)
-    if not (tools / "dirname").exists():
-        (tools / "dirname").symlink_to(shutil.which("dirname"))
+    """The manifest's command shape, with a PATH holding no tools at all."""
+    cmd = f'. "{hooks_dir}/find-python.sh" && run_hook "{hooks_dir}/echo_hook.py" --stdout-json'
     return subprocess.run(
-        [shutil.which("sh"), str(hooks_dir / "run-hook.sh"), "echo_hook.py", "--stdout-json"],
+        [shutil.which("sh"), "-c", cmd],
         input='{"tool_name": "Bash"}',
         capture_output=True,
         text=True,
         timeout=30,
         cwd=cwd,
-        env={"PATH": os.pathsep.join([*path, str(tools)])},
+        env={"PATH": os.pathsep.join(path)},
     )
 
 

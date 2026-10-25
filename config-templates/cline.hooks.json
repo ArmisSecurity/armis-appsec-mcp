@@ -4,7 +4,7 @@
     "PreToolUse": [
       {
         "type": "command",
-        "command": "sh \"/absolute/path/to/armis-appsec-mcp/hooks/run-hook.sh\" cline_pre_tool.py",
+        "command": ". \"/absolute/path/to/armis-appsec-mcp/hooks/find-python.sh\" && run_hook \"/absolute/path/to/armis-appsec-mcp/hooks/cline_pre_tool.py\"",
         "matcher": "execute_command|write_to_file|replace_in_file",
         "timeout": 10
       }
