@@ -7,6 +7,7 @@ location, so we replicate the directory structure exactly.
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 
@@ -77,7 +78,12 @@ def _init_git_repo(path):
     # Initial commit so HEAD exists
     (path / "init.txt").write_text("init")
     subprocess.run(["git", "add", "init.txt"], cwd=str(path), capture_output=True, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(path), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "--no-verify", "-m", "init"],
+        cwd=str(path),
+        capture_output=True,
+        check=True,
+    )
 
     # Stage a test file
     (path / "test.py").write_text("print('hello')\n")
@@ -101,7 +107,7 @@ def _run_hook(tmp_path, installed_hook, env_override=None):
         env.update(env_override)
 
     result = subprocess.run(
-        ["bash", str(installed_hook)],
+        [shutil.which("bash"), str(installed_hook)],
         capture_output=True,
         text=True,
         timeout=15,

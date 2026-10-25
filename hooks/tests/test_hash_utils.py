@@ -7,9 +7,11 @@ case is the one the old dual-resolver code got wrong (isdir vs exists), so it
 gets dedicated coverage here.
 """
 
+import contextlib
 import os
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -22,6 +24,21 @@ from hash_utils import (  # noqa: E402
     merge_or_rebase_in_progress,
     resolve_scan_pass_path,
 )
+
+
+@contextlib.contextmanager
+def _isolated_cwd(monkeypatch):
+    """chdir into a fresh non-repo temp dir, and back out before it is deleted.
+
+    Windows cannot remove a directory that is the process CWD.
+    """
+    origin = os.getcwd()
+    with tempfile.TemporaryDirectory() as isolated:
+        monkeypatch.chdir(isolated)
+        try:
+            yield isolated
+        finally:
+            os.chdir(origin)
 
 
 def _git(args, cwd):
@@ -77,10 +94,7 @@ class TestResolveScanPassPath:
 
     def test_not_a_git_repo_falls_back_to_plugin_dir(self, monkeypatch):
         """Outside any git repo, fall back to the plugin install dir."""
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as isolated:
-            monkeypatch.chdir(isolated)
+        with _isolated_cwd(monkeypatch):
             result = resolve_scan_pass_path()
         plugin_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         assert result == os.path.join(plugin_dir, SCAN_PASS_BASENAME)
@@ -179,6 +193,8 @@ class TestWorktree:
                 f.write("deadbeef")
             assert os.path.isfile(result)
         finally:
+            # Windows cannot remove a worktree that is the process CWD.
+            monkeypatch.chdir(git_repo)
             _git(["worktree", "remove", "--force", str(worktree)], git_repo)
 
 
@@ -285,10 +301,7 @@ class TestMergeOrRebaseInProgress:
         assert merge_or_rebase_in_progress(str(other)) is True
 
     def test_false_outside_git_repo(self, monkeypatch):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as isolated:
-            monkeypatch.chdir(isolated)
+        with _isolated_cwd(monkeypatch):
             assert merge_or_rebase_in_progress() is False
 
 
@@ -305,9 +318,6 @@ class TestCleanupLegacyScanPass:
         assert not (git_repo / ".scan-pass").exists()
 
     def test_noop_outside_git_repo(self, monkeypatch):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as isolated:
-            monkeypatch.chdir(isolated)
+        with _isolated_cwd(monkeypatch):
             # No git repo → no toplevel → silently does nothing.
             cleanup_legacy_scan_pass()

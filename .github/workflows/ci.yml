@@ -41,3 +41,64 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
+
+      - name: End-to-end smoke (run.sh, MCP stdio, commit gate)
+        run: python .github/scripts/smoke_e2e.py --log-dir smoke-logs
+
+      - name: Upload server log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log-linux
+          path: smoke-logs/
+
+  windows:
+    name: windows-${{ matrix.arch }} (Git Bash)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x64
+          - os: windows-11-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash  # Git Bash, the shell Claude Code uses on Windows
+    steps:
+      # Match a stock Git for Windows install, which checks files out with CRLF.
+      - name: Enable autocrlf
+        run: git config --global core.autocrlf true
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.arch }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ".[dev]"
+
+      - name: End-to-end smoke (run.sh, MCP stdio, commit gate)
+        timeout-minutes: 15
+        run: python .github/scripts/smoke_e2e.py --log-dir smoke-logs
+
+      - name: Tests
+        if: ${{ !cancelled() }}
+        run: pytest
+
+      - name: Upload server log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log-windows-${{ matrix.arch }}
+          path: |
+            smoke-logs/
+            logs/
