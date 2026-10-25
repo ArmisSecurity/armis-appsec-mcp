@@ -3,14 +3,14 @@
   "hooks": {
     "beforeShellExecution": [
       {
-        "command": "if python3 -c 0 >/dev/null 2>&1; then python3 \"/absolute/path/to/armis-appsec-mcp/hooks/cursor_pre_tool.py\"; elif python -c 0 >/dev/null 2>&1; then python \"/absolute/path/to/armis-appsec-mcp/hooks/cursor_pre_tool.py\"; else py -3 \"/absolute/path/to/armis-appsec-mcp/hooks/cursor_pre_tool.py\"; fi",
+        "command": "sh \"/absolute/path/to/armis-appsec-mcp/hooks/run-hook.sh\" cursor_pre_tool.py",
         "matcher": "\\b[Gg][Ii][Tt]\\b|\\b[Gg][Hh]\\b|[Ss][Cc][Aa][Nn]-[Pp]|[Aa][Rr][Mm][Ii][Ss]-~",
         "timeout": 10
       }
     ],
     "preToolUse": [
       {
-        "command": "if python3 -c 0 >/dev/null 2>&1; then python3 \"/absolute/path/to/armis-appsec-mcp/hooks/cursor_pre_tool.py\"; elif python -c 0 >/dev/null 2>&1; then python \"/absolute/path/to/armis-appsec-mcp/hooks/cursor_pre_tool.py\"; else py -3 \"/absolute/path/to/armis-appsec-mcp/hooks/cursor_pre_tool.py\"; fi",
+        "command": "sh \"/absolute/path/to/armis-appsec-mcp/hooks/run-hook.sh\" cursor_pre_tool.py",
         "matcher": "Write|Edit",
         "timeout": 5
       }

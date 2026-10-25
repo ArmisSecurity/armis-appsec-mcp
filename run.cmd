@@ -9,5 +9,8 @@ if not defined ARMIS_BASH (
     echo ERROR: Git for Windows bash.exe not found. Install Git for Windows or set CLAUDE_CODE_GIT_BASH_PATH. 1>&2
     exit /b 1
 )
-"%ARMIS_BASH%" "%~dp0run.sh" %*
+rem Forward slashes: run.sh takes PLUGIN_DIR from dirname "$0", which splits on "/" only.
+rem Not cd /d, since the server falls back to its CWD (the user's project) for repo paths.
+set "ARMIS_RUN_SH=%~dp0run.sh"
+"%ARMIS_BASH%" "%ARMIS_RUN_SH:\=/%" %*
 exit /b %ERRORLEVEL%

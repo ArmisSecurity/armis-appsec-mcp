@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,17 @@ if _hooks_dir not in sys.path:
 _tests_dir = os.path.dirname(__file__)
 if _tests_dir not in sys.path:
     sys.path.insert(0, _tests_dir)
+
+
+def git_bash():
+    """Git for Windows' bash; a bare `bash` on Windows may be WSL's or absent from PATH."""
+    found = shutil.which("bash")
+    if sys.platform == "win32":
+        git = shutil.which("git")
+        candidate = Path(git).parent.parent / "bin" / "bash.exe" if git else None
+        if candidate and candidate.is_file():
+            return str(candidate)
+    return found
 
 
 # A directory guaranteed to exist for the whole session — the repo root that

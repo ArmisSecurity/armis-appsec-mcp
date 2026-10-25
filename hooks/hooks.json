@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if python3 -c 0 >/dev/null 2>&1; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_commit_scan.py\"; elif python -c 0 >/dev/null 2>&1; then python \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_commit_scan.py\"; else py -3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_commit_scan.py\"; fi",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" pre_commit_scan.py",
             "timeout": 10
           }
         ]
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "shell": "powershell",
-            "command": "$p = 'python'; $a = @(); if (Get-Command py -ErrorAction SilentlyContinue) { $p = 'py'; $a = @('-3') } elseif (-not (Get-Command python -ErrorAction SilentlyContinue)) { $p = 'python3' }; $input | & $p @a \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_commit_scan.py\" --stdout-json; exit $LASTEXITCODE",
+            "command": "$s = \"${CLAUDE_PLUGIN_ROOT}/hooks/pre_commit_scan.py\"; $c = @(); foreach ($n in 'py', 'python', 'python3') { $c += @(Get-Command $n -CommandType Application -All -ErrorAction SilentlyContinue | ForEach-Object Source) }; foreach ($p in $c) { $a = @(); if ((Split-Path $p -Leaf) -like 'py.exe') { $a = @('-3') }; & $p @a -c 0 *> $null; if ($LASTEXITCODE -eq 0) { $input | & $p @a $s --stdout-json; exit $LASTEXITCODE } }; [Console]::Error.WriteLine('armis-appsec: no working py/python/python3 on PATH; hook not run, commit gate is OFF.'); exit 1",
             "timeout": 10
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if python3 -c 0 >/dev/null 2>&1; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/protect_scan_pass.py\"; elif python -c 0 >/dev/null 2>&1; then python \"${CLAUDE_PLUGIN_ROOT}/hooks/protect_scan_pass.py\"; else py -3 \"${CLAUDE_PLUGIN_ROOT}/hooks/protect_scan_pass.py\"; fi",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" protect_scan_pass.py",
             "timeout": 5
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if python3 -c 0 >/dev/null 2>&1; then python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/protect_scan_pass.py\"; elif python -c 0 >/dev/null 2>&1; then python \"${CLAUDE_PLUGIN_ROOT}/hooks/protect_scan_pass.py\"; else py -3 \"${CLAUDE_PLUGIN_ROOT}/hooks/protect_scan_pass.py\"; fi",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" protect_scan_pass.py",
             "timeout": 5
           }
         ]

@@ -22,6 +22,7 @@ _PRE_COMMIT = os.path.join(_ROOT, "hooks", "pre_commit_scan.py")
 
 sys.path.insert(0, os.path.join(_ROOT, "hooks"))
 import hook_core  # noqa: E402
+from conftest import git_bash  # noqa: E402
 
 
 def _entries():
@@ -51,6 +52,14 @@ def test_powershell_hook_runs_under_powershell_with_stdout_protocol():
     assert "command -v" not in cmd  # no bash-only syntax
 
 
+def test_powershell_hook_probes_every_path_match():
+    # The Microsoft Store python/python3 stubs resolve by name but exit non-zero.
+    cmd = _by_matcher("PowerShell")["command"]
+    assert "Get-Command $n -CommandType Application -All" in cmd
+    assert cmd.index("-c 0 *> $null") < cmd.index("$input |")
+    assert cmd.index("'py'") < cmd.index("'python'") < cmd.index("'python3'")
+
+
 def test_mcp_json_launches_extensionless_run_on_every_os():
     with open(os.path.join(_ROOT, ".mcp.json")) as f:
         command = json.load(f)["scanner"]["command"]
@@ -63,13 +72,8 @@ def test_mcp_json_launches_extensionless_run_on_every_os():
         cmd = f.read()
     assert "run.sh" in cmd and "bash.exe" in cmd
     assert "CLAUDE_CODE_GIT_BASH_PATH" in cmd
-
-
-@pytest.mark.parametrize("matcher", ["Bash", "Write", "Edit"])
-def test_bash_form_hooks_fall_back_to_py_launcher(matcher):
-    cmd = _by_matcher(matcher)["command"]
-    assert cmd.index("python3") < cmd.index("elif python -c 0 ") < cmd.index("py -3")
-    assert "shell" not in _by_matcher(matcher)
+    # run.sh's dirname "$0" splits on "/" only.
+    assert '"%ARMIS_RUN_SH:\\=/%"' in cmd
 
 
 def _commands(node):
@@ -85,33 +89,30 @@ def _commands(node):
             yield from _commands(item)
 
 
+# Quoted, so a plugin path with a space (C:/Users/John Smith/...) stays one argument.
+_LAUNCHER = re.compile(r'sh "[^"]+/hooks/run-hook\.sh" \w+\.py')
+
+
 @pytest.mark.parametrize("matcher", ["Bash", "Write", "Edit"])
-def test_bash_form_hooks_probe_interpreter_not_name(matcher):
-    # The Microsoft Store python3/python stubs are on PATH but exit non-zero.
-    assert "command -v" not in _by_matcher(matcher)["command"]
+def test_bash_form_hooks_go_through_the_launcher(matcher):
+    hook = _by_matcher(matcher)
+    assert _LAUNCHER.fullmatch(hook["command"]), hook["command"]
+    assert hook["command"].startswith('sh "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh" ')
+    assert "shell" not in hook
 
 
 @pytest.mark.parametrize("path", _TEMPLATES, ids=os.path.basename)
-def test_client_templates_fall_back_to_py_launcher(path):
+def test_client_templates_go_through_the_launcher(path):
     with open(path) as f:
-        cfg = json.load(f)
-    commands = [c for c in _commands(cfg) if "python3 -c 0" in c]
+        commands = list(_commands(json.load(f)))
     assert commands, path
     for cmd in commands:
-        assert "elif python -c 0 " in cmd and "else py -3 " in cmd, cmd
+        assert _LAUNCHER.fullmatch(cmd), cmd
+        script = cmd.rsplit(" ", 1)[1]
+        assert os.path.isfile(os.path.join(_ROOT, "hooks", script)), script
 
 
-@pytest.mark.parametrize("path", [_HOOKS_JSON, *_TEMPLATES], ids=os.path.basename)
-def test_hook_script_paths_are_quoted(path):
-    """A plugin path with a space (C:/Users/John Smith/...) must not split the command."""
-    with open(path) as f:
-        commands = [c for c in _commands(json.load(f)) if "python3 -c 0" in c]
-    assert commands, path
-    for cmd in commands:
-        assert len(re.findall(r'(?:python3|python|-3) "[^"]+\.py"', cmd)) == 3, cmd
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.skipif(git_bash() is None, reason="needs bash")
 @pytest.mark.parametrize("matcher", ["Bash", "Write"])
 def test_manifest_command_runs_from_a_path_with_a_space(tmp_path, matcher):
     root = tmp_path / "with space"
@@ -131,7 +132,7 @@ def test_manifest_command_runs_from_a_path_with_a_space(tmp_path, matcher):
     else:
         payload = {"tool_name": "Write", "tool_input": {"file_path": str(pass_file)}}
     r = subprocess.run(
-        ["bash", "-c", cmd],
+        [git_bash(), "-c", cmd],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
@@ -146,7 +147,9 @@ def test_manifest_command_runs_from_a_path_with_a_space(tmp_path, matcher):
 # CRLF checkouts (Git for Windows defaults to core.autocrlf=true)
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-@pytest.mark.parametrize("path", ["run.sh", "git-hooks/pre-commit"])
+@pytest.mark.parametrize(
+    "path", ["run.sh", "run", "git-hooks/pre-commit", "hooks/run-hook.sh", "hooks/find-python.sh"]
+)
 def test_gitattributes_pins_bash_scripts_to_lf(path):
     r = subprocess.run(
         ["git", "check-attr", "eol", "--", path],
@@ -246,27 +249,46 @@ def test_make_setup_without_mcp_template_still_prints_hooks(client):
 # ---------------------------------------------------------------------------
 # hook interpreter surfaced in debug_config
 # ---------------------------------------------------------------------------
-def test_hook_python_report(monkeypatch):
+def _fake_exe(directory, name):
+    directory.mkdir(parents=True, exist_ok=True)
+    exe = directory / (name + (".exe" if sys.platform == "win32" else ""))
+    exe.write_text("")
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def _report_names(report, expected_name, expected_path):
+    prefix = f"Hook interpreter: {expected_name} ("
+    assert report.startswith(prefix), report
+    assert os.path.normcase(report[len(prefix) : -1]) == os.path.normcase(expected_path)
+
+
+def test_hook_python_report(monkeypatch, tmp_path):
     sys.path.insert(0, _ROOT)
     import server
 
-    ran = subprocess.CompletedProcess([], 0)
-    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: ran)
-    monkeypatch.setattr(server.shutil, "which", lambda n: "/x/py" if n == "py" else None)
-    assert server._hook_python_report() == "Hook interpreter: py (/x/py)"
-    monkeypatch.setattr(server.shutil, "which", lambda n: None)
+    monkeypatch.setattr(
+        server.subprocess, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 0)
+    )
+    py = _fake_exe(tmp_path / "launcher", "py")
+    monkeypatch.setenv("PATH", str(tmp_path / "launcher"))
+    _report_names(server._hook_python_report(), "py", py)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     assert "NONE FOUND" in server._hook_python_report()
     assert "NOT gated" in server._hook_python_report()
 
 
-def test_hook_python_report_skips_store_stub(monkeypatch):
+def test_hook_python_report_skips_store_stub_earlier_on_path(monkeypatch, tmp_path):
     sys.path.insert(0, _ROOT)
     import server
 
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 49 if "WindowsApps" in cmd[0] else 0)
 
-    paths = {"python3": "C:/WindowsApps/python3.exe", "python": "C:/Python312/python.exe"}
+    stubs, real = tmp_path / "WindowsApps", tmp_path / "Python312"
+    _fake_exe(stubs, "python3")
+    _fake_exe(stubs, "python")
+    python3 = _fake_exe(real, "python3")
     monkeypatch.setattr(server.subprocess, "run", fake_run)
-    monkeypatch.setattr(server.shutil, "which", lambda n: paths.get(n))
-    assert server._hook_python_report() == "Hook interpreter: python (C:/Python312/python.exe)"
+    monkeypatch.setenv("PATH", os.pathsep.join([str(stubs), str(real)]))
+    _report_names(server._hook_python_report(), "python3", python3)

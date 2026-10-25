@@ -13,22 +13,11 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import scan_pass_path
+from conftest import git_bash, scan_pass_path
 
 # Actual plugin root — used to copy hash_utils.py
 _PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _GIT_HOOK_SCRIPT = os.path.join(_PLUGIN_ROOT, "git-hooks", "pre-commit")
-
-
-def _bash():
-    """Git for Windows' bash; a bare `bash` on Windows may be WSL's or absent from PATH."""
-    found = shutil.which("bash")
-    if sys.platform == "win32":
-        git = shutil.which("git")
-        candidate = Path(git).parent.parent / "bin" / "bash.exe" if git else None
-        if candidate and candidate.is_file():
-            return str(candidate)
-    return found or "bash"
 
 
 def _link_python(link):
@@ -66,15 +55,13 @@ def _setup_plugin_structure(tmp_path):
     hooks_dir = git_dir / "hooks"
     hooks_dir.mkdir(exist_ok=True)
 
-    # Copy the hook script and hash_utils.py as LF bytes: a CRLF checkout (Windows
-    # autocrlf) would otherwise leave "\r" in the bash script's lines.
+    # Copy the hook script as LF bytes: a CRLF checkout (Windows autocrlf) would
+    # otherwise leave "\r" in the bash script's lines.
     hook_dest = git_hooks_dir / "pre-commit"
     hook_dest.write_bytes(Path(_GIT_HOOK_SCRIPT).read_bytes().replace(b"\r\n", b"\n"))
     hook_dest.chmod(0o755)
-    hash_utils_src = Path(_PLUGIN_ROOT, "hash_utils.py").read_bytes()
-    (tmp_path / "hash_utils.py").write_bytes(hash_utils_src.replace(b"\r\n", b"\n"))
+    shutil.copy(os.path.join(_PLUGIN_ROOT, "hash_utils.py"), tmp_path / "hash_utils.py")
 
-    # Symlink python
     _link_python(venv_bin / "python")
 
     # Symlink the hook (mimics `make install-hooks`)
@@ -124,7 +111,7 @@ def _run_hook(tmp_path, installed_hook, env_override=None):
         env.update(env_override)
 
     result = subprocess.run(
-        [_bash(), str(installed_hook)],
+        [git_bash() or "bash", str(installed_hook)],
         capture_output=True,
         text=True,
         timeout=15,

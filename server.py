@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 # Ensure scanner_core is importable regardless of cwd
@@ -91,19 +92,24 @@ _runtime: dict[str, str] = {
 def _hook_python_report() -> str:
     """Which interpreter the commit-gate hooks will find on PATH.
 
-    The hook commands try python3, then python, then ``py -3`` (the Windows
-    launcher), taking the first that actually runs: the Microsoft Store
-    python3/python stubs are on PATH but exit non-zero. A hook that can't start
-    is a non-blocking error in Claude Code, which silently disables the commit
-    gate and the forgery guard, so report it.
+    Mirrors hooks/find-python.sh: python3, then python, in every absolute PATH
+    entry, then ``py -3`` (the Windows launcher), taking the first that actually
+    runs. The Microsoft Store python3/python stubs come early on PATH but exit
+    non-zero. A hook that can't start is a non-blocking error in Claude Code,
+    which silently disables the commit gate and the forgery guard, so report it.
     """
-    for name in ("python3", "python", "py"):
-        found = shutil.which(name)
+    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if os.path.isabs(d)]
+    candidates = [
+        (n, shutil.which(n, path=d), ["-c", "0"]) for n in ("python3", "python") for d in dirs
+    ]
+    candidates.append(("py", shutil.which("py"), ["-3", "-c", "0"]))
+    for name, found, probe_args in candidates:
         if not found:
             continue
-        probe = [found, "-3", "-c", "0"] if name == "py" else [found, "-c", "0"]
         try:
-            ok = subprocess.run(probe, capture_output=True, timeout=10).returncode == 0
+            ok = (
+                subprocess.run([found, *probe_args], capture_output=True, timeout=5).returncode == 0
+            )
         except (OSError, subprocess.SubprocessError):
             ok = False
         if ok:
@@ -112,6 +118,11 @@ def _hook_python_report() -> str:
         "Hook interpreter: NONE FOUND on PATH (python3, python, py) -- the commit "
         "gate and scan-pass guard hooks cannot run, so commits are NOT gated"
     )
+
+
+def _log_hook_python() -> None:
+    report = _hook_python_report()
+    (logger.warning if "NONE FOUND" in report else logger.info)("%s", report)
 
 
 def _credential_report() -> list[str]:
@@ -1323,8 +1334,9 @@ def main() -> None:
     logger.info("Log file: %s", _runtime["log_file"])
     for line in _credential_report():
         logger.info("%s", line)
-    hook_python = _hook_python_report()
-    (logger.warning if "NONE FOUND" in hook_python else logger.info)("%s", hook_python)
+    # The probes can take seconds on Windows; off the startup path so they never
+    # delay the MCP initialize handshake.
+    threading.Thread(target=_log_hook_python, name="hook-python-probe", daemon=True).start()
 
     try:
         init_auth(APPSEC_API_URL)

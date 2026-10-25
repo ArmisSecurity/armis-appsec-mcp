@@ -22,29 +22,6 @@ venv_pip() {
     fi
 }
 
-# Probe each candidate instead of trusting its name: on Windows the Microsoft Store
-# "python3"/"python" App execution alias is on PATH but exits non-zero without running.
-# Native Windows Python installs commonly expose only "python", not "python3".
-PYTHON_BIN=""
-PYTHON_ARGS=""
-for _cand in python3 python; do
-    _path="$(command -v "$_cand" 2>/dev/null || true)"
-    if [ -n "$_path" ] && "$_path" -c 0 >/dev/null 2>&1; then
-        PYTHON_BIN="$_path"
-        break
-    fi
-done
-# Stock python.org Windows installs may register only the "py" launcher,
-# with neither "python3" nor "python" on PATH.
-if [ -z "$PYTHON_BIN" ] && command -v py >/dev/null 2>&1 && py -3 -c 0 >/dev/null 2>&1; then
-    PYTHON_BIN="py"
-    PYTHON_ARGS="-3"
-fi
-if [ -z "$PYTHON_BIN" ]; then
-    echo "ERROR: no working python3/python/py found on PATH." >&2
-    exit 1
-fi
-
 # Compute a hash of requirements.txt to detect changes.
 REQS_HASH=""
 if command -v sha256sum >/dev/null 2>&1; then
@@ -73,6 +50,12 @@ if [ "$NEEDS_INSTALL" -eq 0 ]; then
 fi
 
 if [ "$NEEDS_INSTALL" -eq 1 ]; then
+    # Only a rebuild needs a system Python, so a healthy venv starts even when PATH has none.
+    . "$PLUGIN_DIR/hooks/find-python.sh"
+    if ! find_python; then
+        echo "ERROR: no working python3/python/py found on PATH." >&2
+        exit 1
+    fi
     # Remove existing venv entirely before recreating — re-running venv against an existing
     # directory with a different Python grafts a second lib/pythonX.Y tree while leaving
     # bin/python (or Scripts/python.exe) pointing at the original, causing
