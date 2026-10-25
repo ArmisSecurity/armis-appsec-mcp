@@ -58,15 +58,84 @@ def test_bash_form_hooks_fall_back_to_py_launcher(matcher):
     assert "shell" not in _by_matcher(matcher)
 
 
+def _commands(node):
+    """Every hook command string in a manifest, whatever the client's key name."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("command", "bash") and isinstance(value, str):
+                yield value
+            else:
+                yield from _commands(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _commands(item)
+
+
 @pytest.mark.parametrize("path", _TEMPLATES, ids=os.path.basename)
 def test_client_templates_fall_back_to_py_launcher(path):
     with open(path) as f:
-        text = f.read()
-    json.loads(text)
-    commands = re.findall(r'"(?:command|bash)": "([^"]*command -v python3[^"]*)"', text)
+        cfg = json.load(f)
+    commands = [c for c in _commands(cfg) if "command -v python3" in c]
     assert commands, path
     for cmd in commands:
         assert "elif command -v python " in cmd and "else py -3 " in cmd, cmd
+
+
+@pytest.mark.parametrize("path", [_HOOKS_JSON, *_TEMPLATES], ids=os.path.basename)
+def test_hook_script_paths_are_quoted(path):
+    """A plugin path with a space (C:/Users/John Smith/...) must not split the command."""
+    with open(path) as f:
+        commands = [c for c in _commands(json.load(f)) if "command -v python3" in c]
+    assert commands, path
+    for cmd in commands:
+        assert len(re.findall(r'(?:python3|python|-3) "[^"]+\.py"', cmd)) == 3, cmd
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("matcher", ["Bash", "Write"])
+def test_manifest_command_runs_from_a_path_with_a_space(tmp_path, matcher):
+    root = tmp_path / "with space"
+    shutil.copytree(
+        os.path.join(_ROOT, "hooks"), root / "hooks", ignore=shutil.ignore_patterns("tests")
+    )
+    for name in os.listdir(_ROOT):
+        if name.endswith(".py"):
+            shutil.copy(os.path.join(_ROOT, name), root / name)
+    cmd = _by_matcher(matcher)["command"].replace("${CLAUDE_PLUGIN_ROOT}", str(root))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    pass_file = repo / ".git" / "armis-scan-pass"
+    if matcher == "Bash":
+        payload = {"tool_name": "Bash", "tool_input": {"command": f"echo x > {pass_file}"}}
+    else:
+        payload = {"tool_name": "Write", "tool_input": {"file_path": str(pass_file)}}
+    r = subprocess.run(
+        ["bash", "-c", cmd],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        cwd=str(repo),
+    )
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert json.loads(r.stderr)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---------------------------------------------------------------------------
+# CRLF checkouts (Git for Windows defaults to core.autocrlf=true)
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+@pytest.mark.parametrize("path", ["run.sh", "git-hooks/pre-commit"])
+def test_gitattributes_pins_bash_scripts_to_lf(path):
+    r = subprocess.run(
+        ["git", "check-attr", "eol", "--", path],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert r.stdout.strip().endswith("eol: lf"), r.stdout
 
 
 def test_cursor_matcher_covers_windows_and_case_variants():
