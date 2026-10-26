@@ -287,6 +287,24 @@ def test_hook_python_report(monkeypatch, tmp_path):
     assert "NOT gated" in server._hook_python_report()
 
 
+def test_hook_python_report_probe_does_not_inherit_stdin(monkeypatch, tmp_path):
+    """On Windows a child inheriting the transport's stdin pipe hangs, so the probe must detach."""
+    sys.path.insert(0, _ROOT)
+    import server
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    _fake_exe(tmp_path / "launcher", "py")
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setenv("PATH", str(tmp_path / "launcher"))
+    server._hook_python_report()
+    assert seen["stdin"] is subprocess.DEVNULL
+
+
 def test_hook_python_report_skips_store_stub_earlier_on_path(monkeypatch, tmp_path):
     sys.path.insert(0, _ROOT)
     import server
