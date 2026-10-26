@@ -58,6 +58,23 @@ def load_armisignore(git_root: str | None) -> ArmisIgnoreConfig:
     return _parse_armisignore_lines(lines)
 
 
+_BACKSLASH_IS_SEP = os.sep == "\\"
+_CASE_FOLDS = os.path.normcase("A") == "a"
+
+
+def _normalize_separators(pattern: str) -> str:
+    """Treat '\\' as a path separator on Windows, where it is one.
+
+    Left alone elsewhere: gitignore uses backslash as an escape character.
+    """
+    return pattern.replace("\\", "/") if _BACKSLASH_IS_SEP else pattern
+
+
+def _fold_case(path: str) -> str:
+    """Fold case where the filesystem does (Windows); fnmatch already does this."""
+    return path.lower() if _CASE_FOLDS else path
+
+
 def _parse_armisignore_lines(lines: list[str]) -> ArmisIgnoreConfig:
     """Parse .armisignore lines into config. Pure logic, no I/O."""
     if len(lines) > _MAX_ARMISIGNORE_LINES:
@@ -92,6 +109,7 @@ def _parse_armisignore_lines(lines: list[str]) -> ArmisIgnoreConfig:
         elif line.startswith("rule:"):
             config.rule_ids.append(line[5:].strip())
         else:
+            line = _normalize_separators(line)
             if line in ("*", "**", "**/*"):
                 logger.warning(
                     ".armisignore: broad pattern %r may exclude all files from scanning",
@@ -148,31 +166,32 @@ def _match_parts(path_parts: list[str], pattern_parts: list[str]) -> bool:
 def is_path_excluded(file_path: str, config: ArmisIgnoreConfig, git_root: str) -> bool:
     """Check if a file path matches any exclusion pattern in the config.
 
-    Uses .gitignore-style semantics: '*' does not cross '/', '**' matches
-    zero or more directories. Trailing-slash patterns match directory prefixes.
+    Uses .gitignore-style semantics: '*' does not cross '/', '**' matches zero or
+    more directories, a leading or middle '/' anchors the pattern at the repo root,
+    and a pattern without one matches at any depth. A pattern that matches a
+    directory excludes everything under it.
     """
     if not config.file_patterns:
         return False
 
-    rel_path = os.path.relpath(file_path, git_root)
-    # Normalize to forward slashes for consistent matching
-    rel_path = rel_path.replace(os.sep, "/")
+    rel_path = os.path.relpath(file_path, git_root).replace(os.sep, "/")
+    parts = _fold_case(rel_path).split("/")
+    return any(_pattern_excludes(parts, _fold_case(p)) for p in config.file_patterns)
 
-    for pattern in config.file_patterns:
-        if pattern.endswith("/"):
-            # Directory prefix match
-            prefix = pattern  # e.g. "vendor/"
-            if rel_path.startswith(prefix) or rel_path == prefix.rstrip("/"):
-                return True
-        elif "/" in pattern:
-            # Pattern contains path separator — match against full relative path
-            if _fnmatch_gitignore(rel_path, pattern):
-                return True
-        else:
-            # No path separator — match against basename (like .gitignore)
-            if fnmatch.fnmatch(os.path.basename(rel_path), pattern):
-                return True
 
+def _pattern_excludes(parts: list[str], pattern: str) -> bool:
+    # A trailing '/' limits gitignore patterns to directories. Only the path is
+    # known here, not whether its last segment is a directory (scan_file of
+    # "vendor" itself), so it only drops out of the anchoring test.
+    pattern = pattern.rstrip("/")
+    anchored = "/" in pattern
+    pattern = pattern.lstrip("/")
+    for n in range(1, len(parts) + 1):
+        if anchored:
+            if _fnmatch_gitignore("/".join(parts[:n]), pattern):
+                return True
+        elif fnmatch.fnmatchcase(parts[n - 1], pattern):
+            return True
     return False
 
 

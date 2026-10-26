@@ -22,20 +22,6 @@ venv_pip() {
     fi
 }
 
-# Native Windows Python installs commonly expose only "python", not "python3".
-PYTHON_BIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
-PYTHON_ARGS=""
-# Stock python.org Windows installs may register only the "py" launcher,
-# with neither "python3" nor "python" on PATH.
-if [ -z "$PYTHON_BIN" ] && command -v py >/dev/null 2>&1; then
-    PYTHON_BIN="py"
-    PYTHON_ARGS="-3"
-fi
-if [ -z "$PYTHON_BIN" ]; then
-    echo "ERROR: no python3/python/py found on PATH." >&2
-    exit 1
-fi
-
 # Compute a hash of requirements.txt to detect changes.
 REQS_HASH=""
 if command -v sha256sum >/dev/null 2>&1; then
@@ -64,6 +50,12 @@ if [ "$NEEDS_INSTALL" -eq 0 ]; then
 fi
 
 if [ "$NEEDS_INSTALL" -eq 1 ]; then
+    # Only a rebuild needs a system Python, so a healthy venv starts even when PATH has none.
+    . "$PLUGIN_DIR/hooks/find-python.sh"
+    if ! find_python all; then
+        echo "ERROR: no working python3/python/py found on PATH." >&2
+        exit 1
+    fi
     # Remove existing venv entirely before recreating — re-running venv against an existing
     # directory with a different Python grafts a second lib/pythonX.Y tree while leaving
     # bin/python (or Scripts/python.exe) pointing at the original, causing
@@ -75,7 +67,7 @@ if [ "$NEEDS_INSTALL" -eq 1 ]; then
         echo "ERROR: no pip found in $VENV_DIR (checked bin/pip and Scripts/pip.exe) after venv creation." >&2
         exit 1
     fi
-    "$VENV_PIP" install -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
+    "$VENV_PIP" install --prefer-binary -r "$REQS_FILE" --quiet || { echo "ERROR: pip install failed. Check requirements.txt and network connectivity." >&2; exit 1; }
     if [ -n "$REQS_HASH" ]; then
         printf '%s\n' "$REQS_HASH" > "$DEPS_SENTINEL"
     else

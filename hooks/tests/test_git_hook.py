@@ -7,15 +7,32 @@ location, so we replicate the directory structure exactly.
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
-from conftest import scan_pass_path
+from conftest import git_bash, scan_pass_path
 
 # Actual plugin root — used to copy hash_utils.py
 _PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _GIT_HOOK_SCRIPT = os.path.join(_PLUGIN_ROOT, "git-hooks", "pre-commit")
+
+
+def _link_python(link):
+    """Point link at the running interpreter.
+
+    A Windows symlink named `python` (no .exe) cannot be executed, and a venv's
+    python.exe cannot be symlinked away from its pyvenv.cfg, so use an sh shim
+    around the base interpreter there. The hook only needs the stdlib.
+    """
+    if sys.platform == "win32":
+        base = getattr(sys, "_base_executable", sys.executable)
+        link.write_text(f'#!/bin/sh\nexec "{Path(base).as_posix()}" "$@"\n', newline="\n")
+        link.chmod(0o755)
+    else:
+        link.symlink_to(sys.executable)
 
 
 def _setup_plugin_structure(tmp_path):
@@ -38,25 +55,18 @@ def _setup_plugin_structure(tmp_path):
     hooks_dir = git_dir / "hooks"
     hooks_dir.mkdir(exist_ok=True)
 
-    # Copy the hook script
-    with open(_GIT_HOOK_SCRIPT) as f:
-        hook_src = f.read()
+    # Copy the hook script as LF bytes: a CRLF checkout (Windows autocrlf) would
+    # otherwise leave "\r" in the bash script's lines.
     hook_dest = git_hooks_dir / "pre-commit"
-    hook_dest.write_text(hook_src)
+    hook_dest.write_bytes(Path(_GIT_HOOK_SCRIPT).read_bytes().replace(b"\r\n", b"\n"))
     hook_dest.chmod(0o755)
+    shutil.copy(os.path.join(_PLUGIN_ROOT, "hash_utils.py"), tmp_path / "hash_utils.py")
 
-    # Copy hash_utils.py
-    with open(os.path.join(_PLUGIN_ROOT, "hash_utils.py")) as f:
-        hash_utils_src = f.read()
-    (tmp_path / "hash_utils.py").write_text(hash_utils_src)
-
-    # Symlink python
-    python_link = venv_bin / "python"
-    python_link.symlink_to(sys.executable)
+    _link_python(venv_bin / "python")
 
     # Symlink the hook (mimics `make install-hooks`)
     installed_hook = hooks_dir / "pre-commit"
-    installed_hook.symlink_to("../../git-hooks/pre-commit")
+    installed_hook.symlink_to(os.path.join("..", "..", "git-hooks", "pre-commit"))
 
     return installed_hook
 
@@ -101,7 +111,7 @@ def _run_hook(tmp_path, installed_hook, env_override=None):
         env.update(env_override)
 
     result = subprocess.run(
-        ["bash", str(installed_hook)],
+        [git_bash() or "bash", str(installed_hook)],
         capture_output=True,
         text=True,
         timeout=15,

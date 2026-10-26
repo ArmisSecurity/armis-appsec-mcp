@@ -2,3 +2,5 @@
 # ($'\r': command not found). Keep everything bash executes LF on checkout.
 *.sh text eol=lf
 git-hooks/pre-commit text eol=lf
+run text eol=lf
+run.cmd text eol=crlf

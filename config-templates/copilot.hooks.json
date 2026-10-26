@@ -4,7 +4,7 @@
     "preToolUse": [
       {
         "type": "command",
-        "bash": "if command -v python3 >/dev/null 2>&1; then python3 \"/absolute/path/to/armis-appsec-mcp/hooks/copilot_pre_tool.py\"; elif command -v python >/dev/null 2>&1; then python \"/absolute/path/to/armis-appsec-mcp/hooks/copilot_pre_tool.py\"; else py -3 \"/absolute/path/to/armis-appsec-mcp/hooks/copilot_pre_tool.py\"; fi",
+        "bash": ". \"/absolute/path/to/armis-appsec-mcp/hooks/find-python.sh\" && run_hook \"/absolute/path/to/armis-appsec-mcp/hooks/copilot_pre_tool.py\"",
         "matcher": "bash|powershell|create|edit",
         "timeoutSec": 10
       }
