@@ -109,8 +109,16 @@ def _hook_python_report() -> str:
         if not found:
             continue
         try:
+            # DEVNULL: on Windows a child inheriting the stdio transport's stdin pipe hangs
+            # while the server is reading it, so the probe timed out and reported a false failure.
             ok = (
-                subprocess.run([found, *probe_args], capture_output=True, timeout=5).returncode == 0
+                subprocess.run(
+                    [found, *probe_args],
+                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=5,
+                ).returncode
+                == 0
             )
         except (OSError, subprocess.SubprocessError):
             ok = False
