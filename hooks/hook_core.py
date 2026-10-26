@@ -94,10 +94,13 @@ _PATH_PREFIX = r"(?:\"[^\"]*[/\\]|'[^']*[/\\]|[^\s;&|()<>\"']*[/\\])?"
 # `git` / `gh`, optionally `.exe`, optionally closing a quote opened before it.
 _GIT_BIN = r"(?i:git(?:\.exe)?)['\"]?"
 _GH_BIN = r"(?i:gh(?:\.exe)?)['\"]?"
+# A separate-token option value: quoted (may hold spaces, `-C "C:/My Repo"`;
+# unquoted, `git -C "a b" commit` was not seen as a commit at all) or non-dash.
+_OPT_VALUE = r"(?:\"[^\"]*\"|'[^']*'|[^-\s]\S*)"
 # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
 _GIT_GLOBAL_OPTS = (
     # armis:ignore cwe:400 reason: provably linear (non-dash values); see TestRegexComplexity
-    r"(?:(?:--\S+\s+[^-\s]\S*|--\S+|-[A-Za-z]\s+[^-\s]\S*|-[A-Za-z]\S*)\s+)*"
+    rf"(?:(?:--\S+\s+{_OPT_VALUE}|--\S+|-[A-Za-z]\s+{_OPT_VALUE}|-[A-Za-z]\S*)\s+)*"
 )
 
 _GIT_PREFIX = (
@@ -230,17 +233,67 @@ _SCAN_PASS_WRITE_PATTERN = re.compile(
 
 def _is_shipping_command(cmd: str) -> bool:
     """Check if the command matches any git shipping pattern."""
-    return any(p.search(cmd) for p in GIT_SHIPPING_PATTERNS)
+    return _is_commit(cmd) or _is_push_or_pr(cmd)
 
 
 def _is_commit(cmd: str) -> bool:
     """Check if the command contains a git commit."""
-    return bool(_COMMIT_PATTERN.search(cmd))
+    return bool(_COMMIT_PATTERN.search(cmd)) or _invokes(cmd, "commit")
 
 
 def _is_push_or_pr(cmd: str) -> bool:
     """Check if the command is a git push or gh pr create."""
-    return any(p.search(cmd) for p in _PUSH_PR_PATTERNS)
+    return any(p.search(cmd) for p in _PUSH_PR_PATTERNS) or _invokes(cmd, "push")
+
+
+_WRAPPERS = frozenset(
+    {"sudo", "command", "exec", "builtin", "nice", "time", "timeout", "xargs", "stdbuf"}
+    | {"nohup", "setsid", "doas", "env"}
+)
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _invokes(cmd: str, subcommand: str) -> bool:
+    """Tokenized check for ``git … <subcommand>`` at command position
+    (``"push"`` also covers ``gh … pr create``).
+
+    Backs up the shipping regexes, which see shell text, not words: they miss
+    quoted global options (``git "--git-dir=/r/.git" commit``,
+    ``git -C "a b" commit``), which would skip the gate entirely.
+    """
+    words = _shell_words(cmd)
+    if not words:
+        return False
+    at_command, wrapped = True, False
+    i, n = 0, len(words)
+    while i < n:
+        text, is_op = words[i]
+        i += 1
+        if is_op:
+            if "<" in text or ">" in text:
+                i += 1 if i < n and not words[i][1] else 0  # redirect target
+                continue
+            at_command, wrapped = True, False
+            continue
+        if not at_command:
+            continue
+        if _is_git_binary(text):
+            while i < n and not words[i][1] and words[i][0].startswith("-"):
+                i += 2 if words[i][0] in _GIT_GLOBAL_VALUE_OPTS else 1
+            if i < n and words[i] == (subcommand, False):
+                return True
+        elif _is_gh_binary(text) and subcommand == "push":
+            while i < n and not words[i][1] and words[i][0].startswith("-"):
+                i += 2 if words[i][0] in _GH_VALUE_OPTS else 1
+            if words[i : i + 2] == [("pr", False), ("create", False)]:
+                return True
+        elif _ASSIGNMENT.match(text) or text in _WRAPPERS:
+            wrapped = wrapped or text in _WRAPPERS
+            continue
+        elif wrapped:
+            continue  # a wrapper's own options and values (`sudo -u root git …`)
+        at_command = False
+    return False
 
 
 def _has_all_flag(cmd: str) -> bool:
@@ -291,9 +344,9 @@ def is_scan_pass_file(file_path: str) -> bool:
 # forever. Delegating to git removes that whole class of bug.
 
 
-def _has_matching_scan_pass() -> bool:
+def _has_matching_scan_pass(repo_path: str | None = None) -> bool:
     """Check if the scan-pass hash matches current staged changes."""
-    scan_pass_path = resolve_scan_pass_path()
+    scan_pass_path = resolve_scan_pass_path(repo_path)
     try:
         if not os.path.isfile(scan_pass_path):
             return False
@@ -301,7 +354,7 @@ def _has_matching_scan_pass() -> bool:
             stored_hash = f.read().strip()
         if not stored_hash:
             return False
-        current_hash = compute_staged_hash()
+        current_hash = compute_staged_hash(repo_path)
         if not current_hash:
             return False
         return stored_hash == current_hash
@@ -312,9 +365,9 @@ def _has_matching_scan_pass() -> bool:
         return False
 
 
-def _has_scan_pass_for_push() -> bool:
+def _has_scan_pass_for_push(repo_path: str | None = None) -> bool:
     """For push/PR: check that a scan-pass file exists."""
-    scan_pass_path = resolve_scan_pass_path()
+    scan_pass_path = resolve_scan_pass_path(repo_path)
     try:
         return os.path.isfile(scan_pass_path)
     except OSError:
@@ -670,6 +723,108 @@ def _commit_arg_problem(args: list[str]) -> str:
     return ""
 
 
+_MSYS_DRIVE = re.compile(r"^/([A-Za-z])(?=/|$)")
+
+
+def _resolve_dir(cwd: str, target: str) -> str | None:
+    """Absolute directory for ``cd <target>`` / ``git -C <target>``, or None
+    when it depends on the shell (``$VAR``, ``cd -``)."""
+    if not target or target.startswith("-") or "$" in target or "`" in target:
+        return None
+    if sys.platform == "win32":
+        # Git Bash spells C:\x as /c/x; native Python can't resolve that.
+        target = _MSYS_DRIVE.sub(lambda m: f"{m.group(1)}:", target)
+    # A missing directory needs no check here: git fails there, the staged hash
+    # is empty, and the gate denies.
+    return os.path.abspath(os.path.join(cwd, os.path.expanduser(target)))
+
+
+# Words that change the shell's directory. Only a `cd <dir>` at command position
+# in an all-&& chain is followed; any other occurrence makes the directory unknown.
+_DIR_CHANGERS = frozenset(
+    {"cd", "pushd", "popd", "chdir", "set-location", "sl", "push-location", "pop-location"}
+)
+_GH_VALUE_OPTS = frozenset({"-R", "--repo"})
+
+
+def _is_gh_binary(word: str) -> bool:
+    name = word.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    return name in ("gh", "gh.exe")
+
+
+def _git_work_dirs(cmd: str, subcommand: str, base: str) -> list[str] | str:
+    """The directory each ``git … <subcommand>`` in ``cmd`` runs in.
+
+    ``subcommand`` is ``"commit"`` or ``"push"`` (which also covers
+    ``gh pr create``). The gate reads the staged hash and scan-pass of the repo
+    the command acts on, not the hook's own CWD: otherwise a pass for this repo
+    would let ``git -C /other commit`` record /other's unscanned index. Follows
+    ``git -C`` and ``cd <dir>`` chained with ``&&`` (sequential, so the cwd is
+    known). Returns a description of the problem instead when the directory
+    can't be known: any other directory change before the command, an
+    unresolvable directory, or ``--git-dir`` / ``--work-tree``.
+    """
+    words = _shell_words(cmd)
+    if words is None:
+        return "the command could not be parsed"
+    dirs: list[str] = []
+    cwd = base
+    chained = True  # every separator so far was &&
+    at_command = True
+    i, n = 0, len(words)
+    while i < n:
+        text, is_op = words[i]
+        i += 1
+        if is_op:
+            if "<" in text or ">" in text:
+                if i < n and not words[i][1]:
+                    i += 1  # redirect target
+                continue
+            chained = chained and text == "&&"
+            if not chained and cwd != base:
+                cwd = ""  # after `cd X;` or `cd X ||` the cwd depends on whether cd failed
+            at_command = True
+            continue
+        command_position, at_command = at_command, False
+        if text.casefold() in _DIR_CHANGERS:
+            follow = command_position and chained and text == "cd"
+            target = words[i][0] if i < n and not words[i][1] else ""
+            resolved = _resolve_dir(cwd, target) if follow and cwd else None
+            cwd = resolved or ""  # "" = unknown from here on
+            if resolved:
+                i += 1
+            continue
+        if _is_gh_binary(text) and subcommand == "push":
+            k = i
+            while k < n and not words[k][1] and words[k][0].startswith("-"):
+                k += 2 if words[k][0] in _GH_VALUE_OPTS else 1
+            if words[k : k + 2] == [("pr", False), ("create", False)]:
+                if not cwd:
+                    return "a directory change the gate cannot follow"
+                dirs.append(cwd)
+            continue
+        if not _is_git_binary(text):
+            continue
+        work_dir = cwd
+        redirected = ""
+        while i < n and not words[i][1] and words[i][0].startswith("-"):
+            opt = words[i][0]
+            if opt.split("=", 1)[0] in ("--git-dir", "--work-tree"):
+                redirected = opt.split("=", 1)[0]
+            if opt == "-C":
+                value = words[i + 1][0] if i + 1 < n and not words[i + 1][1] else ""
+                work_dir = (_resolve_dir(work_dir, value) or "") if work_dir else ""
+            i += 2 if opt in _GIT_GLOBAL_VALUE_OPTS else 1
+        if i >= n or words[i] != (subcommand, False):
+            continue
+        if redirected:
+            return f"'{redirected}' points git at a different repository"
+        if not work_dir:
+            return "a directory change the gate cannot follow"
+        dirs.append(work_dir)
+    return dirs
+
+
 def _index_changing_commit(cmd: str) -> str:
     """Return why this commit command would record more than the scanned
     index, or "" if it records the index exactly as the gate hashed it.
@@ -791,6 +946,16 @@ def build_index_change_message(problem: str, repo_path: str | None = None) -> st
     )
 
 
+def build_work_dir_message(problem: str) -> str:
+    """Deny message for a shipping command whose repository can't be determined."""
+    return (
+        f"BLOCKED: the security gate can't tell which repository this command acts "
+        f"on ({problem}), so it can't check that repository's scan. Run it as "
+        f"`git -C <repo> <command>` or `cd <repo> && git <command>`, after "
+        f"scan_diff(staged=True, repo_path='<repo>')."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main gate logic
 # ---------------------------------------------------------------------------
@@ -812,14 +977,29 @@ def check_gate(cmd: str) -> GateResult:
     # A commit in the command is checked even when a push/PR follows it
     # (`git add -A && git commit … && git push`): the push branch only checks
     # that a pass exists, which would wave through an unscanned commit.
+    base = os.getcwd()
     if _is_commit(cmd):
         problem = _index_changing_commit(cmd)
         if problem:
             return GateResult("deny", build_index_change_message(problem))
-        if not _has_matching_scan_pass():
-            return GateResult("deny", build_system_message(cmd))
+        work_dirs = _git_work_dirs(cmd, "commit", base)
+        if isinstance(work_dirs, str):
+            return GateResult("deny", build_work_dir_message(work_dirs))
+        for work_dir in work_dirs or [base]:
+            if not _has_matching_scan_pass(work_dir):
+                return GateResult("deny", _system_message_for(cmd, work_dir))
 
-    if _is_push_or_pr(cmd) and not _has_scan_pass_for_push():
-        return GateResult("deny", build_system_message(cmd))
+    if _is_push_or_pr(cmd):
+        work_dirs = _git_work_dirs(cmd, "push", base)
+        if isinstance(work_dirs, str):
+            return GateResult("deny", build_work_dir_message(work_dirs))
+        # `gh pr create` has no git invocation; it runs in the hook's CWD.
+        for work_dir in work_dirs or [base]:
+            if not _has_scan_pass_for_push(work_dir):
+                return GateResult("deny", _system_message_for(cmd, work_dir))
 
     return GateResult("allow", "")
+
+
+def _system_message_for(cmd: str, work_dir: str) -> str:
+    return build_system_message(cmd, repo_path=resolve_repo_toplevel(work_dir) or work_dir)
