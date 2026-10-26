@@ -60,6 +60,8 @@ def test_powershell_hook_probes_every_path_match():
     assert "foreach ($d in $env:Path -split ';')" in cmd
     # Relative PATH entries (".") would run a python.exe from the user's repo.
     assert "[IO.Path]::IsPathRooted($d)" in cmd
+    # Only WindowsApps candidates are probed; anything else starts once per tool call.
+    assert "if ($p -match '[\\\\/]WindowsApps[\\\\/]') { & $p @a -c 0" in cmd
     # Windows PowerShell 5.1 strips embedded double quotes from a native command's argument.
     assert '"' not in cmd
     assert cmd.index("-c 0 *> $null") < cmd.index("$input |")
@@ -299,3 +301,20 @@ def test_hook_python_report_skips_store_stub_earlier_on_path(monkeypatch, tmp_pa
     monkeypatch.setattr(server.subprocess, "run", fake_run)
     monkeypatch.setenv("PATH", os.pathsep.join([str(stubs), str(real)]))
     _report_names(server._hook_python_report(), "python3", python3)
+
+
+def test_hook_python_report_flags_a_broken_first_match_outside_windowsapps(monkeypatch, tmp_path):
+    """The hooks exec it without probing, so the gate is off; say so instead of skipping it."""
+    sys.path.insert(0, _ROOT)
+    import server
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 127 if "pyenv" in cmd[0] else 0)
+
+    shims, real = tmp_path / "pyenv" / "shims", tmp_path / "usr-bin"
+    _fake_exe(shims, "python3")
+    _fake_exe(real, "python3")
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(shims), str(real)]))
+    report = server._hook_python_report()
+    assert "does NOT run" in report and "NOT gated" in report, report

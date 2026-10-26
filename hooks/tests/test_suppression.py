@@ -4,6 +4,8 @@ import os
 import sys
 from unittest.mock import patch
 
+import pytest
+
 _plugin_dir = os.path.join(os.path.dirname(__file__), "..", "..")
 if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
@@ -294,6 +296,38 @@ class TestIsPathExcluded:
         )
         # Does NOT match outside src/
         assert is_path_excluded(str(tmp_path / "lib" / "app.js"), config, git_root) is False
+
+
+class TestGitignoreAnchoring:
+    def _excluded(self, tmp_path, pattern, rel):
+        config = ArmisIgnoreConfig(file_patterns=[pattern])
+        return is_path_excluded(str(tmp_path.joinpath(*rel.split("/"))), config, str(tmp_path))
+
+    @pytest.mark.parametrize(
+        ("pattern", "rel", "expected"),
+        [
+            ("/vendor/", "vendor/a.py", True),
+            ("/vendor/", "lib/vendor/a.py", False),
+            ("/docs/*.md", "docs/a.md", True),
+            ("/docs/*.md", "lib/docs/a.md", False),
+            ("/build", "build/out/x.js", True),
+            ("vendor/", "a/vendor/b.py", True),
+            ("vendor", "a/vendor/b.py", True),
+            ("a/vendor/", "a/vendor/b.py", True),
+            ("a/vendor/", "x/a/vendor/b.py", False),
+            ("docs/*", "docs/sub/a.md", True),
+            ("*.min.js", "web/vendor/app.min.js", True),
+            ("vendor/", "src/vendorized.py", False),
+        ],
+    )
+    def test_gitignore_semantics(self, tmp_path, pattern, rel, expected):
+        assert self._excluded(tmp_path, pattern, rel) is expected
+
+    def test_anchored_backslash_pattern_on_windows(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(suppression, "_BACKSLASH_IS_SEP", True)
+        config = _parse_armisignore_lines(["\\vendor\\\n"])
+        assert config.file_patterns == ["/vendor/"]
+        assert is_path_excluded(str(tmp_path / "vendor" / "a.py"), config, str(tmp_path)) is True
 
 
 class TestWindowsPathSemantics:

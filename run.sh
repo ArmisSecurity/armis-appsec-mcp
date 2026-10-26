@@ -52,7 +52,7 @@ fi
 if [ "$NEEDS_INSTALL" -eq 1 ]; then
     # Only a rebuild needs a system Python, so a healthy venv starts even when PATH has none.
     . "$PLUGIN_DIR/hooks/find-python.sh"
-    if ! find_python; then
+    if ! find_python all; then
         echo "ERROR: no working python3/python/py found on PATH." >&2
         exit 1
     fi

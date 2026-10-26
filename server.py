@@ -90,13 +90,15 @@ _runtime: dict[str, str] = {
 
 
 def _hook_python_report() -> str:
-    """Which interpreter the commit-gate hooks will find on PATH.
+    """Which interpreter the commit-gate hooks will pick from PATH, and whether it runs.
 
-    Mirrors hooks/find-python.sh: python3, then python, in every absolute PATH
-    entry, then ``py -3`` (the Windows launcher), taking the first that actually
-    runs. The Microsoft Store python3/python stubs come early on PATH but exit
-    non-zero. A hook that can't start is a non-blocking error in Claude Code,
-    which silently disables the commit gate and the forgery guard, so report it.
+    Mirrors hooks/find-python.sh: the first python3, then python, in an absolute
+    PATH entry, passing over WindowsApps candidates that don't run (the Microsoft
+    Store stubs), then ``py -3`` (the Windows launcher). Outside WindowsApps the
+    hooks take the first match without probing it, so a broken one there (a stale
+    pyenv shim) is reported, not skipped. A hook that can't start is a non-blocking
+    error in Claude Code, which silently disables the commit gate and the forgery
+    guard, so report it.
     """
     dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if os.path.isabs(d)]
     candidates = [
@@ -114,6 +116,14 @@ def _hook_python_report() -> str:
             ok = False
         if ok:
             return f"Hook interpreter: {name} ({found})"
+        in_windows_apps = any(
+            part.lower() == "windowsapps" for part in re.split(r"[\\/]", os.path.dirname(found))
+        )
+        if not in_windows_apps:
+            return (
+                f"Hook interpreter: {name} ({found}) does NOT run -- the commit gate and "
+                "scan-pass guard hooks fail, so commits are NOT gated"
+            )
     return (
         "Hook interpreter: NONE FOUND on PATH (python3, python, py) -- the commit "
         "gate and scan-pass guard hooks cannot run, so commits are NOT gated"
@@ -122,7 +132,7 @@ def _hook_python_report() -> str:
 
 def _log_hook_python() -> None:
     report = _hook_python_report()
-    (logger.warning if "NONE FOUND" in report else logger.info)("%s", report)
+    (logger.warning if "NOT gated" in report else logger.info)("%s", report)
 
 
 def _credential_report() -> list[str]:
@@ -1308,6 +1318,10 @@ def main() -> None:
     log_file = setup_logging(_plugin_dir, level)
     install_exception_hooks()
     _runtime["log_file"] = log_file or "none"
+    # The probes can take seconds on Windows; off the startup path so they never
+    # delay the MCP initialize handshake.
+    hook_probe = threading.Thread(target=_log_hook_python, name="hook-python-probe", daemon=True)
+    hook_probe.start()
 
     # Before any httpx client exists: every call site builds its client per
     # request and reads the ssl module + env (trust_env) at that point.
@@ -1334,9 +1348,6 @@ def main() -> None:
     logger.info("Log file: %s", _runtime["log_file"])
     for line in _credential_report():
         logger.info("%s", line)
-    # The probes can take seconds on Windows; off the startup path so they never
-    # delay the MCP initialize handshake.
-    threading.Thread(target=_log_hook_python, name="hook-python-probe", daemon=True).start()
 
     try:
         init_auth(APPSEC_API_URL)
@@ -1346,6 +1357,9 @@ def main() -> None:
     transport = os.environ.get("APPSEC_TRANSPORT", "stdio")
     # An exception escaping mcp.run() reaches the excepthook installed above.
     mcp.run(transport=transport)  # type: ignore[arg-type]
+    # A short-lived session (a client health check) ends before the probe does;
+    # wait briefly so its line still reaches the log.
+    hook_probe.join(timeout=3)
     logger.info("MCP server stopped")
 
 

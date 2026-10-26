@@ -81,3 +81,16 @@ def test_relative_path_entries_are_not_searched(hooks_dir, tmp_path):
     r = _run(hooks_dir, ["", ".", real_dir], cwd=str(repo))
     assert r.returncode == 0, r.stderr
     assert not marker.exists()
+
+
+def test_a_candidate_outside_windowsapps_starts_once(hooks_dir, tmp_path):
+    """No `-c 0` probe on the hook path: every tool call would pay a second Python start."""
+    log = tmp_path / "starts.log"
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    counting = real_dir / "python3"
+    counting.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\nexec "{sys.executable}" "$@"\n')
+    counting.chmod(counting.stat().st_mode | stat.S_IXUSR)
+    r = _run(hooks_dir, [str(real_dir), os.path.dirname(shutil.which("cat"))])
+    assert r.returncode == 0, r.stderr
+    assert len(log.read_text().splitlines()) == 1

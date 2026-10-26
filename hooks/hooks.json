@@ -18,7 +18,7 @@
           {
             "type": "command",
             "shell": "powershell",
-            "command": "$s = '${CLAUDE_PLUGIN_ROOT}/hooks/pre_commit_scan.py'; $c = @(); foreach ($n in 'py', 'python', 'python3') { foreach ($d in $env:Path -split ';') { if ($d -and [IO.Path]::IsPathRooted($d)) { $f = Join-Path $d ($n + '.exe'); if (Test-Path -LiteralPath $f) { $c += $f } } } }; foreach ($p in $c) { $a = @(); if ((Split-Path $p -Leaf) -like 'py.exe') { $a = @('-3') }; & $p @a -c 0 *> $null; if ($LASTEXITCODE -eq 0) { $input | & $p @a $s --stdout-json; exit $LASTEXITCODE } }; [Console]::Error.WriteLine('armis-appsec: no working py/python/python3 on PATH; hook not run, commit gate is OFF.'); exit 1",
+            "command": "$s = '${CLAUDE_PLUGIN_ROOT}/hooks/pre_commit_scan.py'; $c = @(); foreach ($n in 'py', 'python', 'python3') { foreach ($d in $env:Path -split ';') { if ($d -and [IO.Path]::IsPathRooted($d)) { $f = Join-Path $d ($n + '.exe'); if (Test-Path -LiteralPath $f) { $c += $f } } } }; foreach ($p in $c) { $a = @(); if ((Split-Path $p -Leaf) -like 'py.exe') { $a = @('-3') }; $ok = $true; if ($p -match '[\\\\/]WindowsApps[\\\\/]') { & $p @a -c 0 *> $null; $ok = $LASTEXITCODE -eq 0 }; if ($ok) { $input | & $p @a $s --stdout-json; exit $LASTEXITCODE } }; [Console]::Error.WriteLine('armis-appsec: no working py/python/python3 on PATH; hook not run, commit gate is OFF.'); exit 1",
             "timeout": 10
           }
         ]
